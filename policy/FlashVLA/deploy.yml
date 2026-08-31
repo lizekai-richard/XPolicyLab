@@ -1,0 +1,42 @@
+# Basic experiment configuration
+policy_name: FlashVLA
+protocol: ws
+host: localhost
+bench_name: null
+task_name: null
+env_cfg_type: null
+seed: null
+eval_batch: true
+
+checkpoint_num: null
+result_dir: "./results/flashvla/"
+
+# Model / action configuration
+action_type: joint
+device: cuda
+# Absolute path to a FlashVLA run directory, or leave null and pass ckpt_name.
+# The policy type (pi05 / pi05-flashvla) is read from the checkpoint's config.
+model_path: null
+# null keeps the checkpoint's own n_action_steps; this is the open-loop horizon
+# the RoboDojo client replays per inference.
+n_action_steps: null
+
+# RoboDojo publishes the overhead camera as cam_head; the exported LeRobot
+# datasets call it cam_high, so the checkpoint's feature keys map onto it here.
+camera_map:
+  observation.images.cam_high: cam_head
+  observation.images.cam_left_wrist: cam_left_wrist
+  observation.images.cam_right_wrist: cam_right_wrist
+
+# pi05-flashvla only (single-env eval).
+cold_start_mode: current_state
+inference_overlap_steps: 0
+skip_stale_actions: false
+
+# Conda env holding the flashvla package.
+policy_conda_env: flashvla
+# null derives the repo from this adapter's own location (it lives inside
+# flashvla at sim_eval/robodojo/XPolicyLab); set a path to override.
+flashvla_repo: null
+
+port: 6000
