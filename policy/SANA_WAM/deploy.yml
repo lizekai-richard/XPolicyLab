@@ -1,0 +1,42 @@
+policy_name: SANA_WAM
+protocol: ws
+host: localhost
+port: null
+bench_name: null
+task_name: null
+ckpt_name: null
+env_cfg_type: null
+seed: null
+action_type: joint
+gpu_id: null
+eval_batch: false
+
+# One inference is ~15 s at 50 steps on an H100 and the first call pays CUDA warm-up.
+request_timeout_s: 600.0
+
+# --- SANA_WAM keys (see README "Configuration") ---
+# HF-style checkpoint dir: config.yaml + model/pytorch_model_fsdp.bin [+ normalization/*.json].
+# null -> XPolicyLab resolution of ckpt_name (path, checkpoints/<bench>-<ckpt>-<env>-<action>-<seed>/, checkpoints/<ckpt_name>/).
+checkpoint_dir: null
+# null -> <checkpoint_dir>/normalization/robodojo_arx_x5_model_fps_25_f25_normalization.json, else the packaged copy
+# policy/SANA_WAM/normalization/ (sha-pinned by default). normalization_sha256 pins whichever file is used.
+normalization_path: null
+normalization_sha256: null
+text_encoder_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/text_encoder/gemma-2-2b-it
+vae_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/LTX-2.3-Diffusers
+sampling_steps: 50
+cfg_scale: 1.0
+flow_shift: 3.5
+device: cuda
+weight_dtype: bfloat16
+# clip | reject | none; only applied when joint_lower/joint_upper (12 values: left 6 then right 6, radians) are set.
+# The +-pi envelope below is the smoke envelope the debug harness ran with, NOT the ARX-X5 URDF limits
+# (see README "Configuration"); it keeps joint_limit_mode active and catches runaway targets only.
+joint_limit_mode: clip
+joint_lower: [-3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793,
+              -3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793]
+joint_upper: [3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793,
+              3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793]
+diffusion_seed_base: 20260802
+strict_image_size: false
+default_instruction: follow the instruction
