@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 import numpy as np
 import pytest
 import torch
 
-ADAPTER_DIR = "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/XPolicyLab/policy/SANA_WAM"
-if ADAPTER_DIR not in sys.path:
-    sys.path.insert(0, ADAPTER_DIR)
+# policy/SANA_WAM (plain ``sana_wam_min`` imports) and the XPolicyLab parent (``XPolicyLab.policy.SANA_WAM`` imports).
+ADAPTER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_XPOLICYLAB_PARENT = os.path.abspath(os.path.join(ADAPTER_DIR, "..", "..", ".."))
+for _p in (ADAPTER_DIR, _XPOLICYLAB_PARENT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from sana_wam_min import robodojo_io  # noqa: E402
 

@@ -106,6 +106,14 @@ class PolicyConfig:
     multiview_spatial_rope_tile_shape: tuple[int, int] = (15, 30)
     fp32_attention: bool = True
     out_channels: int = 128
+    # One text group shared by every token (G = 1: one query span over the video tokens and the robot tail) --
+    # the OpenWAM canvas policy (sana_qwennext_openwam_canvas_policy.py _prompt_group_spans). False keeps one
+    # group per view plus one for the robot tail.
+    shared_prompt: bool = False
+    # The canvas policy's opt-in ``model.extra.state_as_cross_attention``: the state row is projected onto one
+    # appended cross-attention key of the (single) text group instead of riding the self-attention robot tail as
+    # a clean token, and the action rows get an independent full-head-dim 1D RoPE over local positions 0..A-1.
+    state_as_cross_attention: bool = False
 
     def validate(self) -> "PolicyConfig":
         _require("patch_size", tuple(self.patch_size), (1, 1, 1))
@@ -145,6 +153,11 @@ class PolicyConfig:
             raise ValueError("softmax_layer_indices must be non-empty and unique")
         if min(indices) < 0 or max(indices) >= self.depth:
             raise ValueError("softmax_layer_indices fall outside the trunk depth")
+        if self.state_as_cross_attention and not self.shared_prompt:
+            # the live model defines the opt-in only on the canvas policy, whose prompt is shared (G = 1)
+            raise ValueError(
+                "state_as_cross_attention is only defined for the shared-prompt (OpenWAM canvas) policy"
+            )
         return self
 
     @classmethod
@@ -205,6 +218,14 @@ class PolicyConfig:
         if softmax_head_dim is None:
             softmax_head_dim = 2 * linear_head_dim
 
+        model_extra = _value(model_cfg, "extra", None) or {}
+        state_as_cross_attention = bool(
+            kwargs.get(
+                "state_as_cross_attention",
+                _value(model_extra, "state_as_cross_attention", False),
+            )
+        )
+
         resolved = cls(
             input_size=int(kwargs.get("input_size", 32)),
             patch_size=tuple(kwargs.get("patch_size", cls.patch_size)),
@@ -252,6 +273,8 @@ class PolicyConfig:
                 )
             ),
             out_channels=out_channels,
+            shared_prompt=bool(kwargs.get("shared_prompt", False)),
+            state_as_cross_attention=state_as_cross_attention,
         )
         return resolved.validate()
 

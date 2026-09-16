@@ -282,3 +282,73 @@ def test_determinism_and_noise_draw_order():
         cond, cond_mask, None, None, 1.0, data_info, 8, SHIFT,
     )
     assert torch.equal(v1, v4) and torch.equal(a1, a4)
+
+
+class _SplitModel(_StubModel):
+    """Constant velocities that DIFFER between the conditional and unconditional rows, so guidance is observable.
+
+    Conditional: video 1, action 1; unconditional: video 0.5, action 0.5 -> a guided stream integrates
+    ``0.5 + s * 0.5`` per unit sigma, an unguided one exactly ``1``.
+    """
+
+    def __call__(self, x, timestep, y, mask=None, data_info=None):
+        out = super().__call__(x, timestep, y, mask=mask, data_info=data_info)
+        level = 1.0 if y is self.cond_embeds else 0.5
+        return {"x": torch.full_like(out["x"], level), "action_pred": torch.full_like(out["action_pred"], level)}
+
+
+def _run_split(video_cfg_scale, action_cfg_scale, cfg_scale=1.0, steps=6):
+    clean_video, clean_action, action_mask, cond, cond_mask, uncond, uncond_mask, data_info = _make_inputs(
+        video_dtype=torch.float32
+    )
+    g = torch.Generator().manual_seed(11)
+    video_noise = torch.randn(clean_video.shape, generator=g)
+    action_noise = torch.randn(clean_action.shape, generator=g)
+    stub = _SplitModel("zero", cond)
+    video, action = sample_policy(
+        stub, clean_video, video_noise, action_noise, clean_action, action_mask,
+        cond, cond_mask, uncond, uncond_mask, cfg_scale, data_info, steps, SHIFT,
+        video_cfg_scale=video_cfg_scale, action_cfg_scale=action_cfg_scale,
+    )
+    return video, action, stub
+
+
+def test_per_stream_cfg_scales_guide_only_their_own_stream():
+    # Both streams unguided (the historical cfg_scale=1 path): a single forward per step.
+    v_plain, a_plain, stub = _run_split(None, None, cfg_scale=1.0)
+    assert stub.cond_calls == 6 and stub.uncond_calls == 0
+    # Both guided through the shared knob.
+    v_both, a_both, stub = _run_split(None, None, cfg_scale=6.0)
+    assert stub.cond_calls == 6 and stub.uncond_calls == 6
+    assert not torch.equal(v_both[:, :, 1:], v_plain[:, :, 1:]) and not torch.equal(a_both, a_plain)
+    # Video-only guidance: the unconditional forward still runs (one transformer for both streams), the video
+    # matches the fully guided run and the action is BIT-IDENTICAL to the unguided one.
+    v_vid, a_vid, stub = _run_split(None, 1.0, cfg_scale=6.0)
+    assert stub.cond_calls == 6 and stub.uncond_calls == 6
+    assert torch.equal(v_vid, v_both)
+    assert torch.equal(a_vid, a_plain)
+    # The same through the explicit video knob with cfg_scale left at 1.
+    v_vid2, a_vid2, stub = _run_split(6.0, None, cfg_scale=1.0)
+    assert stub.uncond_calls == 6 and torch.equal(v_vid2, v_both) and torch.equal(a_vid2, a_plain)
+    # Action-only guidance: video unguided, action guided.
+    v_act, a_act, stub = _run_split(1.0, 6.0, cfg_scale=1.0)
+    assert stub.uncond_calls == 6
+    assert torch.equal(v_act, v_plain) and torch.equal(a_act, a_both)
+    # Different scales per stream are honoured independently (video at 2 is neither the 1 nor the 6 result).
+    v_mix, a_mix, _ = _run_split(2.0, 6.0, cfg_scale=1.0)
+    assert torch.equal(a_mix, a_both)
+    assert not torch.equal(v_mix, v_plain) and not torch.equal(v_mix, v_both)
+    # A guided action stream needs the unconditional rows even when cfg_scale itself is 1.
+    clean_video, clean_action, action_mask, cond, cond_mask, _, _, data_info = _make_inputs()
+    with pytest.raises(ValueError):
+        sample_policy(
+            _StubModel("zero", cond), clean_video, None, None, clean_action, action_mask,
+            cond, cond_mask, None, None, 1.0, data_info, 2, SHIFT,
+            generator=torch.Generator().manual_seed(0), action_cfg_scale=6.0,
+        )
+    with pytest.raises(ValueError):
+        sample_policy(
+            _StubModel("zero", cond), clean_video, None, None, clean_action, action_mask,
+            cond, cond_mask, None, None, 1.0, data_info, 2, SHIFT,
+            generator=torch.Generator().manual_seed(0), video_cfg_scale=float("nan"),
+        )

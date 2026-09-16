@@ -71,6 +71,21 @@ def _view_slot_ids(data_info: dict) -> tuple[int, ...]:
     return slots
 
 
+def _independent_action_rope(rope, action_steps: int, batch: int, device) -> torch.Tensor:
+    """Full-head-dim 1D rotary phases over the local action positions ``0 .. action_steps - 1``
+    (sana_qwennext_openwam_canvas_policy.py _independent_action_rope): no three-axis split and no
+    ``model_fps`` scaling; ``[batch, 1, action_steps, head_dim // 2]`` complex, concatenable with the
+    video RoPE along the token axis."""
+
+    head_dim = sum(rope.axis_dims)
+    positions = torch.arange(action_steps, device=device, dtype=torch.float64)
+    exponent = torch.arange(0, head_dim, 2, device=device, dtype=torch.float64) / head_dim
+    inverse_frequency = rope.theta ** (-exponent)
+    phase = torch.outer(positions, inverse_frequency)
+    freqs = torch.polar(torch.ones_like(phase), phase)
+    return freqs.view(1, 1, action_steps, -1).expand(batch, 1, action_steps, -1)
+
+
 class PolicyModel(nn.Module):
     """The unified world model's policy branch as one flat inference graph.
 
@@ -80,6 +95,14 @@ class PolicyModel(nn.Module):
     span.  The camera channel is not modeled: ``plucker_embed`` is absent and
     a batch with the camera gate on is refused.  Checkpoint tensors the
     mirror does not model are removed by :func:`load_policy_state_dict`.
+
+    Two config flags mirror the OpenWAM canvas policy
+    (sana_qwennext_openwam_canvas_policy.py): ``shared_prompt`` makes the text
+    ONE group cross-attended by every token (G = 1, one query span; V must be
+    1), and ``state_as_cross_attention`` moves the state row from the
+    self-attention tail (``state_embed``) to one appended cross-attention key
+    (``state_context_embed``) and gives the action rows an independent local
+    1D RoPE.
     """
 
     def __init__(self, config: PolicyConfig | None = None) -> None:
@@ -106,6 +129,8 @@ class PolicyModel(nn.Module):
         self.multiview_spatial_rope_tile_shape = tuple(
             config.multiview_spatial_rope_tile_shape
         )
+        self.shared_prompt = bool(config.shared_prompt)
+        self.state_as_cross_attention = bool(config.state_as_cross_attention)
         self.use_xformers_cross_attention = False
 
         self.x_embedder = PatchEmbedMS3D(
@@ -166,7 +191,11 @@ class PolicyModel(nn.Module):
             config.patch_size,
             config.out_channels,
         )
-        self.state_embed = MaskedProjector(config.state_dim, config.hidden_size)
+        if self.state_as_cross_attention:
+            # the state feeds the text/cross-attention side; the self-attention robot tail is action rows only
+            self.state_context_embed = MaskedProjector(config.state_dim, config.hidden_size)
+        else:
+            self.state_embed = MaskedProjector(config.state_dim, config.hidden_size)
         self.action_embed = MaskedProjector(
             config.action_dim, config.hidden_size
         )
@@ -198,8 +227,9 @@ class PolicyModel(nn.Module):
         nn.init.zeros_(self.attn_res.attn_proj.weight)
         nn.init.zeros_(self.attn_res.mlp_proj.weight)
         nn.init.zeros_(self.attn_res.final_proj.weight)
-        nn.init.zeros_(self.state_embed.proj.weight)
-        nn.init.zeros_(self.state_embed.proj.bias)
+        state_projector = self.state_context_embed if self.state_as_cross_attention else self.state_embed
+        nn.init.zeros_(state_projector.proj.weight)
+        nn.init.zeros_(state_projector.proj.bias)
         nn.init.zeros_(self.action_embed.proj.weight)
         nn.init.zeros_(self.action_embed.proj.bias)
         nn.init.zeros_(self.action_head.linear.weight)
@@ -265,10 +295,9 @@ class PolicyModel(nn.Module):
         self, data_info: dict, video: torch.Tensor
     ) -> tuple[torch.Tensor, int]:
         """State token followed by one token per 80D action row
-        (sana_qwennext_pretrain.py _robot_tokens)."""
+        (sana_qwennext_pretrain.py _robot_tokens); the action rows alone under
+        ``state_as_cross_attention`` (sana_qwennext_openwam_canvas_policy.py)."""
 
-        state = data_info["initial_state80"].to(video.device)
-        state_mask = data_info["initial_state_condition_mask80"].to(video.device)
         action = data_info["action80"].to(video.device)
         action_mask = data_info["action_mask80"].to(video.device)
 
@@ -280,8 +309,12 @@ class PolicyModel(nn.Module):
                 f"got {action_steps}, expected {expected_steps} for latent F={self.f}"
             )
 
-        state = state.to(dtype=video.dtype)
         action = action.to(dtype=video.dtype)
+        if self.state_as_cross_attention:
+            return self.action_embed(action, action_mask), action_steps
+        state = data_info["initial_state80"].to(video.device)
+        state_mask = data_info["initial_state_condition_mask80"].to(video.device)
+        state = state.to(dtype=video.dtype)
         return torch.cat(
             (
                 self.state_embed(state, state_mask).unsqueeze(1),
@@ -339,6 +372,12 @@ class PolicyModel(nn.Module):
                 ],
                 dim=2,
             ).expand(batch, -1, -1, -1)
+        if self.state_as_cross_attention:
+            # (sana_qwennext_openwam_canvas_policy.py _unified_rope) no state row; the action tail carries its
+            # own local 1D phases instead of the parent's (time, 0, 0) ids through the three-axis split
+            return torch.cat(
+                (video, _independent_action_rope(rope, action_steps, batch, device)), dim=2
+            )
         action_ids = torch.arange(
             1, action_steps + 1, device=device, dtype=torch.float64
         )
@@ -379,20 +418,50 @@ class PolicyModel(nn.Module):
             raise ValueError("token-group text mask length differs from embeddings")
         return y, mask.to(torch.int16).reshape(batch, groups, -1)
 
-    @staticmethod
     def _prompt_group_spans(
-        view_token_counts, action_steps: int
+        self, view_token_counts, action_steps: int
     ) -> tuple[tuple[int, int], ...]:
         """Static (offset, length) query span per text group: one per view
-        block in view order, then the robot tail (state row + action rows)."""
+        block in view order, then the robot tail (state row + action rows);
+        under ``shared_prompt`` one span over the whole sequence
+        (sana_qwennext_openwam_canvas_policy.py _prompt_group_spans)."""
 
+        state_slots = 0 if self.state_as_cross_attention else 1
+        if self.shared_prompt:
+            total = sum(int(count) for count in view_token_counts) + state_slots + int(action_steps)
+            return ((0, total),)
         spans = []
         offset = 0
         for count in view_token_counts:
             spans.append((offset, int(count)))
             offset += int(count)
-        spans.append((offset, 1 + int(action_steps)))
+        spans.append((offset, state_slots + int(action_steps)))
         return tuple(spans)
+
+    def _splice_state_context(self, text, text_mask, data_info: dict):
+        """Append the projected state row as one extra cross-attention key of the last text group
+        (sana_qwennext_openwam_canvas_policy.py _splice_state_context): ``[B,G,L,C]`` -> ``[B,G,L+1,C]``
+        and a ``[B,G,L+1]`` int16 key mask whose new column is 1 for the last group only."""
+
+        batch, groups, length, hidden = text.shape
+        state = data_info["initial_state80"].to(device=text.device, dtype=text.dtype)
+        state_mask = data_info["initial_state_condition_mask80"].to(text.device)
+        state_token = self.state_context_embed(state, state_mask).to(text.dtype)
+
+        zero_slot = state_token.new_zeros(batch, groups - 1, hidden)
+        new_columns = torch.cat((zero_slot, state_token.unsqueeze(1)), dim=1).unsqueeze(2)
+        text = torch.cat((text, new_columns), dim=2)
+
+        base_mask = (
+            text.new_ones(batch, groups, length, dtype=torch.int16)
+            if text_mask is None
+            else text_mask
+        )
+        new_mask_column = torch.zeros(
+            batch, groups, 1, dtype=base_mask.dtype, device=base_mask.device
+        )
+        new_mask_column[:, -1, 0] = 1
+        return text, torch.cat((base_mask, new_mask_column), dim=2)
 
     @torch.no_grad()
     def _forward_trunk(
@@ -535,6 +604,11 @@ class PolicyModel(nn.Module):
 
         batch = x.shape[0]
         num_views = _view_count(data_info)
+        if self.shared_prompt and num_views != 1:
+            raise ValueError(
+                "the shared-prompt (OpenWAM canvas) policy takes ONE composite visual stream; "
+                f"got view_count={num_views}"
+            )
         x = x.to(self.dtype)
         y = y.to(self.dtype)
         self.f, self.h, self.w = (
@@ -564,14 +638,18 @@ class PolicyModel(nn.Module):
         action_timestep = self._to_model_t_domain(
             self._action_timesteps(data_info, batch, action_steps, x.device)
         )
-        token_timestep = torch.cat(
-            (
-                video_timestep,
-                video_timestep.new_zeros(batch, 1),
-                action_timestep,
-            ),
-            dim=1,
-        ).unsqueeze(1)
+        if self.state_as_cross_attention:
+            # no clean state token in the tail: the robot rows are the action rows only
+            token_timestep = torch.cat((video_timestep, action_timestep), dim=1).unsqueeze(1)
+        else:
+            token_timestep = torch.cat(
+                (
+                    video_timestep,
+                    video_timestep.new_zeros(batch, 1),
+                    action_timestep,
+                ),
+                dim=1,
+            ).unsqueeze(1)
 
         fps = PhysicalTimeWanRotaryPosEmbed._normalize_fps(
             data_info["model_fps"], batch, x.device
@@ -593,6 +671,13 @@ class PolicyModel(nn.Module):
         )
         modulation = self.t_block(time_embedding)
         text, text_mask = self._grouped_text_condition(y, mask)
+        if self.shared_prompt and text.shape[1] != 1:
+            raise ValueError(
+                "the OpenWAM canvas policy takes ONE prompt shared by the video and action tokens "
+                f"(G == 1), got G={text.shape[1]}"
+            )
+        if self.state_as_cross_attention:
+            text, text_mask = self._splice_state_context(text, text_mask, data_info)
         tokens = self._forward_trunk(
             tokens,
             text,
@@ -608,8 +693,9 @@ class PolicyModel(nn.Module):
         )
         video_tokens = view_to_strip_tokens(video_tokens, self.f, view_shapes)
         action_mask = data_info["action_mask80"].to(tokens.device)
+        offset = 0 if self.state_as_cross_attention else 1  # the state token precedes the action rows
         action_pred = self.action_head(
-            tokens[:, n_video + 1 :], time_embedding[:, :, n_video + 1 :]
+            tokens[:, n_video + offset :], time_embedding[:, :, n_video + offset :]
         ).masked_fill(~action_mask, 0)
         return {
             "x": self.unpatchify(video_tokens),

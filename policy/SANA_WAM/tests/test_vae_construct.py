@@ -11,14 +11,19 @@ import pytest
 import torch
 from diffusers.models.autoencoders import AutoencoderKLLTX2Video
 
-ADAPTER_DIR = "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/XPolicyLab/policy/SANA_WAM"
-if ADAPTER_DIR not in sys.path:
-    sys.path.insert(0, ADAPTER_DIR)
+# policy/SANA_WAM (plain ``sana_wam_min`` imports) and the XPolicyLab parent (``XPolicyLab.policy.SANA_WAM`` imports).
+ADAPTER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_XPOLICYLAB_PARENT = os.path.abspath(os.path.join(ADAPTER_DIR, "..", "..", ".."))
+for _p in (ADAPTER_DIR, _XPOLICYLAB_PARENT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from sana_wam_min import vae as vae_mod  # noqa: E402
 from sana_wam_min.ltx2_causal_vae import AutoencoderKLCausalLTX2Video  # noqa: E402
 
-VAE_ROOT = "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/LTX-2.3-Diffusers"
+# Local LTX-2.3-Diffusers repo root (holds vae/). Tests that need the real snapshot skip when it is
+# absent; point SANA_WAM_VAE_PATH (the same variable the adapter reads) at a local copy to run them.
+VAE_ROOT = os.environ.get("SANA_WAM_VAE_PATH", "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/LTX-2.3-Diffusers")
 VAE_CONFIG = os.path.join(VAE_ROOT, "vae", "config.json")
 
 EXPECTED_CONFIG = {
@@ -60,8 +65,11 @@ HUB_ID = "Efficient-Large-Model/LTX-2.3-Diffusers"
 
 def test_subfolder_resolution(tmp_path):
     assert vae_mod.resolve_vae_subfolder(HUB_ID) == "vae"
-    assert vae_mod.resolve_vae_subfolder(VAE_ROOT) == "vae"
-    assert vae_mod.resolve_vae_subfolder(os.path.join(VAE_ROOT, "vae")) is None
+    # A local repo root resolves to its vae/ subfolder; the vae/ folder itself needs no subfolder.
+    repo_root = tmp_path / "LTX-2.3-Diffusers"
+    (repo_root / "vae").mkdir(parents=True)
+    assert vae_mod.resolve_vae_subfolder(str(repo_root)) == "vae"
+    assert vae_mod.resolve_vae_subfolder(str(repo_root / "vae")) is None
     # A renamed copy of the VAE folder is recognized through its own config.json.
     renamed = tmp_path / "ltx_vae_weights"
     renamed.mkdir()
@@ -201,7 +209,10 @@ def test_load_vae_real_weights_cpu():
     assert float(z.float().abs().mean()) < 10.0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="frame-0 parity on real weights needs a GPU (bf16 encode)")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not os.path.isfile(VAE_CONFIG),
+    reason="frame-0 parity on real weights needs a GPU (bf16 encode) and the local VAE snapshot",
+)
 def test_frame0_parity_real_weights_gpu():
     bundle = vae_mod.load_vae(VAE_ROOT, device="cuda", dtype=torch.bfloat16)
     clip = (torch.rand(1, 3, 25, 256, 320, device="cuda") * 2 - 1).to(torch.bfloat16)

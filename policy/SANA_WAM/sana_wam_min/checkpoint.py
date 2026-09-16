@@ -60,7 +60,9 @@ def load_policy_weights(
     FSDP full state dict), the three unmodeled tensors are shape-checked and
     removed, and the remainder must match ``model.state_dict()`` exactly.  The
     softmax-layer placement recorded in the checkpoint (blocks without
-    ``attn.beta_proj``) must agree with the config before any tensor is copied.
+    ``attn.beta_proj``) and its state projector (``state_embed`` vs the canvas
+    policy's ``state_context_embed``) must agree with the config before any
+    tensor is copied.
     """
 
     path = resolve_checkpoint_file(checkpoint_dir_or_file)
@@ -82,6 +84,17 @@ def load_policy_weights(
         raise ValueError(
             f"checkpoint softmax blocks {softmax_blocks} differ from config "
             f"{tuple(config.softmax_layer_indices)}"
+        )
+
+    expects_context = bool(getattr(model, "state_as_cross_attention", False))
+    has_context = "state_context_embed.proj.weight" in state
+    has_token = "state_embed.proj.weight" in state
+    if has_context != expects_context or has_token == expects_context:
+        raise ValueError(
+            "checkpoint state conditioning disagrees with the resolved config: the checkpoint carries "
+            f"{'state_context_embed' if has_context else 'state_embed'}"
+            f"{' and state_embed' if has_context and has_token else ''} while model.extra.state_as_cross_attention "
+            f"resolves to {expects_context} (a canvas checkpoint trained with the other setting?)"
         )
 
     active = strip_unmodeled_state(

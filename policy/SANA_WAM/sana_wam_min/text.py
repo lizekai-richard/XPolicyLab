@@ -7,7 +7,9 @@ Ports of ``dev/rwm/diffusion/data/token_group_prompts.py`` (field renderer and
 by G = V + 1 independent prompt strings (one per camera view in token-group order, then the
 robot/action group); each string is encoded separately and the model routes group g's keys
 to token group g. The CFG unconditional row is the same strings minus the trailing
-``Instruction:`` line, which is what training-time instruction dropout produced.
+``Instruction:`` line, which is what training-time instruction dropout produced. The
+``Action Mode`` sentence depends on the line's action mode and joint / EEF target modes
+(``action_mode_text``); the OpenWAM canvas line's single shared row lives in ``openwam_canvas``.
 """
 
 from __future__ import annotations
@@ -35,6 +37,84 @@ ACTION_MODE_TEXT = (
     "targets are absolute future targets, and no end-effector action is "
     "supervised"
 )
+
+# Every Action Mode sentence of ``build_token_group_prompts`` (token_group_prompts.py ``_ACTION_MODE_TEXT`` and
+# ``_EEF_ABSOLUTE_ACTION_MODE_TEXT``), keyed by (joint_target_mode, eef_target_mode) then the action mode. The
+# training prompt always carries the sentence of ITS line, so the served prompt must be rendered from the
+# checkpoint's own modes (``action_mode_text``); qwen_canonical has no absolute-EEF form.
+ACTION_MODE_TEXTS = {
+    ("anchor_delta", "anchor_delta"): {
+        "qwen_canonical": (
+            "qwen_canonical; joint and end-effector motion are relative to the "
+            "first state, end-effector motion is expressed in the camera-aligned "
+            "canonical frame, and gripper targets are absolute future targets"
+        ),
+        "robot_base_eef": (
+            "robot_base_eef; end-effector motion is relative to the first state "
+            "and expressed in the robot base frame, joint motion is relative to "
+            "the first state, and gripper targets are absolute future targets"
+        ),
+        "joint_only": ACTION_MODE_TEXT,
+    },
+    ("absolute", "anchor_delta"): {
+        "qwen_canonical": (
+            "qwen_canonical; end-effector motion is relative to the first state "
+            "and expressed in the camera-aligned canonical frame, while joint "
+            "and gripper targets are absolute future targets"
+        ),
+        "robot_base_eef": (
+            "robot_base_eef; end-effector motion is relative to the first state "
+            "and expressed in the robot base frame, while joint and gripper "
+            "targets are absolute future targets"
+        ),
+        "joint_only": (
+            "joint_only; joint and gripper targets are absolute future targets "
+            "and no end-effector action is supervised"
+        ),
+    },
+    ("anchor_delta", "absolute"): {
+        "robot_base_eef": (
+            "robot_base_eef; end-effector targets are absolute future poses in the "
+            "robot base frame, joint motion is relative to the first state, and "
+            "gripper targets are absolute future targets"
+        ),
+        "joint_only": ACTION_MODE_TEXT,
+    },
+    ("absolute", "absolute"): {
+        "robot_base_eef": (
+            "robot_base_eef; end-effector targets are absolute future poses in the "
+            "robot base frame, and joint and gripper targets are absolute future "
+            "targets"
+        ),
+        "joint_only": (
+            "joint_only; joint and gripper targets are absolute future targets "
+            "and no end-effector action is supervised"
+        ),
+    },
+}
+
+
+def action_mode_text(
+    action_mode: str = "joint_only",
+    joint_target_mode: str = "anchor_delta",
+    eef_target_mode: str = "anchor_delta",
+) -> str:
+    """The Action Mode sentence of a line (without the trailing period the field renderer adds)."""
+
+    try:
+        table = ACTION_MODE_TEXTS[(str(joint_target_mode), str(eef_target_mode))]
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported target modes joint={joint_target_mode!r} eef={eef_target_mode!r}"
+        ) from error
+    try:
+        return table[str(action_mode)]
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported action mode {action_mode!r} for joint_target_mode {joint_target_mode!r} / "
+            f"eef_target_mode {eef_target_mode!r}"
+        ) from error
+
 
 # Wire encoding of the four groups carried in ``obs.instruction`` by the deploy client.
 TOKEN_GROUP_SEPARATOR = "\n\n"

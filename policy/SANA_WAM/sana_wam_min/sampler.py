@@ -111,6 +111,8 @@ def sample_policy(
     steps: int,
     flow_shift: float,
     generator: torch.Generator | None = None,
+    video_cfg_scale: float | None = None,
+    action_cfg_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run joint Flow-Euler sampling of the video and action streams for the policy task.
 
@@ -125,9 +127,16 @@ def sample_policy(
         action_mask: Bool mask matching clean_action; masked-out slots are zeroed after every step.
         caption_embeds: Conditional caption embeddings (opaque, forwarded to the model).
         caption_mask: Conditional caption mask (opaque, forwarded to the model).
-        unconditional_caption_embeds: Unconditional caption embeddings, required when cfg_scale > 1.
-        unconditional_caption_mask: Unconditional caption mask, required when cfg_scale > 1.
-        cfg_scale: Text classifier-free guidance scale; values above 1 enable guidance (two forwards per step).
+        unconditional_caption_embeds: Unconditional caption embeddings, required when either stream is guided.
+        unconditional_caption_mask: Unconditional caption mask, required when either stream is guided.
+        cfg_scale: Text classifier-free guidance scale shared by the video and action streams; values above 1
+            enable guidance (two forwards per step).
+        video_cfg_scale: Guidance scale of the video stream, or None to use ``cfg_scale``.
+        action_cfg_scale: Guidance scale of the action stream, or None to use ``cfg_scale``. ``1.0`` together
+            with a ``cfg_scale`` above 1 guides the video only: the action integrates the exact conditional
+            velocity (no ``u + s * (c - u)`` rounding) while the video still follows the guided one. The two
+            streams share one transformer, so the unconditional forward runs once per step whenever either
+            scale is above 1.
         data_info: Extra conditioning dict shallow-copied into every model call; the sampler adds
             ``rwm_task``, ``action80``, ``action_mask80`` and ``action_timestep`` per step.
         steps: Number of Euler steps; must be positive.
@@ -153,7 +162,12 @@ def sample_policy(
         raise ValueError("action_mask must be a bool tensor matching clean_action")
     if steps <= 0 or not math.isfinite(flow_shift) or flow_shift <= 0:
         raise ValueError("steps and flow_shift must be positive")
-    if cfg_scale > 1 and (
+    video_cfg_scale = float(cfg_scale if video_cfg_scale is None else video_cfg_scale)
+    action_cfg_scale = float(cfg_scale if action_cfg_scale is None else action_cfg_scale)
+    if not math.isfinite(video_cfg_scale) or not math.isfinite(action_cfg_scale):
+        raise ValueError("video_cfg_scale / action_cfg_scale must be finite")
+    use_cfg = video_cfg_scale > 1 or action_cfg_scale > 1
+    if use_cfg and (
         unconditional_caption_embeds is None or unconditional_caption_mask is None
     ):
         raise ValueError("text CFG requires unconditional caption embeds and mask")
@@ -214,7 +228,7 @@ def sample_policy(
         if not isinstance(conditional_output, dict) or conditional_output.get("x") is None:
             raise TypeError("world model must return a dict containing video velocity 'x'")
 
-        if cfg_scale > 1:
+        if use_cfg:
             unconditional_output = model(
                 video,
                 video_timesteps[:, None],
@@ -228,8 +242,8 @@ def sample_policy(
             unconditional_output = None
 
         video_prediction = conditional_output["x"]
-        if unconditional_output is not None:
-            video_prediction = unconditional_output["x"] + cfg_scale * (
+        if unconditional_output is not None and video_cfg_scale > 1:
+            video_prediction = unconditional_output["x"] + video_cfg_scale * (
                 video_prediction - unconditional_output["x"]
             )
         if video_prediction.shape != video.shape:
@@ -240,9 +254,9 @@ def sample_policy(
         video[:, :, :1] = clean_video[:, :, :1]
 
         action_prediction = conditional_output["action_pred"]
-        if unconditional_output is not None:
+        if unconditional_output is not None and action_cfg_scale > 1:
             unconditional_action_prediction = unconditional_output["action_pred"]
-            action_prediction = unconditional_action_prediction + cfg_scale * (
+            action_prediction = unconditional_action_prediction + action_cfg_scale * (
                 action_prediction - unconditional_action_prediction
             )
         if action_prediction.shape != action.shape:

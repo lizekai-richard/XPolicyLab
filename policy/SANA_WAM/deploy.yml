@@ -26,7 +26,50 @@ text_encoder_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/
 vae_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/LTX-2.3-Diffusers
 sampling_steps: 50
 cfg_scale: 1.0
+# Per-stream text CFG: null inherits cfg_scale (one knob for both streams, the historical behaviour). The policy
+# transformer denoises the video and the action chunk jointly, so the unconditional forward runs once per step
+# whenever either scale is above 1; e.g. cfg_scale 6 + action_cfg_scale 1 guides the video only and the action
+# stream integrates the exact conditional velocity. Each must be >= 1.
+video_cfg_scale: null
+action_cfg_scale: null
 flow_shift: 3.5
+# Targets returned per inference: null/0/all -> the whole predicted chunk (24 joint targets for the 25-frame tier);
+# a positive n returns only the first n, so the RoboDojo loop executes n control ticks, re-observes and asks for a
+# new chunk (receding-horizon replanning every n ticks; inferences per episode grow by chunk/n).
+n_action_steps: null
+# Which joint state the model is conditioned on AND the anchor its joint deltas are added to (one row in training):
+#   measured              the evaluator's measured joints (historical behaviour)
+#   last_command          the last joint target this adapter returned for the previous chunk -- the convention of the
+#                         training corpus, whose recorded state is the previous frame's command (state[i+1] == action[i]);
+#                         a simulator's measured joints lag the command they track, so `measured` shifts every target
+#   last_command_clamped  measured + clip(last_command - measured, +-anchor_clamp_rad): guards against command wind-up
+#                         while the arm is blocked by contact
+# Grippers follow the same source; the first chunk of every episode uses the measured state. The lag
+# |last_command - measured| is logged per chunk in every mode.
+anchor_source: measured
+anchor_clamp_rad: 0.05
+# Which Robot80 slots the checkpoint is conditioned on and supervised: auto (default) reads the training yaml's
+# data.extra.action_mode_sample_ratio -> joint_only (6 joints + gripper per arm) or robot_base_eef (plus the flange
+# link6 pose in the arm's base frame: position + rot6d, from URDF FK of the row's joints, E-axis remap; the eef SFT line).
+state_profile: auto
+# Visual front-end of the checkpoint: auto (default) reads its training yaml (model.model + data.type):
+#   three_view_strip  the 320px lines -- every camera resized/cropped to 256x320, encoded on its own, packed as a strip
+#   openwam_canvas    the rwm/openwam canvas line (SanaRWMOpenWAMCanvasPolicy) -- the three cameras stretched into one
+#                     384x320 L-shaped RGB canvas (head 256x320 above the left/right wrists 128x160), encoded ONCE;
+#                     one prompt shared by the video and action tokens
+# An explicit value must agree with the checkpoint: it documents the intent and cannot re-route a checkpoint.
+visual_layout: auto
+# action_type (top of this file, normally set by eval.sh): joint = 24 joint-target dicts (any checkpoint);
+# ee = 24 {left,right}_ee_pose dicts (link6 in the env-relative world frame, xyz + wxyz; the evaluator runs cuRobo IK
+# per tick) -- requires a robot_base_eef checkpoint and anchor_source measured.
+# Once per episode the adapter compares the evaluator's *_ee_pose observation with FK(measured joints) and warns
+# above 5 mm / 1 deg (frame/URDF mismatch); set false to silence.
+eef_pose_check: true
+# null -> the packaged sana_wam_min/assets/robotwin2_arx_x5.urdf (Sana's FK URDF, sha256 7aaa308a...).
+urdf_path: null
+# null -> the ARX-X5 root poses of env_cfg/robot/dual_x5.yml ({left: [x, y, z, qw, qx, qy, qz], right: [...]}): the
+# constant world-to-base transform between the observation frame and the training corpus' base-frame FK.
+robot_root_poses: null
 device: cuda
 weight_dtype: bfloat16
 # clip | reject | none; only applied when joint_lower/joint_upper (12 values: left 6 then right 6, radians) are set.

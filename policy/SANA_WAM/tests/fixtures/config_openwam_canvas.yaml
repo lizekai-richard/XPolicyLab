@@ -1,0 +1,419 @@
+# Resolved training configuration of the rwm/openwam CANVAS line (SanaRWMOpenWAMCanvasPolicy_5B_P1_D36 on
+# RoboDojoOpenWAMCanvasSFTDataset), in the form the trainer writes next to every checkpoint. SYNTHESIZED on
+# 2026-09-16: tests/fixtures/config.yaml (the resolved three-view line) overlaid with every field set by
+# dev/rwm/configs/ablation/openwam/sft_robodojo_sanavideo_jointabs_f25_openwam.yaml at Sana rwm/openwam c22ab366a
+# (model.model / data.type / data.extra incl. openwam_canvas and the absolute normalization pin 802f8fe9...,
+# model.extra.state_as_cross_attention false, the Sana-Video donor load_from, lr 1e-4 cosine, wd 1e-4, clip 1, no
+# latent cache); model.multiview_spatial_rope_layout is the ModelConfig default (local_reset) because that yaml sets
+# none. No checkpoint of the line had been dumped when this was written; the tests never read the cluster paths.
+data:
+    data_dir:
+        RoboDojo-ARX-X5: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/RoboDojo/converted/RoboDojo/arx-x5_zip_nrt
+    caption_proportion:
+        detailed_caption: 1
+    external_caption_suffixes: []
+    external_clipscore_suffixes: []
+    caption_selection_type: clipscore
+    clip_thr_temperature: 1.0
+    clip_thr: 0.0
+    del_img_clip_thr: 0.0
+    sort_dataset: false
+    load_text_feat: false
+    load_vae_feat: false
+    aspect_ratio_type: ASPECT_RATIO_OPENWAM_LSHAPE_384_320
+    transform: default_train_video
+    type: RoboDojoOpenWAMCanvasSFTDataset
+    image_size: 320
+    hq_only: false
+    valid_num: 0
+    data: null
+    num_frames: 25
+    extra:
+        action_representation: current_anchor_qwen
+        action_mode_sample_ratio:
+        - 0.0
+        - 0.0
+        - 1.0
+        joint_target_mode: absolute
+        camera_conditioning: true
+        recaption_instruction: false
+        openwam_canvas:
+            source_hdf5_root: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/RoboDojo/data/RoboDojo
+            layout: openwam_lshape_rgb_v1
+            encode_mode: joint_rgb_canvas
+        robotwin_sft:
+            tasks: null
+            splits:
+            - default
+            holdout_episodes_per_task_split: 0
+            holdout_mode: train
+            tier_num_frames: 25
+            instruction_source: dataset_seen
+            normalization_num_frames: 25
+            normalization_sha256: 802f8fe90cbe35688859d2ed2b058e04fd33a57261124422e7dc7e686db3d7ad
+            tail_windows:
+                enabled: true
+                min_rows: 2
+                padding: freeze
+        use_mobile_base: false
+    multi_res_ratio: null
+    dataset_repeats:
+        RoboDojo-ARX-X5: 1
+    dual_data_ratio: 0.5
+    external_data_filter:
+        RoboDojo-ARX-X5:
+            _model_fps:
+                min: 25
+                max: 25
+    meta_data_filter: {}
+    motion_score_file_thres: {}
+    motion_score_cal_type: average
+    target_fps: 16
+    resample_fps: false
+    shuffle_dataset: false
+    vae_cache_dir: null
+    json_cache_dir: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/data_cache_rwm_zekail_absolute
+    load_first_frame: false
+    embodiment_type_only: false
+    multi_fps:
+        '25':
+        - 25
+    validation_num_frames: null
+    validation_fps: null
+    chunk_glob: chunk_*
+    chunk_start_idx: null
+    chunk_end_idx: null
+model:
+    model: SanaRWMOpenWAMCanvasPolicy_5B_P1_D36
+    teacher: null
+    image_size: 320
+    mixed_precision: bf16
+    fp32_attention: true
+    load_from: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/models/Sana/sana_v2_5b_sft_2076k_ema.pth
+    discriminator_model: null
+    teacher_model: null
+    teacher_model_weight_dtype: null
+    resume_from:
+        checkpoint: null
+        load_ema: false
+        resume_lr_scheduler: true
+        resume_optimizer: true
+    aspect_ratio_type: null
+    multi_scale: true
+    pe_interpolation: 1.0
+    micro_condition: false
+    attn_type: linear
+    autocast_linear_attn: false
+    ffn_type: SwiGLU
+    mlp_acts:
+    - silu
+    - silu
+    - null
+    mlp_ratio: 4.0
+    use_pe: true
+    pos_embed_type: wan_rope
+    qk_norm: true
+    class_dropout_prob: 0.1
+    linear_head_dim: 128
+    cross_norm: true
+    cross_attn_type: flash
+    logvar: false
+    cfg_scale: 4
+    cfg_embed: false
+    cfg_embed_scale: 1.0
+    guidance_type: classifier-free
+    pag_applied_layers:
+    - 8
+    ladd_multi_scale: true
+    head_block_ids: null
+    extra:
+        action_dim: 80
+        state_dim: 80
+        state_as_cross_attention: false
+    remove_state_dict_keys: null
+    rope_fhw_dim: null
+    multiview_spatial_rope_layout: local_reset
+    multiview_spatial_rope_tile_shape:
+    - 15
+    - 30
+    t_kernel_size: 3
+    flash_attn_layer_idx: null
+    flash_attn_layer_type: null
+    flash_attn_window_count: null
+    diagonal_mask: false
+    diagonal_mask_type: nlogn
+    diagonal_block_size: 1
+    diagonal_mask_root: output/pretrained_models/diagonal_mask
+    additional_inchannels: 0
+    pack_latents: false
+    addition_layers_num: 0
+    encode_image_prompt_embeds: false
+    cross_attn_image_embeds: false
+    image_latent_mode: video_zero
+    chunk_index: null
+    softmax_ratio: 0.25
+    softmax_head_dim: 256
+    softmax_layer_indices: null
+    linear_attn_type: GatedDeltaNet
+    softmax_attn_type: GatedSoftmaxAttention
+    use_attn_res: true
+    attn_res_block_size: 8
+    use_residual_gate: false
+    use_two_phase: false
+    use_time_conditioning: false
+    use_dual_attn_res_routing: false
+    scale_warmup_steps: 0
+vae:
+    vae_type: LTX2VAE_diffusers
+    vae_pretrained: Efficient-Large-Model/LTX-2.3-Diffusers
+    weight_dtype: bfloat16
+    scale_factor: 0.41407
+    scaling_factor: null
+    vae_latent_dim: 128
+    vae_downsample_rate: 32
+    sample_posterior: true
+    vae_stride:
+    - 8
+    - 32
+    - 32
+    use_causal_encode: true
+    if_cache: false
+    cache_dir: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/vae_cache
+    extra: null
+    chunk_size: 0
+    causal_size: 0
+text_encoder:
+    text_encoder_name: gemma-2-2b-it-local
+    caption_channels: 2304
+    y_norm: true
+    y_norm_scale_factor: 0.01
+    model_max_length: 300
+    chi_prompt: []
+    fsdp_shard: true
+    extra: null
+scheduler:
+    train_sampling_steps: 1000
+    predict_flow_v: true
+    noise_schedule: linear_flow
+    pred_sigma: false
+    learn_sigma: true
+    vis_sampler: flow_dpm-solver
+    flow_shift: 3.0
+    flow_shift_type: tail_floor_logit_normal
+    flow_shift_by_resolution: null
+    flow_shift_by_token_count:
+        base_tokens: 4290
+        max_tokens: 23000
+        base_shift: 3.0
+        max_shift: 6.0
+        mode: log_linear
+    inference_flow_shift: 3.5
+    inference_tail_floor_left: 0.0
+    inference_tail_start: 0.22
+    inference_tail_power: 1.5
+    inference_cfg_scale: 6.0
+    dual_timestep: false
+    min_train_timestep: 1
+    weighting_scheme: uniform
+    weighting_scheme_discriminator: logit_normal_trigflow
+    add_noise_timesteps:
+    - 1.5708
+    logit_mean: 0.0
+    logit_std: 0.95
+    logit_shift: 0.0
+    beta_mode: null
+    beta_concentration: 3.0
+    beta_floor_prob: 0.0
+    tail_floor_left: 0.12
+    tail_floor_right: 0.16
+    tail_floor_power: 1.2
+    tail_floor_body_weight: 0.925
+    logit_mean_discriminator: 0.0
+    logit_std_discriminator: 1.0
+    mode_scale: 1.29
+    sigma_data: 1.0
+    p_low: null
+    p_high: null
+    timestep_norm_scale_factor: 1.0
+    pretrain_timestep_norm_scale_factor: 1.0
+    discrete_norm_timestep: false
+    extra: null
+    interval_k: null
+train:
+    num_workers: 10
+    persistent_workers: null
+    seed: 1
+    train_batch_size: 8
+    train_batch_size_image: 32
+    early_stop_hours: 100
+    max_train_steps: null
+    num_epochs: 10
+    gradient_accumulation_steps: 1
+    grad_checkpointing: true
+    gradient_clip: 1.0
+    gc_step: 1
+    optimizer:
+        betas:
+        - 0.9
+        - 0.999
+        eps: 1.0e-10
+        lr: 0.0001
+        type: AdamW
+        weight_decay: 0.0001
+        paramwise_cfg:
+            bias_decay_mult: 0.0
+            norm_decay_mult: 0.0
+    optimizer_D:
+        eps: 1.0e-10
+        lr: 0.0001
+        type: AdamW
+        weight_decay: 0.03
+    load_from_optimizer: false
+    load_from_lr_scheduler: false
+    resume_lr_scheduler: true
+    resume_optimizer: true
+    wandb_step_offset: 0
+    lr_schedule: cosine
+    lr_schedule_args:
+        num_warmup_steps: 3000
+        num_training_steps: 72500
+        final_lr: 0.01
+    auto_lr: null
+    eval_batch_size: 16
+    use_fsdp: true
+    use_flash_attn: false
+    eval_sampling_steps: 1000000000
+    lora_rank: 4
+    log_interval: 10
+    mask_type: 'null'
+    mask_loss_coef: 0.0
+    load_mask_index: false
+    snr_loss: false
+    real_prompt_ratio: 1.0
+    save_image_epochs: 1
+    save_model_epochs: 5
+    save_model_steps: 500
+    save_model_pth: false
+    visualize: false
+    null_embed_root: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/pretrained_embeds
+    valid_prompt_embed_root: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/tmp_embed
+    validation_prompts:
+    - dog
+    - portrait photo of a girl, photograph, highly detailed face, depth of field
+    - Self-portrait oil painting, a beautiful cyborg with golden hair, 8k
+    - Astronaut in a jungle, cold color palette, muted colors, detailed, 8k
+    - A photo of beautiful mountain with realistic sunset and blue lake, highly detailed, masterpiece
+    local_save_vis: true
+    deterministic_validation: false
+    online_metric: false
+    eval_metric_step: 5000
+    online_metric_dir: metric_helper
+    work_dir: /cache/exps/
+    skip_step: 0
+    loss_type: huber
+    num_ddim_timesteps: 50
+    w_max: 15.0
+    w_min: 3.0
+    ema_decay: 0.95
+    debug_nan: false
+    ema_update: false
+    ema_rate: 0.9999
+    weight_loss: true
+    tangent_warmup_steps: 10000
+    scm_cfg_scale:
+    - 1.0
+    cfg_interval: null
+    scm_logvar_loss: true
+    norm_invariant_to_spatial_dim: true
+    norm_same_as_512_scale: false
+    g_norm_constant: 0.1
+    g_norm_r: 1.0
+    show_gradient: false
+    lr_scale: null
+    adv_lambda: 1.0
+    scm_loss: true
+    scm_lambda: 1.0
+    loss_scale: 1.0
+    r1_penalty: false
+    r1_penalty_weight: 1.0e-05
+    diff_timesteps_D: true
+    suffix_checkpoints: disc
+    misaligned_pairs_D: false
+    discriminator_loss: cross entropy
+    largest_timestep: 1.5708
+    train_largest_timestep: false
+    largest_timestep_prob: 0.5
+    reconstruct_loss: false
+    reconstruct_loss_type: huber
+    huber_c: 0.001
+    vis_grad: false
+    extra:
+        rwm_task: policy
+        unified_wm: true
+        instruction_dropout_probability: 0.1
+        action_loss_weight: 1.0
+        max_save_limit: 3
+        keep_milestone_steps: 0
+        rwm_validation_steps: 50
+        rwm_validation_seed: 1
+        rwm_validation_samples_per_dataset: 10
+        rwm_validation_video_samples_per_dataset: 4
+        rwm_validation_action_overlay: false
+    offload_vae: false
+    offload_text_encoder: false
+    deepspeed_stage: null
+    use_lora: false
+    lora_config:
+        r: 32
+        lora_alpha: 64
+        init_lora_weights: true
+        target_modules:
+        - attn.qkv
+        learnable_modules:
+        - logvar_linear
+        - cfg_embedder
+    validation_images: null
+    image_prior_type: null
+    image_only_validation: false
+    joint_training_interval: 0
+    qat: null
+    global_distributed_multiframe: true
+    timestep_weight: false
+    bell_timestep_loss_weight: false
+    noise_multiplier: 0.0
+    ltx_image_condition_prob: 1.0
+    chunk_sampling_strategy: incremental
+    same_timestep_prob: 0.0
+    temporal_coherence_loss: false
+    temporal_coherence_weight: 0.0
+    temporal_variance_loss: false
+    temporal_variance_weight: 0.01
+    spectral_motion_loss: false
+    spectral_motion_weight: 0.01
+    spectral_motion_rho: 0.3
+    self_flow_enabled: false
+    self_teacher: false
+    self_flow_student_layer: 8
+    self_flow_teacher_layer: 20
+    self_flow_distill_weight: 1.0
+    self_flow_mask_ratio: 0.25
+    self_flow_high_noise_ratio: 0.0
+    quality_timestep_shift: 0.0
+    motion_threshold: 30.0
+    quality_threshold: 0.92
+image_data: null
+dual_data: null
+image_encoder: {}
+model_growth: null
+text_encoder_wan: null
+work_dir: output/sft_robodojo_sanavideo_jointabs_f25_openwam
+resume_from: null
+load_from: null
+debug: false
+caching: false
+report_to: wandb
+tracker_project_name: sana-video-baseline
+name: baseline
+loss_report_name: loss
+task: ltx
+distill: null

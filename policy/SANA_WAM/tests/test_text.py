@@ -11,22 +11,27 @@ import sys
 import pytest
 import torch
 
-ADAPTER_DIR = "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/XPolicyLab/policy/SANA_WAM"
-if ADAPTER_DIR not in sys.path:
-    sys.path.insert(0, ADAPTER_DIR)
+# policy/SANA_WAM (plain ``sana_wam_min`` imports) and the XPolicyLab parent (``XPolicyLab.policy.SANA_WAM`` imports).
+ADAPTER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_XPOLICYLAB_PARENT = os.path.abspath(os.path.join(ADAPTER_DIR, "..", "..", ".."))
+for _p in (ADAPTER_DIR, _XPOLICYLAB_PARENT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from sana_wam_min import text  # noqa: E402
 
-MANIFEST_GLOB = (
+# Cluster artifacts (not in the repo): holdout validation manifests and the Gemma-2-2B snapshot. The
+# tests that need them skip when they are absent; override the locations through the environment
+# (GEMMA_DIR uses the same variable the adapter reads).
+MANIFEST_GLOB = os.environ.get(
+    "SANA_WAM_TEST_MANIFEST_GLOB",
     "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/sana_wam_runs/output/"
     "VAL_SFT_RoboDojo_ArxX5_320px_unified_joint_only_holdout_s35000/log_vis/rwm_validation/"
-    "policy/joint_only/step_35000/sample_*/manifest.json"
+    "policy/joint_only/step_35000/sample_*/manifest.json",
 )
-GEMMA_DIR = "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/text_encoder/gemma-2-2b-it"
-REFERENCE_OUT = (
-    "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/xpolicylab_sana_wam_port_20260908/"
-    "logs/text_cpu_reference_sample000.pt"
-)
+GEMMA_DIR = os.environ.get("SANA_WAM_TEXT_ENCODER_PATH", "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/text_encoder/gemma-2-2b-it")
+# Where test_gemma_cpu_reference_sample000 saves its reference tensors; default = the test's tmp_path.
+REFERENCE_OUT = os.environ.get("SANA_WAM_TEST_REFERENCE_OUT")
 
 
 def _manifests() -> list[str]:
@@ -195,7 +200,10 @@ def test_load_text_encoder_signature():
     os.environ.get("SANA_WAM_TEXT_SKIP_GEMMA") == "1" or not os.path.isdir(GEMMA_DIR),
     reason="Gemma-2-2B dir missing or SANA_WAM_TEXT_SKIP_GEMMA=1 (CPU load+encode ~30 s, ~5 GB RAM)",
 )
-def test_gemma_cpu_reference_sample000():
+def test_gemma_cpu_reference_sample000(tmp_path):
+    if not _manifests():
+        pytest.skip("validation manifests not present")
+    reference_out = REFERENCE_OUT or str(tmp_path / "text_cpu_reference_sample000.pt")
     tokenizer, encoder = text.load_text_encoder(GEMMA_DIR, device="cpu")
     assert tokenizer.padding_side == "right"
     assert type(encoder).__name__ == "Gemma2Model"
@@ -211,8 +219,8 @@ def test_gemma_cpu_reference_sample000():
     lengths = mask.reshape(4, 300).sum(-1)
     assert (lengths >= 57).all() and (lengths <= 112).all()
     assert torch.isfinite(y.float()).all()
-    os.makedirs(os.path.dirname(REFERENCE_OUT), exist_ok=True)
+    os.makedirs(os.path.dirname(reference_out), exist_ok=True)
     torch.save(
         {"y": y, "y_mask": mask, "rows": rows, "manifest": _manifests()[0], "token_lengths": lengths.tolist()},
-        REFERENCE_OUT,
+        reference_out,
     )

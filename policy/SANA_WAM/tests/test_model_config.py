@@ -9,9 +9,12 @@ import sys
 import pytest
 import torch
 
-ADAPTER_DIR = "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/XPolicyLab/policy/SANA_WAM"
-if ADAPTER_DIR not in sys.path:
-    sys.path.insert(0, ADAPTER_DIR)
+# policy/SANA_WAM (plain ``sana_wam_min`` imports) and the XPolicyLab parent (``XPolicyLab.policy.SANA_WAM`` imports).
+ADAPTER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_XPOLICYLAB_PARENT = os.path.abspath(os.path.join(ADAPTER_DIR, "..", "..", ".."))
+for _p in (ADAPTER_DIR, _XPOLICYLAB_PARENT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from _tiny_policy import (  # noqa: E402
     FRAMES,
@@ -25,10 +28,8 @@ from _tiny_policy import (  # noqa: E402
 from sana_wam_min import config as wam_config  # noqa: E402
 from sana_wam_min.checkpoint import build_policy_model  # noqa: E402
 
-TRAIN_YAML = (
-    "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/"
-    "xpolicylab_sana_wam_port_20260908/train_config.yaml"
-)
+# The resolved training yaml of the RoboDojo 320px joint-only line (see the header of the fixture).
+TRAIN_YAML = os.path.join(os.path.dirname(__file__), "fixtures", "config.yaml")
 PACKAGE_DIR = os.path.join(ADAPTER_DIR, "sana_wam_min")
 
 

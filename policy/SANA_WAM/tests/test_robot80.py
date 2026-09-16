@@ -4,22 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 
 import numpy as np
 import pytest
 import torch
 
-ADAPTER_DIR = "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/XPolicyLab/policy/SANA_WAM"
-if ADAPTER_DIR not in sys.path:
-    sys.path.insert(0, ADAPTER_DIR)
+# policy/SANA_WAM (plain ``sana_wam_min`` imports) and the XPolicyLab parent (``XPolicyLab.policy.SANA_WAM`` imports).
+ADAPTER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_XPOLICYLAB_PARENT = os.path.abspath(os.path.join(ADAPTER_DIR, "..", "..", ".."))
+for _p in (ADAPTER_DIR, _XPOLICYLAB_PARENT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from sana_wam_min import robot80  # noqa: E402
 
-ARTIFACT = (
-    "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/xpolicylab_sana_wam_port_20260908/"
-    "ckpt_snapshots/normalization/robodojo_arx_x5_model_fps_25_f25_normalization.json"
-)
+# The packaged copy shipped with the adapter (policy/SANA_WAM/normalization/); byte-identical to the
+# checkpoint artifact (sha256 983fbd46...).
+ARTIFACT = os.path.join(ADAPTER_DIR, "normalization", "robodojo_arx_x5_model_fps_25_f25_normalization.json")
 ARTIFACT_SHA = "983fbd46df6af34e2048ed6806ae9ce49cd8bd3af72cfba7d8610069959ea1da"
 JOINT_SLOTS = [0, 1, 2, 3, 4, 5, 29, 30, 31, 32, 33, 34]
 ACTIVE_SLOTS = [0, 1, 2, 3, 4, 5, 16, 29, 30, 31, 32, 33, 34, 45]
