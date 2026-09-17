@@ -8,6 +8,9 @@ Shared conventions (argument meanings, checkpoint naming, split-machine deployme
 
 ## Installation
 
+See `INSTALLATION.md` for the full setup: environment, the three model assets that do **not** ship with the
+checkpoint (LTX-2.3 VAE, Gemma-2-2b-it, the checkpoint itself) with download commands, and troubleshooting.
+
 ```bash
 conda create -n sana_wam python=3.11 && conda activate sana_wam
 cd XPolicyLab/policy/SANA_WAM && bash install.sh
