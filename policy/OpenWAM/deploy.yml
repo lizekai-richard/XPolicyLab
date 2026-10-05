@@ -38,3 +38,8 @@ default_instruction: follow the instruction
 # true skips checkpoint loading and returns hold-position chunks (protocol
 # debugging only; never valid for a real evaluation).
 allow_dummy_policy: false
+# Directory for the world model's own predicted VIDEO LATENTS, one compressed .npz per env per
+# chunk (<dir>/batch<RRRR>/env<EE>_chunk<CCC>.npz: fp16 (C,F,H,W) latents + prompt + state).
+# null -> off. The batch path never decodes video, so this costs one device->host copy per chunk
+# and NO VAE decode inside the timed inference; decode offline with the checkpoint's Wan2.2 VAE.
+prediction_latent_dir: null

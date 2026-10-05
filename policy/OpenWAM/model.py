@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 from XPolicyLab.model_template import ModelTemplate
 from XPolicyLab.utils.checkpoint_resolver import resolve_checkpoint_root
@@ -214,6 +215,12 @@ class Model(ModelTemplate):
         # Per-env stored observations (keyed by env_idx, order preserved).
         self._batch: dict[int, dict] = {}
         self._order: list[int] = []
+        # Latent-dump bookkeeping. Initialized HERE, before the allow_dummy_policy early return
+        # below, because reset() and get_action_batch() read these on every path.
+        self.prediction_latent_dir = None
+        self._latent_capture = None
+        self._reset_index = -1        # one per eval_one_episode_batch() -> reset()
+        self._chunk_index = 0
 
         self.allow_dummy_policy = _is_true(self.model_cfg.get("allow_dummy_policy", False))
         self._engine = None
@@ -251,6 +258,29 @@ class Model(ModelTemplate):
         self._engine = server.engine
         self._wam_policy = server._policy  # for the binary-dim legality projection
         self._preprocessor = server._obs_preprocessor
+
+        # --- optional world-model video LATENT dump (no VAE decode) -------------------
+        # generate_batch returns {"video": None, ...}: the batch path is actions-only and the
+        # decoder is off, yet the joint denoising still produces the video stream. Its final
+        # state lives in inputs_shared["latents"] ("advanced in place across steps", see
+        # BaseWAMArchitecture._run_joint_denoising). Wrapping that call is the cheapest place
+        # to keep it: nothing is decoded, so the timed inference is unchanged apart from one
+        # device->host copy per chunk. Decode offline with the checkpoint's own Wan2.2 VAE.
+        latent_dir = self.model_cfg.get("prediction_latent_dir")
+        self.prediction_latent_dir = None if _is_none_like(latent_dir) else Path(str(latent_dir)).expanduser()
+        if self.prediction_latent_dir is not None:
+            self.prediction_latent_dir.mkdir(parents=True, exist_ok=True)
+            arch = self._engine.architecture
+            inner = arch._run_joint_denoising
+
+            def _capturing_run_joint_denoising(*args, **kwargs):
+                out = inner(*args, **kwargs)
+                shared = args[1] if len(args) > 1 else kwargs.get("inputs_shared")
+                self._latent_capture = (shared or {}).get("latents")
+                return out
+
+            arch._run_joint_denoising = _capturing_run_joint_denoising
+            print(f"[OpenWAM] video-latent dump ON -> {self.prediction_latent_dir} (no VAE decode)")
 
         if self.replan_steps is None:
             horizon = OmegaConf.select(server.cfg, "inference.inference_horizon", default=None)
@@ -409,6 +439,8 @@ class Model(ModelTemplate):
 
         conditions = [self._conditions(p) for p in payloads]
         result = self._engine.generate_batch(conditions)
+        if self.prediction_latent_dir is not None:
+            self._dump_latents(env_idx_list, payloads)
         actions = result["actions"]
         if hasattr(actions, "cpu"):
             actions = actions.detach().cpu().numpy()
@@ -427,6 +459,44 @@ class Model(ModelTemplate):
             n_exec = min(self.replan_steps, n_exec)
         return [self._eef20_chunk_to_native(actions[b, :n_exec]) for b in range(actions.shape[0])]
 
+    def _dump_latents(self, env_idx_list: list, payloads: list) -> None:
+        """Write one compressed .npz per env per chunk: fp16 latents + provenance.
+
+        Layout ``<dir>/batch<RRRR>/env<EE>_chunk<CCC>.npz``; ``batch`` counts reset() calls
+        (one per parallel episode group), ``env`` is the XPolicyLab env_idx, ``chunk`` the
+        replan index within that group. Latents are (C, F, H, W) per env. Failures never
+        abort an evaluation -- a dump is diagnostics, the score is the product.
+        """
+        lat = self._latent_capture
+        self._latent_capture = None
+        if lat is None:
+            return
+        try:
+            import numpy as _np
+
+            arr = lat.detach().to("cpu", dtype=torch.float16).numpy() if hasattr(lat, "detach") else _np.asarray(lat)
+            if arr.shape[0] != len(env_idx_list):
+                print(f"[OpenWAM] latent dump skipped: batch {arr.shape[0]} != {len(env_idx_list)} envs")
+                return
+            out = self.prediction_latent_dir / f"batch{max(self._reset_index, 0):04d}"
+            out.mkdir(parents=True, exist_ok=True)
+            for b, env_idx in enumerate(env_idx_list):
+                _np.savez_compressed(
+                    out / f"env{int(env_idx):02d}_chunk{self._chunk_index:03d}.npz",
+                    latents=arr[b],
+                    env_idx=int(env_idx),
+                    reset_index=int(max(self._reset_index, 0)),
+                    chunk_index=int(self._chunk_index),
+                    prompt=str(payloads[b].get("prompt", "")),
+                    state=_np.asarray(payloads[b].get("state"), dtype=_np.float32),
+                )
+        except Exception as exc:                      # never fail an episode over diagnostics
+            print(f"[OpenWAM] latent dump failed at reset {self._reset_index} chunk {self._chunk_index}: {exc!r}")
+        finally:
+            self._chunk_index += 1
+
     def reset(self):
+        self._reset_index += 1
+        self._chunk_index = 0
         self._batch = {}
         self._order = []
