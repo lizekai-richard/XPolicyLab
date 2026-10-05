@@ -1,0 +1,111 @@
+policy_name: SANA_MOT
+protocol: ws
+host: localhost
+port: null
+bench_name: null
+task_name: null
+ckpt_name: null
+env_cfg_type: null
+seed: null
+# joint (joint_only lines) | ee (the EEF-only robot_base_eef line: {left,right}_ee_pose, the evaluator's IK)
+action_type: joint
+gpu_id: null
+eval_batch: false
+
+# One inference is a few seconds per chunk at 10 steps on an A6000 / H100 and the first call pays CUDA warm-up.
+request_timeout_s: 600.0
+
+# --- SANA_MOT keys (see README "Configuration") ---
+# HF-style checkpoint dir: config.yaml + model/pytorch_model_fsdp.bin [+ normalization/*.json] of a
+# SanaRWMMoTAttnResPolicy_5B_P1_D36 run (the paired video_dit / action_dit / blocks.* state dict).
+# null -> XPolicyLab resolution of ckpt_name (path, checkpoints/<bench>-<ckpt>-<env>-<action>-<seed>/, checkpoints/<ckpt_name>/).
+# The text layout (context_embedder | shared_caption_embedder | legacy_action_mlp) and the action attention key naming
+# (attn, or attn_head before rwm/mot 3058e5785 -- renamed at load) are detected from the weights, the video layout from
+# the checkpoint's config.yaml (data.extra.multiview, else model.extra.video_layout, else data.type). A strided-video yaml
+# (robotwin_sft.video_fps) is served: the observation fills a shorter latent window and the batch carries the stride.
+checkpoint_dir: null
+# Video front-end of the checkpoint: auto (default) takes the layout it was trained with -- data.extra.multiview since
+# rwm/mot a26807821 (sana_latent | sana_pixel | openwam), before that model.extra.video_layout, before that data.type.
+#   multiview          multiview sana_latent, the 2x2 multiview strip: every camera resized/cropped to 256x320 and encoded
+#                      on its own; one prompt group per view plus the robot group, each expert its own caption embedder
+#   openwam_canvas     multiview openwam: the OpenWAM 384x320 canvas (head above the two wrists), encoded once
+#   sana_pixel_canvas  multiview sana_pixel (2026-09-22): every camera resize-cropped to 320x480 and halved into its 2x2
+#                      quadrant of one 320x480 canvas (top-right black), encoded once
+# A canvas reads the prompt through ONE shared caption embedder (checkpoints since rwm/mot 4e67e1e1d, detected from the
+# weights) or through both experts' embedders (earlier canvases). An explicit value must agree with the checkpoint: it
+# asserts the operator's intent (checked before the weights are read) and never re-routes a checkpoint.
+video_layout: auto
+# RoPE regime (model.extra.rope since rwm/mot 71ac93f43): auto (default) = the yaml's key, else the table of the run's
+# era: legacy before 42aee4fa9 (physical clock at stride 1; strided: state and first action both at 0), independent
+# after it (data.extra.multiview or a shared caption embedder marks that era). legacy | aligned | independent force one;
+# a value contradicting a declared key is refused.
+#   aligned      video latent j at 16*j*s/fps (stride s folded in), the robot rows on that clock (state 0, action k at 16*k/(8*fps))
+#   independent  video on its own clock, the action expert's own 1D clock: state 0, actions 1..S (0..S-1 under state_as_context)
+rope_mode: auto
+# Text contract of a canvas (auto = the checkpoint's era; the strip ignores both keys):
+#   text_groups    1 = ONE composite-view row read by both experts, 2 = that row for the video expert + the robot row
+#                  for the action expert (separate embedders with data.extra.multiview, 2026-09-21..22)
+#   canvas_prompt  openwam composite_view | l_shape | two_rows, sana_pixel composite_view | tiling (the Observation View
+#                  sentence of the canvas row; auto: two_rows / tiling with model.extra.rope, l_shape / tiling with a shared
+#                  caption embedder before it, composite_view for every canvas before 2026-09-21)
+text_groups: auto
+canvas_prompt: auto
+# robot_base_eef checkpoints (e.g. sft_robodojo_mot_eefabs_*): full (joints + EEF + grippers) | eef_only (EEF pose +
+# grippers; joints neither fed nor supervised -- the rwm/mot contract since 2434e9199). auto: eef_only when the run carries
+# a post-2026-09-20 marker (data.extra.multiview, model.extra.rope, a forced-scheme normalization artifact). An EEF-only
+# checkpoint predicts no joints: serve it with action_type ee (the evaluator's IK consumes link6 poses).
+robot_base_eef_layout: auto
+# Once per episode compare the evaluator's *_ee_pose observation with FK(measured joints) (robot_base_eef only).
+eef_pose_check: true
+# null -> the packaged SANA_WAM URDF / ARX-X5 root poses (see policy/SANA_WAM/deploy.yml)
+urdf_path: null
+robot_root_poses: null
+# null -> <checkpoint_dir>/normalization/robodojo_arx_x5_model_fps_25_f25_normalization.json, else the packaged copy
+# policy/SANA_MOT/normalization/ (the absolute-joint-target artifact of the local-cluster yamls, sha 802f8fe9..., pinned
+# by default). The NSC checkpoints ship their own artifact (sha 3cd3ce1d...), which the resolver uses; the packaged copy
+# is never a silent fallback for a yaml that pins another sha. normalization_sha256 pins whichever file is used.
+normalization_path: null
+normalization_sha256: null
+text_encoder_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/text_encoder/gemma-2-2b-it
+vae_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/LTX-2.3-Diffusers
+# Euler steps; the SANA RoboDojo evaluations settled on 10 (10 vs 20 vs 50 NFE indistinguishable on scores).
+sampling_steps: 10
+cfg_scale: 1.0
+# Per-stream text CFG: null inherits cfg_scale. The MoT experts denoise the video and the action chunk jointly, so the
+# unconditional forward runs once per step whenever either scale is above 1. DEFAULT action_cfg_scale 1.0 (user,
+# 2026-09-25): cfg_scale 6 then guides the video expert only; action_cfg_scale null (or 6) restores the historical
+# single knob. Each must be >= 1.
+video_cfg_scale: null
+action_cfg_scale: 1.0
+flow_shift: 3.5
+# The ACTION stream's own sampling shift: null = the checkpoint's scheduler.inference_action_flow_shift (else
+# action_flow_shift) when its recipe declares one (zekai-merge 4f99eecba / rwm/mot b865ad732: e.g. the vanilla34k
+# recipes train video 5 / action 1), otherwise flow_shift for both streams (the historical shared schedule).
+action_flow_shift: null
+# How each camera view reaches its bucket (the sana_pixel canvas bucket, the sana_latent per-view bucket; the OpenWAM
+# canvas always stretches): null = the training yaml's data.extra.robot_sft.view_resize when it declares one, else
+# stretch -- the whole frame bilinearly resized, the only SFT resize since rwm/mot 034e55dca / rwm/zekai-merge 1061b16f0
+# (f06615b2f / 77cf81fbf dropped the yaml key). crop = scale to cover + centre crop, the LEGACY resize of every checkpoint
+# trained before those commits: serve those with view_resize: crop (the RoboDojo eval worker does so for every label in
+# its pre_stretch_labels.txt). A value that contradicts a declared yaml key is refused.
+view_resize: null
+# Targets returned per inference: null/0/all -> the whole predicted chunk (24 joint targets for the 25-frame tier);
+# a positive n returns only the first n (receding-horizon replanning every n ticks).
+n_action_steps: null
+device: cuda
+weight_dtype: bfloat16
+# clip | reject | none; only applied when joint_lower/joint_upper (12 values: left 6 then right 6, radians) are set.
+# The +-pi envelope below is a smoke envelope, NOT the ARX-X5 URDF limits; it keeps joint_limit_mode active and
+# catches runaway targets only.
+joint_limit_mode: clip
+joint_lower: [-3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793,
+              -3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793, -3.141592653589793]
+joint_upper: [3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793,
+              3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793, 3.141592653589793]
+diffusion_seed_base: 20260802
+strict_image_size: false
+default_instruction: follow the instruction
+# Diagnostic only (null = off): directory for a per-episode trajectory dump (same format as policy/SANA_WAM): every
+# update_obs tick's measured Robot80 joints + grippers and, per inference, the conditioning row and the absolute chunk
+# returned (ep<N>.npz, rewritten after every chunk). Leave null in evaluations.
+trajectory_dump_dir: null

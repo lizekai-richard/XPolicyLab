@@ -1,0 +1,196 @@
+# verbatim copy of Sana rwm/mot 71ac93f43 dev/rwm/configs/ablation/mot/sft_robodojo_mot_jointabs_f25_320px.yaml (adapter test fixture)
+task: ltx
+work_dir: output/sft_robodojo_mot_jointabs_f25_320px
+
+# MoT (AttnRes dual-system) policy SFT on RoboDojo ARX-X5 over the ORIGINAL 2x2 multiview layout (3 views of
+# 256x320, semantic_2x2 RoPE tiles, one text group per view plus the robot group), absolute joint targets, freeze-padded
+# tail windows over all 3,500 episodes (no holdout, user ruling 2026-09-15). The data, VAE, text and scheduler blocks
+# are the single-DiT RoboDojo tail-window recipe (cached f25 latents + the freeze tail store); only the model block
+# differs (MoT policy, donor loaded by the model itself, so model.load_from stays null). Batch: 16 windows per GPU x
+# 32 GPUs (4 nodes) = 512 windows per optimizer step (user request 2026-09-17; the single-DiT line runs 256), so the
+# cosine horizon is 10 epochs x floor(1,852,602 windows / 512) = 10 x 3,618 = 36,180 optimizer steps (num_warmup_steps and
+# num_training_steps are optimizer steps; the trainer applies its own world-size scaling). data.extra.multiview defaults
+# to sana (one visual stream per camera); the OpenWAM canvas is multiview: openwam (sft_robodojo_mot_jointabs_f25_openwam.yaml).
+data:
+  data_dir:
+    RoboDojo-ARX-X5: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/RoboDojo/converted/RoboDojo/arx-x5_zip_nrt
+  dataset_repeats:
+    RoboDojo-ARX-X5: 1
+  image_size: 320
+  json_cache_dir: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/data_cache_rwm_zekail_absolute_aligned
+  caption_proportion:
+    detailed_caption: 1
+  embodiment_type_only: false
+  external_data_filter:
+    RoboDojo-ARX-X5:
+      _model_fps: {min: 25, max: 25}
+  load_text_feat: false
+  transform: default_train_video
+  type: RoboDojoSFTDataset
+  extra:
+    action_representation: current_anchor_qwen
+    action_mode_sample_ratio: [0.0, 0.0, 1.0]
+    joint_target_mode: absolute
+    # Required by the multi-view dataset (per-view poses/intrinsics, per-view latent grids); joint_only never turns
+    # camera conditioning on, and the MoT video expert refuses camera-conditioned samples.
+    camera_conditioning: true
+    recaption_instruction: false
+    robotwin_sft:
+      tasks: null
+      splits: [default]
+      holdout_episodes_per_task_split: 0
+      holdout_mode: train
+      tier_num_frames: 25
+      instruction_source: dataset_seen
+      normalization_num_frames: 25
+      normalization_sha256: 7f6bc08574b01a981146bb3d42d55134f75a38cc7b29cf022e2ea5e7e7104460
+      # Pre-encoded 320px window latents: base store v2-f25-427f5e349d78c33c + the FREEZE tail store
+      # v2-f25-tail-fd41ee2cb25c03f7 (identity from num_frames + view_keys + image_size + aspect_ratio + VAE build).
+      vae_latent_cache_dir: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/sft_vae_latents
+      allow_online_encode: false
+      tail_windows:
+        enabled: true
+        min_rows: 2
+        padding: freeze
+    use_mobile_base: false
+  num_frames: 25
+  aspect_ratio_type: ASPECT_RATIO_VIDEO_320_ROBOT
+  sort_dataset: false
+  shuffle_dataset: false
+  resample_fps: false
+  multi_fps:
+    "25": [25]
+  load_vae_feat: false
+
+model:
+  model: SanaRWMMoTAttnResPolicy_5B_P1_D36
+  extra:
+    action_hidden_size: 1024
+    action_mlp_ratio: 4.0
+    action_cross_attn_heads: 8
+    action_rope_theta: 10000.0
+    # RoPE mode (user ruling 2026-09-23, the same two modes on both lines): independent = the video on its own mRoPE
+    # clock and the robot rows on the action expert's 1D clock (state 0, actions 1..S); aligned = one physical clock
+    # for both (video latent j at 16*j*stride/fps, action k at 16*k/(8*fps)). independent is what this line has
+    # trained with since 2026-09-22, so declaring it changes nothing.
+    rope: independent
+    action_attn_res_block_size: 8
+    action_state_as_context: false
+    video_donor: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/models/Sana/sana_v2_5b_sft_2076k_ema.pth
+  image_size: 320
+  mixed_precision: bf16
+  fp32_attention: true
+  load_from: null
+  multi_scale: true
+  softmax_ratio: 0.25
+  linear_attn_type: GatedDeltaNet
+  softmax_attn_type: GatedSoftmaxAttention
+  linear_head_dim: 128
+  softmax_head_dim: 256
+  ffn_type: SwiGLU
+  mlp_ratio: 4.0
+  use_pe: true
+  pos_embed_type: wan_rope
+  qk_norm: true
+  cross_norm: true
+  class_dropout_prob: 0.1
+  use_attn_res: true
+  use_time_conditioning: false
+  attn_res_block_size: 8
+
+vae:
+  vae_type: LTX2VAE_diffusers
+  vae_pretrained: Efficient-Large-Model/LTX-2.3-Diffusers
+  weight_dtype: bfloat16
+  vae_latent_dim: 128
+  vae_downsample_rate: 32
+  vae_stride:
+    - 8
+    - 32
+    - 32
+  cache_dir: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/vae_cache
+  if_cache: false
+  use_causal_encode: true
+
+text_encoder:
+  text_encoder_name: gemma-2-2b-it-local
+  y_norm: true
+  y_norm_scale_factor: 0.01
+  model_max_length: 300
+  chi_prompt: []
+
+scheduler:
+  predict_flow_v: true
+  noise_schedule: linear_flow
+  pred_sigma: false
+  flow_shift: 3.0
+  flow_shift_by_token_count:
+    base_tokens: 4290
+    max_tokens: 23000
+    base_shift: 3.0
+    max_shift: 6.0
+    mode: log_linear
+  flow_shift_type: tail_floor_logit_normal
+  inference_flow_shift: 3.5
+  inference_cfg_scale: 6.0
+  min_train_timestep: 1
+  weighting_scheme: uniform
+  logit_mean: 0.0
+  logit_std: 0.95
+  tail_floor_left: 0.12
+  tail_floor_right: 0.16
+  tail_floor_power: 1.2
+  tail_floor_body_weight: 0.925
+
+train:
+  global_distributed_multiframe: true
+  null_embed_root: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/pretrained_embeds
+  valid_prompt_embed_root: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/tmp_embed
+  use_fsdp: true
+  num_workers: 10
+  seed: 1
+  train_batch_size: 16
+  num_epochs: 10
+  gradient_accumulation_steps: 1
+  grad_checkpointing: true
+  gradient_clip: 1.0
+  optimizer:
+    betas:
+      - 0.9
+      - 0.999
+    eps: 1.0e-10
+    lr: 1.0e-4
+    type: AdamW
+    weight_decay: 1.0e-4
+    paramwise_cfg:
+      bias_decay_mult: 0.0
+      norm_decay_mult: 0.0
+  auto_lr: null
+  lr_schedule: cosine
+  lr_schedule_args:
+    num_warmup_steps: 3000
+    num_training_steps: 36180
+    final_lr: 0.01
+  local_save_vis: true
+  visualize: false
+  eval_sampling_steps: 1000000000
+  log_interval: 10
+  save_model_epochs: 5
+  save_model_steps: 500
+  load_from_optimizer: false
+  load_from_lr_scheduler: false
+  deterministic_validation: false
+  joint_training_interval: 0
+  ltx_image_condition_prob: 1.0
+  extra:
+    rwm_task: policy
+    unified_wm: true
+    instruction_dropout_probability: 0.1
+    action_loss_weight: 1.0
+    max_save_limit: 3
+    keep_milestone_steps: 0
+    rwm_validation_steps: 50
+    rwm_validation_seed: 1
+    rwm_validation_samples_per_dataset: 10
+    rwm_validation_video_samples_per_dataset: 4
+    rwm_validation_action_overlay: false
