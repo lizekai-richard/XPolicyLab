@@ -21,10 +21,11 @@ from .embeddings import (
     T2IFinalLayer,
     TimestepEmbedder,
 )
-from .geometry import strip_to_view_tokens, view_to_strip_tokens
+from .geometry import sana_pixel_real_token_index, strip_to_view_tokens, view_to_strip_tokens
 from .rope import (
     PhysicalTimeWanRotaryPosEmbed,
     WanRotaryPosEmbed,
+    independent_action_rope,
     semantic_2x2_position_ids,
 )
 
@@ -73,17 +74,11 @@ def _view_slot_ids(data_info: dict) -> tuple[int, ...]:
 
 def _independent_action_rope(rope, action_steps: int, batch: int, device) -> torch.Tensor:
     """Full-head-dim 1D rotary phases over the local action positions ``0 .. action_steps - 1``
-    (sana_qwennext_openwam_canvas_policy.py _independent_action_rope): no three-axis split and no
-    ``model_fps`` scaling; ``[batch, 1, action_steps, head_dim // 2]`` complex, concatenable with the
-    video RoPE along the token axis."""
+    (sana_qwennext_openwam_canvas_policy.py _independent_action_rope, and the strided robot tail of every checkpoint
+    trained before zekai-merge 8a61ae18a): no three-axis split and no ``model_fps`` scaling;
+    ``[batch, 1, action_steps, head_dim // 2]`` complex, concatenable with the video RoPE along the token axis."""
 
-    head_dim = sum(rope.axis_dims)
-    positions = torch.arange(action_steps, device=device, dtype=torch.float64)
-    exponent = torch.arange(0, head_dim, 2, device=device, dtype=torch.float64) / head_dim
-    inverse_frequency = rope.theta ** (-exponent)
-    phase = torch.outer(positions, inverse_frequency)
-    freqs = torch.polar(torch.ones_like(phase), phase)
-    return freqs.view(1, 1, action_steps, -1).expand(batch, 1, action_steps, -1)
+    return independent_action_rope(rope, action_steps, batch, device, first_position=0)
 
 
 class PolicyModel(nn.Module):
@@ -131,6 +126,8 @@ class PolicyModel(nn.Module):
         )
         self.shared_prompt = bool(config.shared_prompt)
         self.state_as_cross_attention = bool(config.state_as_cross_attention)
+        self.rope_mode = config.rope
+        self.legacy_strided_action_origin = int(config.legacy_strided_action_origin)
         self.use_xformers_cross_attention = False
 
         self.x_embedder = PatchEmbedMS3D(
@@ -256,11 +253,12 @@ class PolicyModel(nn.Module):
 
     @staticmethod
     def _assert_lockstep(
-        timestep: torch.Tensor, data_info: dict, latent_frames: int
+        timestep: torch.Tensor, data_info: dict, latent_frames: int, separate_action_schedule: bool = False
     ) -> None:
         """The task=ltx lockstep diagonal in the raw domain: frame 0 clean, one
         shared scalar t over the noisy frames, action schedule equal to it
-        (sana_qwennext_action_policy.py _assert_policy_lockstep)."""
+        (sana_qwennext_action_policy.py _assert_policy_lockstep); with a separate
+        action schedule the action rows share one t of their own."""
 
         t = torch.as_tensor(timestep).reshape(timestep.shape[0], -1)
         if latent_frames < 2 or t.shape[1] != latent_frames:
@@ -285,28 +283,49 @@ class PolicyModel(nn.Module):
                 "([B, T] or per-batch scalar, raw domain)."
             )
         action_rows = action_timestep.reshape(t.shape[0], -1)
-        if not bool((action_rows == t[:, -1:]).all()):
+        shared = action_rows[:, -1:] if separate_action_schedule else t[:, -1:]
+        if not bool((action_rows == shared).all()):
             raise ValueError(
                 "lockstep violated: supplied action_timestep differs from the "
                 "noisy video t."
             )
+
+    @staticmethod
+    def _video_frame_stride(data_info: dict) -> int:
+        """The batch's video frame stride (sana_qwennext_pretrain.py _video_frame_stride, rwm/strided_video):
+        video frame j is source row ``j * stride``; 1 when the key is absent, uniform within the batch."""
+
+        value = data_info.get("video_frame_stride")
+        if value is None:
+            return 1
+        strides = torch.as_tensor(value).reshape(-1)
+        if bool((strides != strides[0]).any()):
+            raise ValueError("video_frame_stride must be uniform within a batch")
+        stride = int(strides[0].item())
+        if stride < 1:
+            raise ValueError(f"video_frame_stride must be >= 1, got {stride}")
+        return stride
 
     def _robot_tokens(
         self, data_info: dict, video: torch.Tensor
     ) -> tuple[torch.Tensor, int]:
         """State token followed by one token per 80D action row
         (sana_qwennext_pretrain.py _robot_tokens); the action rows alone under
-        ``state_as_cross_attention`` (sana_qwennext_openwam_canvas_policy.py)."""
+        ``state_as_cross_attention`` (sana_qwennext_openwam_canvas_policy.py).
+        The action rows are dense in SOURCE frames, so a strided video carries
+        ``(F - 1) * compression * stride`` of them."""
 
         action = data_info["action80"].to(video.device)
         action_mask = data_info["action_mask80"].to(video.device)
 
         action_steps = action.shape[1]
-        expected_steps = (self.f - 1) * self.action_temporal_compression
+        frame_stride = self._video_frame_stride(data_info)
+        expected_steps = (self.f - 1) * self.action_temporal_compression * frame_stride
         if action_steps != expected_steps:
             raise ValueError(
                 "one motion80 row per source-frame transition is required: "
-                f"got {action_steps}, expected {expected_steps} for latent F={self.f}"
+                f"got {action_steps}, expected {expected_steps} for latent F={self.f} "
+                f"at video frame stride {frame_stride}"
             )
 
         action = action.to(dtype=video.dtype)
@@ -332,6 +351,21 @@ class PolicyModel(nn.Module):
             value = value.expand(-1, action_steps)
         return value
 
+    def _robot_rope_mode(self, data_info: dict) -> tuple[str, int]:
+        """``(mode, first action position)`` of this batch (sana_qwennext_pretrain.py ``_rope_mode``).
+
+        A declared ``model.extra.rope`` wins at every stride (independent actions start at 1). Undeclared: a dense
+        batch is ``aligned``, the only table the pre-2026-09-23 lines had; a strided batch takes the independent table
+        those checkpoints trained with, whose first action sits at ``legacy_strided_action_origin`` (the live model
+        refuses an undeclared strided batch instead).
+        """
+
+        if self.rope_mode is not None:
+            return self.rope_mode, 1
+        if self._video_frame_stride(data_info) == 1:
+            return "aligned", 1
+        return "independent", self.legacy_strided_action_origin
+
     def _robot_rope(
         self,
         rope: PhysicalTimeWanRotaryPosEmbed,
@@ -340,25 +374,39 @@ class PolicyModel(nn.Module):
         view_shapes: tuple[tuple[int, int], ...],
         action_steps: int,
         device: torch.device,
+        video_token_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Video frequencies followed by the robot clock (state at t=0, action
-        row k at ``k / (compression * fps)`` in base-fps frame units).
+        """Video frequencies followed by the robot rows (sana_qwennext_pretrain.py ``_unified_rope`` / ``_robot_rope``,
+        sana_qwennext_multiview.py ``_multiview_robot_rope``).
 
-        V=1 is the regular grid (sana_qwennext_pretrain.py _unified_rope); V>1
-        follows the configured multiview spatial layout
-        (sana_qwennext_multiview.py _multiview_robot_rope).
+        V=1 is the regular grid, V>1 the semantic 2x2 tiling (or a legacy yaml's ``local_reset`` per-view grids).
+        ``aligned``: the video latent frame j sits at ``base_fps * j * s / fps`` (the video frame stride s folded into
+        the time axis; s = 1 for a dense batch) and the robot rows on the same physical clock, the state at t=0 and
+        action row k at ``base_fps * k / (compression * fps)``. ``independent``: the video keeps its own clock
+        (``base_fps * j / fps`` whatever the stride), the state the zero phase, the actions a full-head 1D RoPE over
+        local positions from 1 (from 0 for the pre-8a61ae18a strided checkpoints). The OpenWAM canvas policy's
+        ``state_as_cross_attention`` option keeps its own tail: no state row, actions at ``0 .. A-1``.
+        ``video_token_index`` (``sana_pixel_pad: masked``, V=1): only those video rows are kept, each at its canvas
+        position (sana_qwennext_pretrain.py ``_unified_rope`` ``video_token_index``).
         """
 
         batch = fps.numel()
+        mode, first_action = self._robot_rope_mode(data_info)
+        clock_stride = self._video_frame_stride(data_info) if mode == "aligned" else 1
         if len(view_shapes) == 1:
-            video = rope((self.f, self.h, self.w), device).expand(batch, -1, -1, -1)
+            video = rope((self.f, self.h, self.w), device, frame_stride=clock_stride)
+            if video_token_index is not None:
+                video = video.index_select(2, video_token_index)
+            video = video.expand(batch, -1, -1, -1)
+        elif video_token_index is not None:
+            raise ValueError("sana_pixel_pad masked serves the one-view sana_pixel canvas only")
         elif self.multiview_spatial_rope_layout == "semantic_2x2":
             video = rope.from_position_ids(
                 semantic_2x2_position_ids(
                     self.f,
                     view_shapes,
                     _view_slot_ids(data_info),
-                    fps,
+                    fps / clock_stride,
                     rope.base_fps,
                     self.multiview_spatial_rope_tile_shape,
                     device,
@@ -367,7 +415,7 @@ class PolicyModel(nn.Module):
         else:
             video = torch.cat(
                 [
-                    rope((self.f, height, width), device)
+                    rope((self.f, height, width), device, frame_stride=clock_stride)
                     for height, width in view_shapes
                 ],
                 dim=2,
@@ -378,6 +426,12 @@ class PolicyModel(nn.Module):
             return torch.cat(
                 (video, _independent_action_rope(rope, action_steps, batch, device)), dim=2
             )
+        if mode == "independent":
+            state = rope.from_position_ids(
+                torch.zeros(batch, 1, 3, device=device, dtype=torch.float64)
+            )
+            actions = independent_action_rope(rope, action_steps, batch, device, first_position=first_action)
+            return torch.cat((video, state, actions), dim=2)
         action_ids = torch.arange(
             1, action_steps + 1, device=device, dtype=torch.float64
         )
@@ -419,17 +473,28 @@ class PolicyModel(nn.Module):
         return y, mask.to(torch.int16).reshape(batch, groups, -1)
 
     def _prompt_group_spans(
-        self, view_token_counts, action_steps: int
+        self, view_token_counts, action_steps: int, groups: int | None = None
     ) -> tuple[tuple[int, int], ...]:
         """Static (offset, length) query span per text group: one per view
         block in view order, then the robot tail (state row + action rows);
-        under ``shared_prompt`` one span over the whole sequence
-        (sana_qwennext_openwam_canvas_policy.py _prompt_group_spans)."""
+        ONE span over the whole sequence under ``shared_prompt``
+        (sana_qwennext_openwam_canvas_policy.py _prompt_group_spans) and for
+        a single visual stream that carries ONE prompt (G = 1: the canvas
+        modes since 2026-09-22, sana_qwennext_camera_condition.py
+        ``_shared_or_grouped_spans``, kernel/policy/model.py)."""
 
         state_slots = 0 if self.state_as_cross_attention else 1
+        total = sum(int(count) for count in view_token_counts) + state_slots + int(action_steps)
         if self.shared_prompt:
-            total = sum(int(count) for count in view_token_counts) + state_slots + int(action_steps)
             return ((0, total),)
+        if groups is not None:
+            if int(groups) == 1 and len(view_token_counts) == 1:
+                return ((0, total),)
+            if int(groups) != len(view_token_counts) + 1:
+                raise ValueError(
+                    f"token-group text must carry G = V + 1 = {len(view_token_counts) + 1} groups "
+                    f"(one per view, then the robot tail) or, for one visual stream, G = 1; got G={groups}"
+                )
         spans = []
         offset = 0
         for count in view_token_counts:
@@ -539,6 +604,22 @@ class PolicyModel(nn.Module):
             None,
         )
 
+    def _sana_pixel_real_tokens(self, num_views: int, device: torch.device) -> torch.Tensor | None:
+        """The real canvas cells' positions in the video token order under ``sana_pixel_pad: masked``, else None
+        (sana_qwennext_camera_condition.py ``_sana_pixel_real_tokens``; cached per grid and device)."""
+
+        if self.policy_config.sana_pixel_pad != "masked":
+            return None
+        if num_views != 1:
+            raise ValueError(
+                f"model.extra.sana_pixel_pad: masked serves the one-view sana_pixel canvas; got view_count {num_views}"
+            )
+        cache = self.__dict__.setdefault("_sana_pixel_real_token_cache", {})
+        key = (self.f, self.h, self.w, str(device))
+        if key not in cache:
+            cache[key] = sana_pixel_real_token_index(self.f, self.h, self.w, device=device)
+        return cache[key]
+
     def unpatchify(self, tokens: torch.Tensor) -> torch.Tensor:
         patch_f, patch_h, patch_w = self.x_embedder.patch_size
         tokens = tokens.reshape(
@@ -616,7 +697,7 @@ class PolicyModel(nn.Module):
             x.shape[-2] // self.patch_size[1],
             x.shape[-1] // self.patch_size[2],
         )
-        self._assert_lockstep(timestep, data_info, self.f)
+        self._assert_lockstep(timestep, data_info, self.f, self.policy_config.separate_action_schedule)
         timestep = self._to_model_t_domain(timestep)
         view_shapes = (
             ((self.h, self.w),) if num_views == 1 else _view_shapes(data_info)
@@ -626,6 +707,14 @@ class PolicyModel(nn.Module):
         view_token_counts = [
             self.f * height * width for height, width in view_shapes
         ]
+        # model.extra.sana_pixel_pad: masked (sana_qwennext_camera_condition.py _forward_unified, zekai-merge 319d3f666):
+        # the black quadrant's cells leave the sequence right after x_embedder; their timesteps and RoPE rows follow the
+        # same index, the G = 1 span covers the kept cells, and the video velocity is 0 on the pad
+        full_video_tokens = video.shape[1]
+        real_tokens = self._sana_pixel_real_tokens(num_views, x.device)
+        if real_tokens is not None:
+            video = video.index_select(1, real_tokens)
+            view_token_counts = [int(real_tokens.numel())]
         n_video = video.shape[1]
         robot, action_steps = self._robot_tokens(data_info, video)
         tokens = torch.cat((video, robot), dim=1)
@@ -635,6 +724,8 @@ class PolicyModel(nn.Module):
             self.f,
             view_shapes,
         )
+        if real_tokens is not None:
+            video_timestep = video_timestep.index_select(1, real_tokens)
         action_timestep = self._to_model_t_domain(
             self._action_timesteps(data_info, batch, action_steps, x.device)
         )
@@ -660,10 +751,10 @@ class PolicyModel(nn.Module):
             fps, batch_size=batch, device=x.device
         ):
             rope_linear = self._robot_rope(
-                self.rope_linear, data_info, fps, view_shapes, action_steps, x.device
+                self.rope_linear, data_info, fps, view_shapes, action_steps, x.device, real_tokens
             )
             rope_softmax = self._robot_rope(
-                self.rope_softmax, data_info, fps, view_shapes, action_steps, x.device
+                self.rope_softmax, data_info, fps, view_shapes, action_steps, x.device, real_tokens
             )
 
         time_embedding = self.t_embedder(token_timestep.flatten()).unflatten(
@@ -683,7 +774,7 @@ class PolicyModel(nn.Module):
             text,
             modulation,
             text_mask,
-            self._prompt_group_spans(view_token_counts, action_steps),
+            self._prompt_group_spans(view_token_counts, action_steps, int(text.shape[1])),
             rope_linear,
             rope_softmax,
         )
@@ -691,6 +782,10 @@ class PolicyModel(nn.Module):
         video_tokens = self.final_layer(
             tokens[:, :n_video], time_embedding[:, :, :n_video]
         )
+        if real_tokens is not None:
+            video_tokens = video_tokens.new_zeros(
+                video_tokens.shape[0], full_video_tokens, video_tokens.shape[-1]
+            ).index_copy(1, real_tokens, video_tokens)
         video_tokens = view_to_strip_tokens(video_tokens, self.f, view_shapes)
         action_mask = data_info["action_mask80"].to(tokens.device)
         offset = 0 if self.state_as_cross_attention else 1  # the state token precedes the action rows

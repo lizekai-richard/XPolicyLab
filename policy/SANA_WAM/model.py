@@ -10,8 +10,8 @@ checkpoint was trained on RGB frames).
 
 Contract: ``update_obs`` stores the observation, ``get_action`` returns the predicted chunk of
 joint-target dicts (``left_arm_joint_state`` (6,), ``left_ee_joint_state`` (1,),
-``right_arm_joint_state`` (6,), ``right_ee_joint_state`` (1,); float32) -- 24 per inference for
-the 25-frame tier, or only its first ``n_action_steps`` targets when that key is set, so the
+``right_arm_joint_state`` (6,), ``right_ee_joint_state`` (1,); float32) -- one per source-frame transition (24 for the
+25-frame tier, 32 for the 33-frame tier, strided video or not), or only its first ``n_action_steps`` targets when that key is set, so the
 environment loop re-observes and asks for a fresh chunk after ``n`` ticks (receding-horizon
 replanning) -- and ``reset`` clears the observation and the last-command anchor and advances the
 episode counter used for diffusion seeding. ``anchor_source`` picks the joint state the model is
@@ -77,11 +77,17 @@ from sana_wam_min.robodojo_io import (  # noqa: E402
     upstream_actions_from_action80,
 )
 from sana_wam_min.session import PolicyInferenceSession, find_train_config  # noqa: E402
+from sana_wam_min.robot80 import normalized_gripper_bounds  # noqa: E402
 from sana_wam_min.config import (  # noqa: E402
+    ROBOT_BASE_EEF_LAYOUTS,
+    ROBOT_BASE_EEF_ONLY,
     VISUAL_LAYOUT_OPENWAM_CANVAS,
+    VISUAL_LAYOUT_SANA_PIXEL_CANVAS,
     VISUAL_LAYOUTS,
+    declared_multiview,
     load_train_config,
     resolve_visual_layout,
+    robot_base_eef_layout_from_train_config,
     state_as_cross_attention_from_train_config,
 )
 from sana_wam_min.openwam_canvas import OPENWAM_CANVAS_HEIGHT, OPENWAM_CANVAS_WIDTH  # noqa: E402
@@ -105,6 +111,13 @@ ROBOT80_GRIPPER_SLOTS_2 = (LEFT_GRIPPER_SLOT, RIGHT_GRIPPER_SLOT)
 SEED_DOMAIN = "sana_wam_xpolicylab.diffusion_seed.v1"
 MAX_JSON_SAFE_INTEGER = 2**53 - 1
 DEFAULT_INSTRUCTION = "follow the instruction"
+
+
+# Robot80 slots kept by the diagnostic trajectory dump: 12 arm joints (left 0-5, right 29-34) + 2 gripper closedness slots
+TRAJ_SLOTS = tuple(ROBOT80_JOINT_SLOTS_12) + tuple(ROBOT80_GRIPPER_SLOTS_2)
+# robot_base_eef checkpoints also dump the EEF position + rot6d slots of both arms (appended after the 14 joint /
+# gripper columns, so a 14-column reader of joint-only dumps is unaffected); observed rows carry FK(measured joints)
+TRAJ_EEF_SLOTS = tuple(range(7, 16)) + tuple(range(36, 45))
 
 
 def _is_true(value: Any) -> bool:
@@ -188,6 +201,14 @@ class Model(ModelTemplate):
                 "action_type 'ee' needs a robot_base_eef checkpoint (EEF position/rotation slots supervised); "
                 f"this checkpoint's state profile is {self.state_profile!r}"
             )
+        # robot_base_eef meaning: ``full`` (joints + EEF + grippers, before 2026-09-20) or ``eef_only`` (EEF + grippers;
+        # joints neither fed nor supervised). Resolved from the yaml here (fail before the weight load) and again with
+        # the normalization artifact's scheme stamps once the session has loaded it.
+        self.requested_robot_base_eef_layout = self._requested_robot_base_eef_layout(cfg)
+        self.robot_base_eef_layout = self._resolve_robot_base_eef_layout(
+            self.requested_robot_base_eef_layout, robot_base_eef_layout_from_train_config(self.train_config)
+        )
+        self._check_eef_only_action_type()
         self.eef_pose_check = _is_true(cfg.get("eef_pose_check", True))
         self.kinematics = ArxX5Kinematics(cfg.get("urdf_path") or None) if self.include_eef else None
         self.world_from_base = root_transforms(cfg.get("robot_root_poses") or None)
@@ -212,6 +233,14 @@ class Model(ModelTemplate):
         # evaluator executed); the state input + delta anchor of the next chunk under anchor_source last_command*;
         # cleared by reset() so the first chunk of every episode anchors on the measured state
         self._last_command80: dict[int, np.ndarray] = {}
+        # Diagnostic trajectory dump (trajectory_dump_dir, null = off): per control tick the measured Robot80 joints +
+        # grippers of every update_obs, per inference the measured row, the anchor row and the absolute chunk this
+        # adapter returned -> <dir>/ep<N>.npz (rewritten after every chunk, flushed at reset / trial end)
+        self.trajectory_dump_dir = self._resolve_trajectory_dump_dir(cfg)
+        self._traj_slots = TRAJ_SLOTS + (TRAJ_EEF_SLOTS if self.include_eef else ())
+        self._traj_obs: list[tuple[int, int, int, np.ndarray]] = []
+        self._traj_chunks: list[dict[str, Any]] = []
+        self._traj_step = 0
 
         self.joint_limit_mode = str(cfg.get("joint_limit_mode") or "clip").lower()
         if self.joint_limit_mode not in JOINT_LIMIT_MODES:
@@ -227,12 +256,28 @@ class Model(ModelTemplate):
             steps=_optional_int(cfg.get("sampling_steps")),
             cfg_scale=_optional_float(cfg.get("cfg_scale")),
             flow_shift=_optional_float(cfg.get("flow_shift")),
+            # the action stream's own sampling shift; null = the checkpoint's scheduler.inference_action_flow_shift /
+            # action_flow_shift when the recipe declares one (zekai-merge 4f99eecba), else the video flow_shift (shared)
+            action_flow_shift=_optional_float(cfg.get("action_flow_shift")),
+            # how each view reaches its bucket: null = the yaml's robot_sft.view_resize, else stretch (the only SFT resize
+            # since rwm/zekai-merge 1061b16f0); crop = the legacy resize of every checkpoint trained before it
+            view_resize=cfg.get("view_resize"),
             expected_normalization_sha256=cfg.get("normalization_sha256") or None,
             # per-stream guidance: null inherits cfg_scale; action_cfg_scale=1 with cfg_scale>1 guides the video only
             video_cfg_scale=_optional_float(cfg.get("video_cfg_scale")),
             action_cfg_scale=_optional_float(cfg.get("action_cfg_scale")),
+            # contracts the yaml cannot always name (auto = resolved from the checkpoint, see deploy.yml)
+            rope_mode=cfg.get("rope_mode"),
+            text_groups=cfg.get("text_groups"),
+            canvas_prompt=cfg.get("canvas_prompt"),
+            robot_base_eef_layout=(
+                None if self.requested_robot_base_eef_layout == "auto" else self.requested_robot_base_eef_layout
+            ),
         )
         self.model = self.session.model
+        if self.include_eef:
+            self.robot_base_eef_layout = getattr(self.session, "robot_base_eef_layout", None) or self.robot_base_eef_layout
+            self._check_eef_only_action_type()
         session_layout = getattr(self.session, "visual_layout", self.visual_layout)
         if session_layout != self.visual_layout:
             raise RuntimeError(f"session visual layout {session_layout!r} != adapter {self.visual_layout!r}")
@@ -246,22 +291,48 @@ class Model(ModelTemplate):
         print(
             f"[SANA_WAM] ready: ckpt={self.ckpt_dir} steps={self.session.steps} cfg_scale={self.session.cfg_scale} "
             f"video_cfg_scale={self.session.video_cfg_scale} action_cfg_scale={self.session.action_cfg_scale} "
-            f"flow_shift={self.session.flow_shift} device={self.device} joint_limit_mode={self.joint_limit_mode} "
+            f"flow_shift={self.session.flow_shift} action_flow_shift={getattr(self.session, 'action_flow_shift', None) or 'shared'} "
+            f"device={self.device} joint_limit_mode={self.joint_limit_mode} "
             f"n_action_steps={'all' if self.n_action_steps is None else self.n_action_steps} "
             f"action_type={self.action_type} state_profile={self.state_profile} include_eef={self.include_eef} "
             f"anchor_source={self.anchor_source}"
             + (f" anchor_clamp_rad={self.anchor_clamp_rad}" if self.anchor_clamp_rad is not None else "")
             + f" visual_layout={self.visual_layout} state_as_cross_attention={self.state_as_cross_attention}"
+            + f" view_resize={getattr(self.session, 'view_resize', 'stretch')} ({getattr(self.session, 'view_resize_source', 'default')})"
+            + f" sana_pixel_pad={getattr(self.session, 'sana_pixel_pad', 'unmasked')}"
+            + f" video_fps={getattr(self.session, 'video_fps', None)}"
+            + f" video_frame_stride={getattr(self.session, 'video_frame_stride', 1)}"
+            + f" multiview={declared_multiview(self.train_config)}"
+            + (
+                f" spatial_rope_tile={tuple(getattr(getattr(self.model, 'policy_config', None), 'multiview_spatial_rope_tile_shape', ()))}"
+                if self.visual_layout == "three_view_strip"
+                else ""
+            )
+            + f" rope={getattr(self.model, 'rope_mode', None)} ({getattr(self.session, 'rope_contract', 'n/a')})"
+            + f" text_groups={getattr(self.session, 'text_groups', None)}"
+            + f" canvas_prompt={getattr(self.session, 'canvas_prompt', None)}"
+            + (f" robot_base_eef_layout={self.robot_base_eef_layout}" if self.include_eef else "")
+            + (f" trajectory_dump_dir={self.trajectory_dump_dir}" if self.trajectory_dump_dir is not None else "")
         )
         prompt_sentence = getattr(self.session, "action_mode_text", None)
         if prompt_sentence is not None:
             print(f"[SANA_WAM] prompt Action Mode sentence (from the training yaml): {prompt_sentence!r}")
+        contract = getattr(self.session, "text_contract", None)
+        if contract is not None:
+            print(f"[SANA_WAM] text contract: {contract}; canvas Observation View: {getattr(self.session, 'canvas_view_text', None)!r}")
         if self.visual_layout == VISUAL_LAYOUT_OPENWAM_CANVAS:
             print(
                 f"[SANA_WAM] visual layout openwam_canvas: the 3 cameras are stretched into one "
-                f"{OPENWAM_CANVAS_HEIGHT}x{OPENWAM_CANVAS_WIDTH} L-shaped RGB canvas (head 256x320 above the left/right "
-                "wrists 128x160), encoded ONCE into a 12x10 latent grid (480 video tokens); one prompt shared by the "
-                "video and action tokens"
+                f"{OPENWAM_CANVAS_HEIGHT}x{OPENWAM_CANVAS_WIDTH} RGB canvas (head 256x320 above the left/right "
+                "wrists 128x160), encoded ONCE into a 12x10 latent grid (480 tokens per latent frame)"
+            )
+        elif self.visual_layout == VISUAL_LAYOUT_SANA_PIXEL_CANVAS:
+            ch, cw = self.session.sana_pixel_canvas_hw
+            print(
+                f"[SANA_WAM] visual layout sana_pixel_canvas: every camera resize-cropped to "
+                f"{ch}x{cw}, halved into its 2x2 quadrant (head top-left, "
+                f"left wrist bottom-left, right wrist bottom-right, top-right black), encoded ONCE into a {ch // 32}x{cw // 32} latent "
+                f"grid ({(ch // 32) * (cw // 32)} tokens per latent frame)"
             )
 
     def _log_normalization_contract(self) -> None:
@@ -276,6 +347,9 @@ class Model(ModelTemplate):
         print(
             f"[SANA_WAM] normalization: path={norm.source_path} sha256={norm.sha256} action_mode={norm.action_mode} "
             f"action_representation={norm.action_representation} joint_target_mode={norm.joint_target_mode} "
+            f"eef_target_mode={getattr(norm, 'eef_target_mode', None)} "
+            f"stats_reselected_from(joint={getattr(norm, 'artifact_joint_target_mode', None)}, "
+            f"eef={getattr(norm, 'artifact_eef_target_mode', None)}) "
             f"num_frames={norm.num_frames} model_fps={norm.model_fps} action_slots_normalized={active} state_slots_normalized={state_active}"
         )
         joint6 = list(range(0, 6)) + list(range(29, 35))
@@ -294,13 +368,28 @@ class Model(ModelTemplate):
         seventh = [i for i in (6, 35) if i in active or i in state_active]
         if seventh:
             problems.append(f"7th-joint slots {seventh} carry statistics (ARX-X5 arms have 6 joints; the adapter fills slots 0-5 / 29-34 only)")
+        # 2026-09-20 forced scheme: grippers by statistics (center 0.5, scale 0.5), Rot6D by the fixed [-1, 1] range; the
+        # artifact stamps it, and the generic masked affine map applies it. Before: grippers identity (mask off).
+        gripper_scheme = getattr(norm, "gripper_normalization", None)
         grippers = [i for i in (16, 45) if i in active]
-        if grippers:
-            problems.append(f"gripper slots {grippers} are normalized (the contract keeps closedness as identity)")
+        if grippers and gripper_scheme != "statistics":
+            problems.append(f"gripper slots {grippers} are normalized but the artifact does not declare gripper_normalization: statistics")
+        if not grippers and gripper_scheme == "statistics":
+            problems.append("the artifact declares gripper_normalization: statistics but slots 16 / 45 are not masked")
+        scheme = (
+            f"grippers 16 / 45 by statistics, rot6d {getattr(norm, 'rotation_normalization', None)} (2026-09-20 scheme)"
+            if gripper_scheme == "statistics"
+            else "grippers 16 / 45 identity (pre-2026-09-20 scheme)"
+        )
         if problems:
-            print("[SANA_WAM] WARNING normalization layout does not match the ARX-X5 joint-only contract: " + "; ".join(problems))
+            print("[SANA_WAM] WARNING normalization layout does not match the ARX-X5 contract: " + "; ".join(problems))
         else:
-            print("[SANA_WAM] normalization layout OK: 6 joints per arm (slots 0-5 / 29-34), grippers 16 / 45 identity, slots 6 / 35 unused")
+            print(f"[SANA_WAM] normalization layout OK: 6 joints per arm (slots 0-5 / 29-34), {scheme}, slots 6 / 35 unused")
+        (left_low, left_high), (right_low, right_high) = normalized_gripper_bounds(norm)
+        print(
+            f"[SANA_WAM] gripper clamp in the model domain = raw closedness [0, 1]: left [{left_low:.3f}, {left_high:.3f}] "
+            f"right [{right_low:.3f}, {right_high:.3f}]"
+        )
 
     # -- configuration --------------------------------------------------------
 
@@ -312,10 +401,42 @@ class Model(ModelTemplate):
         return root
 
     @staticmethod
+    def _requested_robot_base_eef_layout(cfg: Mapping[str, Any]) -> str:
+        """``robot_base_eef_layout``: ``auto`` (default) | ``full`` | ``eef_only`` (robot_base_eef checkpoints only)."""
+
+        raw = cfg.get("robot_base_eef_layout")
+        if raw is None or (isinstance(raw, str) and raw.strip().lower() in {"", "auto", "none", "null"}):
+            return "auto"
+        value = str(raw).strip().lower()
+        if value not in ROBOT_BASE_EEF_LAYOUTS:
+            raise ValueError(f"robot_base_eef_layout must be one of ('auto',) + {ROBOT_BASE_EEF_LAYOUTS}, got {raw!r}")
+        return value
+
+    def _resolve_robot_base_eef_layout(self, requested: str, detected: str) -> Optional[str]:
+        """The robot_base_eef meaning of this checkpoint (None for joint_only lines)."""
+
+        if not self.include_eef:
+            if requested != "auto":
+                raise ValueError("robot_base_eef_layout applies to robot_base_eef checkpoints only")
+            return None
+        return detected if requested == "auto" else requested
+
+    def _check_eef_only_action_type(self) -> None:
+        """An EEF-only checkpoint predicts no joint slot, so it can only drive the evaluator through EE poses."""
+
+        if self.robot_base_eef_layout == ROBOT_BASE_EEF_ONLY and self.action_type != "ee":
+            raise ValueError(
+                "this robot_base_eef checkpoint is EEF-only (2026-09-20 contract: EEF pose + grippers, no joint slot "
+                "supervised or fed), so it predicts no joint targets; serve it with action_type 'ee' "
+                "(or set robot_base_eef_layout: full if it predates the change)"
+            )
+
+    @staticmethod
     def _resolve_visual_layout(cfg: Mapping[str, Any], train_cfg: Mapping[str, Any]) -> str:
-        """``visual_layout``: ``auto`` (default) reads the checkpoint's training yaml (model factory + dataset type); an
-        explicit ``three_view_strip`` / ``openwam_canvas`` must agree with it. The key documents the operator's intent
-        and can never re-route a checkpoint through the other front-end (the layout is a training-time contract)."""
+        """``visual_layout``: ``auto`` (default) reads the checkpoint's training yaml (``data.extra.multiview``, model
+        factory + dataset type); an explicit ``three_view_strip`` / ``openwam_canvas`` / ``sana_pixel_canvas`` must
+        agree with it. The key documents the operator's intent and can never re-route a checkpoint through another
+        front-end (the layout is a training-time contract)."""
 
         detected = resolve_visual_layout(train_cfg)
         raw = cfg.get("visual_layout")
@@ -444,17 +565,22 @@ class Model(ModelTemplate):
             env_idx = int(obs.get("env_idx", index))
             self._obs[env_idx] = obs
             self._order.append(env_idx)
+            self._traj_record_obs(env_idx, obs)
+        if self.trajectory_dump_dir is not None:
+            self._traj_step += 1  # one control tick per update_obs call
 
     def _frames_from_obs(self, obs: Mapping[str, Any]) -> list[np.ndarray]:
         vision = obs["vision"]
         frames = [_rgb_frame(vision[cam]["color"], cam, self.strict_image_size) for cam in ROBODOJO_VIEW_ORDER]
         expected = (ROBODOJO_FROZEN_IMAGE_HEIGHT, ROBODOJO_FROZEN_IMAGE_WIDTH, 3)
         if not self._size_warned and any(tuple(f.shape) != expected for f in frames):
-            target = (
-                f"stretched into the {OPENWAM_CANVAS_HEIGHT}x{OPENWAM_CANVAS_WIDTH} OpenWAM canvas slots"
-                if self.visual_layout == VISUAL_LAYOUT_OPENWAM_CANVAS
-                else "resized/cropped to the trained 256x320 bucket"
-            )
+            if self.visual_layout == VISUAL_LAYOUT_OPENWAM_CANVAS:
+                target = f"stretched into the {OPENWAM_CANVAS_HEIGHT}x{OPENWAM_CANVAS_WIDTH} OpenWAM canvas slots"
+            elif self.visual_layout == VISUAL_LAYOUT_SANA_PIXEL_CANVAS:
+                ch, cw = self.session.sana_pixel_canvas_hw
+                target = f"resized/cropped to {ch}x{cw} and halved into the sana_pixel quadrants"
+            else:
+                target = "resized/cropped to the trained 256x320 bucket"
             warnings.warn(
                 f"camera frames are not {expected} (got {[tuple(f.shape) for f in frames]}); they are {target}",
                 stacklevel=2,
@@ -481,6 +607,11 @@ class Model(ModelTemplate):
             # the training row pairs each arm's joints with FK(those joints) -> derive the EEF slots from the row's own
             # joints (measured, or the last command under anchor_source last_command), never from the observation's pose
             state80_raw, state_mask80 = fill_eef_state_slots(state80_raw, eef_state_slot_mask(True), self.kinematics)
+            if self.robot_base_eef_layout == ROBOT_BASE_EEF_ONLY:
+                # EEF-only (2026-09-20): the model's state token and action mask are the 20 EEF-pose + gripper slots;
+                # the joints only served the FK above (sana_multiview_video_action_data.py narrows the slots after it)
+                state_mask80 = np.array(state_mask80, dtype=bool, copy=True)
+                state_mask80[list(ROBOT80_JOINT_SLOTS_12)] = False
             if self.eef_pose_check and self._chunk_index == 0:
                 self._check_observed_eef_pose(obs["state"], state80_measured)
         instruction = self._instruction_from_obs(obs)
@@ -493,8 +624,9 @@ class Model(ModelTemplate):
         generator = torch.Generator(device=self.session.device).manual_seed(seed)
         result = self.session.predict(frames, state80_raw, state_mask80, instruction, generator)
         action80 = result.action80_raw_absolute
-        if self.include_eef:
-            # joints are already anchor + delta (session); the EEF slots are still anchor-relative deltas
+        if self.include_eef and self.session.eef_target_mode == "anchor_delta":
+            # joints are already absolute (session); anchor_delta EEF slots are still anchor-relative deltas.
+            # eef_target_mode absolute lines already predict the base-frame E pose itself -- no reconstruction.
             action80 = reconstruct_absolute_eef(action80, result.action_mask, state80_raw, state_mask80)
         if self.joint_lower is not None and self.joint_limit_mode in ("clip", "reject"):
             action80, clipped = apply_joint_limits(
@@ -522,6 +654,7 @@ class Model(ModelTemplate):
                 assert action["right_ee_joint_state"].shape == (int(ee_dims[1]),)
         actions = self._select_actions_to_execute(actions)
         self._remember_last_command(env_idx, action80, len(actions))
+        self._traj_record_chunk(env_idx, state80_measured, state80_raw, action80, len(actions))
         return [{k: np.ascontiguousarray(a[k], dtype=np.float32) for k in keys} for a in actions]
 
     def _check_observed_eef_pose(self, obs_state: Mapping[str, Any], state80_measured: np.ndarray) -> None:
@@ -588,6 +721,79 @@ class Model(ModelTemplate):
         )
         return anchor
 
+    # -- diagnostic trajectory dump ----------------------------------------------
+
+    @staticmethod
+    def _resolve_trajectory_dump_dir(cfg: Mapping[str, Any]) -> Optional[Path]:
+        """``trajectory_dump_dir``: null/empty = off; otherwise a directory (created) for per-episode ``ep<N>.npz`` dumps."""
+
+        raw = cfg.get("trajectory_dump_dir")
+        if raw is None or raw is False or str(raw).strip().lower() in ("", "null", "none", "false", "off"):
+            return None
+        path = Path(str(raw)).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _traj_record_obs(self, env_idx: int, obs: Mapping[str, Any]) -> None:
+        if self.trajectory_dump_dir is None:
+            return
+        state80, _ = state80_from_obs(obs["state"])
+        if self.include_eef:
+            state80, _ = fill_eef_state_slots(state80, eef_state_slot_mask(True), self.kinematics)
+        row = np.asarray(state80, dtype=np.float32)[list(self._traj_slots)]
+        self._traj_obs.append((int(self._episode_index), int(self._traj_step), int(env_idx), row))
+
+    def _traj_record_chunk(self, env_idx: int, state80_measured: Any, state80_raw: Any, action80: Any, executed: int) -> None:
+        if self.trajectory_dump_dir is None:
+            return
+        rows = torch.as_tensor(action80).detach().to(device="cpu", dtype=torch.float32).numpy()
+        sl = list(self._traj_slots)
+        self._traj_chunks.append(
+            dict(
+                episode=int(self._episode_index),
+                chunk=int(self._chunk_index - 1),  # _chunk_index was advanced by the caller
+                step=int(max(self._traj_step - 1, 0)),  # the update_obs tick this chunk was predicted from
+                env=int(env_idx),
+                measured=np.asarray(state80_measured, dtype=np.float32)[sl],
+                anchor=np.asarray(state80_raw, dtype=np.float32)[sl],
+                actions=np.ascontiguousarray(rows[:, sl], dtype=np.float32),
+                executed=int(executed),
+            )
+        )
+        self._traj_flush()
+
+    def _traj_flush(self) -> None:
+        if self.trajectory_dump_dir is None or (not self._traj_obs and not self._traj_chunks):
+            return
+        obs, ch = self._traj_obs, self._traj_chunks
+        n_slots = len(self._traj_slots)
+        if ch:
+            width = max(c["actions"].shape[0] for c in ch)
+            acts = np.full((len(ch), width, n_slots), np.nan, dtype=np.float32)
+            for i, c in enumerate(ch):
+                acts[i, : c["actions"].shape[0]] = c["actions"]
+        else:
+            acts = np.zeros((0, 0, n_slots), dtype=np.float32)
+        arrays = dict(
+            slots=np.asarray(self._traj_slots, dtype=np.int64),
+            obs_episode=np.asarray([o[0] for o in obs], dtype=np.int64),
+            obs_step=np.asarray([o[1] for o in obs], dtype=np.int64),
+            obs_env=np.asarray([o[2] for o in obs], dtype=np.int64),
+            obs_state=np.stack([o[3] for o in obs]) if obs else np.zeros((0, n_slots), dtype=np.float32),
+            chunk_episode=np.asarray([c["episode"] for c in ch], dtype=np.int64),
+            chunk_index=np.asarray([c["chunk"] for c in ch], dtype=np.int64),
+            chunk_step=np.asarray([c["step"] for c in ch], dtype=np.int64),
+            chunk_env=np.asarray([c["env"] for c in ch], dtype=np.int64),
+            chunk_executed=np.asarray([c["executed"] for c in ch], dtype=np.int64),
+            chunk_measured=np.stack([c["measured"] for c in ch]) if ch else np.zeros((0, n_slots), dtype=np.float32),
+            chunk_anchor=np.stack([c["anchor"] for c in ch]) if ch else np.zeros((0, n_slots), dtype=np.float32),
+            chunk_actions=acts,
+        )
+        out = self.trajectory_dump_dir / f"ep{int(self._episode_index):04d}.npz"
+        tmp = out.with_name(out.stem + ".tmp.npz")
+        np.savez_compressed(tmp, **arrays)
+        os.replace(tmp, out)
+
     def _remember_last_command(self, env_idx: int, action80: Any, executed: int) -> None:
         """Keep row ``executed - 1`` of the absolute chunk -- the last target actually returned, hence the last
         command the evaluator executes before it re-observes -- as the next chunk's last command."""
@@ -642,6 +848,8 @@ class Model(ModelTemplate):
         return results
 
     def reset(self) -> None:
+        self._traj_flush()
+        self._traj_obs, self._traj_chunks, self._traj_step = [], [], 0
         self._obs, self._order = {}, []
         self._chunk_index = 0
         self._last_command80 = {}
@@ -652,4 +860,5 @@ class Model(ModelTemplate):
         return None
 
     def on_trial_end(self, result=None) -> None:
+        self._traj_flush()
         return None

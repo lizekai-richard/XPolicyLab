@@ -44,6 +44,7 @@ class StubSession:
         self.model = None
         self.steps, self.cfg_scale, self.flow_shift = 50, 1.0, 3.5
         self.video_cfg_scale, self.action_cfg_scale = 1.0, 1.0
+        self.eef_target_mode = "anchor_delta"
         self.ramp = ramp
         self.calls: list[dict] = []
 
@@ -537,6 +538,22 @@ def test_action_type_ee_emits_world_link6_poses_and_gripper_openings(patched, ck
     np.testing.assert_allclose(model._last_command80[0][7:10], row[7:10], atol=1e-6)
 
 
+def test_absolute_eef_line_emits_the_predicted_pose_without_anchor_reconstruction(patched, ckpt_dir):
+    # eef_target_mode absolute (e.g. sft_robodojo_eefabs_*): the EEF slots already hold the base-frame E pose itself,
+    # so adding the anchor pose again (the anchor_delta reconstruction) would double it.
+    model = adapter.Model(base_cfg(_make_eef_checkpoint(ckpt_dir), action_type="ee", eef_pose_check=False))
+    model.session.eef_target_mode = "absolute"
+    model.session.ramp = 0.0          # the stub echoes the anchor: predicted absolute EEF pose == anchor pose
+    obs = fake_obs()
+    model.update_obs(obs)
+    actions = model.get_action()
+    anchor = model.session.calls[0]["state80_raw"]
+    for side in ("left", "right"):
+        expected = eef_mod.world_link6_pose_from_slots(anchor, side, model.world_from_base[side])
+        np.testing.assert_allclose(actions[0][f"{side}_ee_pose"], expected, atol=1e-5)
+    np.testing.assert_allclose(model._last_command80[0][7:16], anchor[7:16], atol=1e-6)
+
+
 def test_action_type_ee_requires_an_eef_checkpoint_and_a_measured_anchor(patched, ckpt_dir):
     with pytest.raises(ValueError, match="robot_base_eef checkpoint"):
         adapter.Model(base_cfg(ckpt_dir, action_type="ee"))
@@ -717,5 +734,122 @@ def test_state_as_cross_attention_flag_is_read_from_the_canvas_yaml(patched, ckp
     cfg = yaml.safe_load(SNAPSHOT_CONFIG and open(SNAPSHOT_CONFIG).read())
     cfg["model"]["extra"]["state_as_cross_attention"] = True
     cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
-    with pytest.raises(ValueError, match="only defined for the OpenWAM canvas"):
+    with pytest.raises(ValueError, match="only defined for the rwm/openwam canvas policy class"):
         adapter.Model(base_cfg(ckpt_dir))
+
+
+def test_trajectory_dump_records_every_tick_and_chunk(patched, ckpt_dir, tmp_path):
+    dump = tmp_path / "traj"
+    model = adapter.Model(base_cfg(ckpt_dir, trajectory_dump_dir=str(dump)))
+    assert model.trajectory_dump_dir == dump and dump.is_dir()
+    obs = fake_obs()
+    model.reset()                                    # episode 1 begins; nothing to flush yet
+    model.update_obs(obs)
+    first = model.get_action()
+    for _ in range(3):
+        model.update_obs(obs)                        # control ticks after the returned targets
+    model.update_obs(obs)
+    model.get_action()
+    assert sorted(p.name for p in dump.iterdir()) == ["ep0001.npz"]
+    model.reset()                                    # flushes episode 1, clears the buffers
+    z = np.load(dump / "ep0001.npz")
+    assert z["slots"].tolist() == list(adapter.TRAJ_SLOTS)
+    assert z["obs_state"].shape == (5, 14) and z["obs_step"].tolist() == [0, 1, 2, 3, 4]
+    assert z["obs_episode"].tolist() == [1] * 5 and z["obs_env"].tolist() == [0] * 5
+    assert z["chunk_actions"].shape == (2, K, 14) and z["chunk_step"].tolist() == [0, 4]
+    assert z["chunk_index"].tolist() == [0, 1] and z["chunk_executed"].tolist() == [K, K]
+    np.testing.assert_allclose(z["chunk_actions"][0, :, 0:6], np.stack([a["left_arm_joint_state"] for a in first]), rtol=1e-6)
+    np.testing.assert_allclose(z["chunk_actions"][0, :, 6:12], np.stack([a["right_arm_joint_state"] for a in first]), rtol=1e-6)
+    measured, _ = adapter.state80_from_obs(obs["state"])
+    np.testing.assert_array_equal(z["obs_state"][0], measured[list(adapter.TRAJ_SLOTS)])
+    np.testing.assert_array_equal(z["chunk_measured"][0], measured[list(adapter.TRAJ_SLOTS)])
+    np.testing.assert_array_equal(z["chunk_anchor"][0], measured[list(adapter.TRAJ_SLOTS)])
+    # the next episode starts a new file; an idle reset writes nothing
+    model.reset()
+    assert sorted(p.name for p in dump.iterdir()) == ["ep0001.npz"]
+    # default: off, no state kept
+    off = adapter.Model(base_cfg(ckpt_dir))
+    assert off.trajectory_dump_dir is None
+    off.update_obs(obs)
+    off.get_action()
+    assert off._traj_obs == [] and off._traj_chunks == []
+
+
+def test_trajectory_dump_of_an_eef_checkpoint_appends_the_eef_columns(patched, ckpt_dir, tmp_path):
+    dump = tmp_path / "traj"
+    model = adapter.Model(
+        base_cfg(_make_eef_checkpoint(ckpt_dir), action_type="ee", eef_pose_check=False, trajectory_dump_dir=str(dump))
+    )
+    slots = adapter.TRAJ_SLOTS + adapter.TRAJ_EEF_SLOTS
+    obs = fake_obs()
+    model.reset()
+    model.update_obs(obs)
+    model.get_action()
+    model.reset()
+    z = np.load(dump / "ep0001.npz")
+    assert z["slots"].tolist() == list(slots)
+    assert z["obs_state"].shape == (1, 32) and z["chunk_actions"].shape[-1] == 32
+    # the 14 joint / gripper columns keep their place; the EEF columns of the observed rows are FK(measured joints),
+    # the same values the model was conditioned on
+    anchor = model.session.calls[0]["state80_raw"]
+    np.testing.assert_allclose(z["obs_state"][0, 14:], anchor[list(adapter.TRAJ_EEF_SLOTS)], rtol=1e-6)
+    np.testing.assert_allclose(z["chunk_anchor"][0], anchor[list(slots)], rtol=1e-6)
+
+
+# -- robot_base_eef after 2026-09-20: EEF-only (EEF pose + grippers, joints neither fed nor supervised) --------------
+
+
+def _mark_post_20260920(ckpt_dir):
+    """A robot_base_eef yaml carrying a post-2026-09-20 marker (``model.extra.rope``, declared since 2026-09-23)."""
+    cfg_path = ckpt_dir / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text())
+    cfg["model"].setdefault("extra", {})["rope"] = "aligned"
+    cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    return ckpt_dir
+
+
+def test_an_eef_only_checkpoint_feeds_the_eef_and_gripper_slots_and_needs_ee_actions(patched, ckpt_dir):
+    _mark_post_20260920(_make_eef_checkpoint(ckpt_dir))
+    with pytest.raises(ValueError, match="EEF-only"):
+        adapter.Model(base_cfg(ckpt_dir))                      # joint actions: the model predicts no joint slot
+    model = adapter.Model(base_cfg(ckpt_dir, action_type="ee", eef_pose_check=False))
+    assert model.robot_base_eef_layout == "eef_only"
+    assert patched.from_paths_kwargs["robot_base_eef_layout"] is None     # auto: the session re-resolves it
+    model.update_obs(fake_obs())
+    actions = model.get_action()
+    mask = model.session.calls[0]["state_mask80"]
+    joints = list(adapter.ROBOT80_JOINT_SLOTS_12)
+    assert mask.sum() == 20 and not mask[joints].any()
+    assert mask[list(eef_mod.EEF_SLOTS)].all() and mask[[16, 45]].all()
+    assert len(actions) == K and sorted(actions[0]) == sorted(adapter.ROBODOJO_EE_ACTION_KEYS)
+    # the pre-2026-09-20 meaning on request: 32 slots, joint actions allowed
+    full = adapter.Model(base_cfg(ckpt_dir, robot_base_eef_layout="full", eef_pose_check=False))
+    assert full.robot_base_eef_layout == "full" and patched.from_paths_kwargs["robot_base_eef_layout"] == "full"
+    full.update_obs(fake_obs())
+    full.get_action()
+    assert full.session.calls[0]["state_mask80"].sum() == 32
+
+
+def test_a_pre_20260920_eef_checkpoint_keeps_the_32_slot_meaning(patched, ckpt_dir):
+    model = adapter.Model(base_cfg(_make_eef_checkpoint(ckpt_dir), eef_pose_check=False))
+    assert model.robot_base_eef_layout == "full"
+    with pytest.raises(ValueError, match="robot_base_eef checkpoints only"):
+        adapter.Model(base_cfg(_make_eef_checkpoint(ckpt_dir, ratio=(0.0, 0.0, 1.0)), robot_base_eef_layout="eef_only"))
+    with pytest.raises(ValueError, match="robot_base_eef_layout must be one of"):
+        adapter.Model(base_cfg(_make_eef_checkpoint(ckpt_dir), robot_base_eef_layout="joints"))
+
+
+def test_new_contract_keys_are_forwarded_to_the_session(patched, ckpt_dir):
+    adapter.Model(base_cfg(ckpt_dir, rope_mode="independent_from0", text_groups=2, canvas_prompt="l_shape"))
+    kwargs = patched.from_paths_kwargs
+    assert (kwargs["rope_mode"], kwargs["text_groups"], kwargs["canvas_prompt"]) == ("independent_from0", 2, "l_shape")
+
+
+def test_shipped_deploy_yml_defaults_to_video_only_cfg():
+    """User default of 2026-09-25: the action stream is not guided (action_cfg_scale 1.0); cfg_scale guides the video
+    stream only. A run that wants the historical single knob passes action_cfg_scale=null (or 6) explicitly."""
+
+    import yaml as _yaml
+
+    deploy = _yaml.safe_load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "deploy.yml")))
+    assert deploy["action_cfg_scale"] == 1.0 and deploy["video_cfg_scale"] is None

@@ -204,7 +204,13 @@ class PhysicalTimeWanRotaryPosEmbed(nn.Module):
         self,
         fhw: tuple[int, int, int],
         device: torch.device,
+        *,
+        frame_stride: int = 1,
     ) -> torch.Tensor:
+        """Rotary table of an ``(F, H, W)`` grid; ``frame_stride`` source frames separate consecutive latent frames'
+        time ids (``rope: aligned`` folds the video frame stride in: latent frame j at ``base_fps * j * s / fps``,
+        layers/wan_mrope.py ``forward(..., frame_stride=)``). 1 is the plain context clock."""
+
         if self._model_fps is None:
             raise RuntimeError(
                 "model_fps context must be set before evaluating Wan RoPE"
@@ -212,12 +218,15 @@ class PhysicalTimeWanRotaryPosEmbed(nn.Module):
         frames, height, width = (int(value) for value in fhw)
         if min(frames, height, width) <= 0:
             raise ValueError(f"F/H/W must be positive, got {fhw}")
+        frame_stride = int(frame_stride)
+        if frame_stride < 1:
+            raise ValueError(f"frame_stride must be >= 1, got {frame_stride}")
 
         fps = self._model_fps.to(device=device)
-        if bool(torch.all(fps == self.base_fps)):
+        if frame_stride == 1 and bool(torch.all(fps == self.base_fps)):
             return self.legacy_rope((frames, height, width), device)
         return self.from_position_ids(
-            self._position_ids(frames, height, width, fps, device)
+            self._position_ids(frames, height, width, fps / frame_stride, device)
         )
 
     def from_position_ids(self, position_ids: torch.Tensor) -> torch.Tensor:
@@ -269,8 +278,40 @@ class PhysicalTimeWanRotaryPosEmbed(nn.Module):
         )
 
 
+def independent_action_rope(
+    rope: PhysicalTimeWanRotaryPosEmbed,
+    action_steps: int,
+    batch: int,
+    device: torch.device,
+    first_position: int = 1,
+) -> torch.Tensor:
+    """Full-head-dim 1D rotary phases at the local positions ``first_position .. first_position + A - 1``.
+
+    ``first_position=1`` is the live ``rope: independent`` table (layers/wan_mrope.py ``independent_action_rope``):
+    the state row keeps the zero phase and the robot tail ``[state; action_1 .. action_A]`` is one consecutive local
+    sequence ``0, 1 .. A`` (user ruling 2026-09-22). ``first_position=0`` is the table every strided checkpoint trained
+    before that ruling used (rwm/strided_video ``d27304e82`` .. zekai-merge ``8a61ae18a``: state and the first action
+    both at 0) and the one the OpenWAM canvas policy's ``state_as_cross_attention`` option has always used.
+    No three-axis split and no ``model_fps`` scaling; ``[batch, 1, A, head_dim // 2]`` complex128.
+    """
+
+    head_dim = sum(rope.axis_dims)
+    start = int(first_position)
+    positions = torch.arange(start, start + int(action_steps), device=device, dtype=torch.float64)
+    exponent = torch.arange(0, head_dim, 2, device=device, dtype=torch.float64) / head_dim
+    inverse_frequency = rope.theta ** (-exponent)
+    phase = torch.outer(positions, inverse_frequency)
+    freqs = torch.polar(torch.ones_like(phase), phase)
+    return freqs.view(1, 1, int(action_steps), -1).expand(int(batch), 1, int(action_steps), -1)
+
+
+MULTIVIEW_SPATIAL_ROPE_TILE_SHAPE = (15, 30)
+
+
 __all__ = [
+    "MULTIVIEW_SPATIAL_ROPE_TILE_SHAPE",
     "PhysicalTimeWanRotaryPosEmbed",
     "WanRotaryPosEmbed",
+    "independent_action_rope",
     "semantic_2x2_position_ids",
 ]

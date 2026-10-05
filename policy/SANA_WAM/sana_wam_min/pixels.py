@@ -114,30 +114,61 @@ class ResizeCrop:
         return resize_crop_to_fill(clip, self.size)
 
 
-def video_transform(target_hw: tuple[int, int]) -> T.Compose:
-    """The training clip transform ``ToTensorVideo -> ResizeCrop -> Normalize(0.5, 0.5)``."""
+class StretchResize:
+    """Resize a ``[T, C, H, W]`` clip whole to ``(height, width)``: bilinear, ``align_corners=False``, every source pixel
+    kept. Port of rwm/zekai-merge ``dev/rwm/diffusion/data/view_resize.py`` (1061b16f0 / 77cf81fbf, rwm/mot 034e55dca /
+    f06615b2f): since then an SFT view is stretched to its bucket instead of scaled-to-cover and centre-cropped."""
 
+    def __init__(self, size) -> None:
+        self.size = (int(size[0]), int(size[1]))
+
+    def __call__(self, clip: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.interpolate(clip, size=self.size, mode="bilinear", align_corners=False)
+
+
+# How a view reaches its bucket (the canvas bucket of sana_pixel, the per-view bucket of the sana_latent strip).
+# "stretch" = StretchResize, the default and the only SFT resize upstream since rwm/zekai-merge 1061b16f0 / rwm/mot
+# 034e55dca (77cf81fbf / f06615b2f removed the yaml switch); "crop" = ResizeCrop, the legacy resize of every checkpoint
+# trained before those commits. The OpenWAM canvas always stretched through Pillow and ignores this.
+VIEW_RESIZE_MODES = ("crop", "stretch")
+
+
+def validate_view_resize(value) -> str:
+    """Return ``value`` as one of :data:`VIEW_RESIZE_MODES` or raise ``ValueError``."""
+
+    mode = str(value).strip().lower()
+    if mode not in VIEW_RESIZE_MODES:
+        raise ValueError(f"view_resize must be one of {VIEW_RESIZE_MODES}, got {value!r}")
+    return mode
+
+
+def video_transform(target_hw: tuple[int, int], view_resize: str = "stretch") -> T.Compose:
+    """The training clip transform ``ToTensorVideo -> ResizeCrop | StretchResize -> Normalize(0.5, 0.5)``."""
+
+    size = tuple(int(v) for v in target_hw)
+    resize_step = StretchResize(size) if validate_view_resize(view_resize) == "stretch" else ResizeCrop(size)
     return T.Compose(
         [
             ToTensorVideo(),
-            ResizeCrop(tuple(int(v) for v in target_hw)),
+            resize_step,
             T.Normalize([0.5] * 3, [0.5] * 3, inplace=True),
         ]
     )
 
 
-def frame_to_model_tensor(rgb_uint8_hwc, target_hw: tuple[int, int]) -> torch.Tensor:
+def frame_to_model_tensor(rgb_uint8_hwc, target_hw: tuple[int, int], view_resize: str = "stretch") -> torch.Tensor:
     """Map one RGB uint8 ``[H, W, 3]`` frame (numpy or torch) to float32 ``[3, H_t, W_t]`` in ``[-1, 1]``.
 
     Runs on CPU in float32 exactly like the training dataset transform; the frame must be
-    true RGB (BGR input silently inverts colours downstream).
+    true RGB (BGR input silently inverts colours downstream). ``view_resize`` picks the checkpoint's bucket resize
+    (``stretch``: the whole frame bilinearly resized, the default; ``crop``: scale to cover + centre crop, legacy).
     """
 
     frame = torch.as_tensor(np.asarray(rgb_uint8_hwc) if not torch.is_tensor(rgb_uint8_hwc) else rgb_uint8_hwc)
     if frame.ndim != 3 or frame.shape[-1] != 3 or frame.dtype != torch.uint8:
         raise ValueError(f"frame must be uint8 [H, W, 3], got {tuple(frame.shape)} {frame.dtype}")
     chw = frame.detach().to(device="cpu").permute(2, 0, 1).contiguous()
-    clip = video_transform(target_hw)(chw.unsqueeze(0))
+    clip = video_transform(target_hw, view_resize)(chw.unsqueeze(0))
     return clip[0]
 
 
@@ -193,7 +224,9 @@ __all__ = [
     "ASPECT_RATIO_VIDEO_480_ROBOT",
     "DEFAULT_MULTI_FPS",
     "ResizeCrop",
+    "StretchResize",
     "ToTensorVideo",
+    "VIEW_RESIZE_MODES",
     "frame_to_model_tensor",
     "frames_to_vae_input",
     "get_closest_ratio",
@@ -203,6 +236,7 @@ __all__ = [
     "resize_crop_to_fill",
     "target_size_hw",
     "tier",
+    "validate_view_resize",
     "video_transform",
     "view_latent_shape_tensor",
 ]

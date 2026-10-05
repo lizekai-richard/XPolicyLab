@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Optional, Union
 
@@ -82,6 +82,17 @@ class Normalization:
     model_fps: Optional[int] = None
     num_frames: Optional[int] = None
     source_path: Optional[str] = None
+    # EEF target mode the action EEF statistics describe; artifacts written before the mode existed are anchor-delta
+    eef_target_mode: str = JOINT_TARGET_ANCHOR_DELTA
+    # set by select_*_target_normalization when the statistics were re-selected for another mode (the artifact's own)
+    artifact_joint_target_mode: Optional[str] = None
+    artifact_eef_target_mode: Optional[str] = None
+    # Self-description of the 2026-09-20 forced scheme (robot80_normalization.py): ``unit_range`` Rot6D (fixed
+    # q01 -1 / q99 1, mask on) and ``statistics`` grippers (paired q01/q99 of the closedness, RoboDojo center 0.5 /
+    # scale 0.5, mask on). None on every artifact built before it (Rot6D native, grippers identity, masks off). The
+    # affine formula is the same either way -- the masks and statistics in the blocks carry the difference.
+    rotation_normalization: Optional[str] = None
+    gripper_normalization: Optional[str] = None
 
 
 def _robot80_array(value, name: str, dtype) -> np.ndarray:
@@ -179,6 +190,9 @@ def parse_normalization_artifact(
         model_fps=None if model_fps is None else int(model_fps),
         num_frames=None if num_frames is None else int(num_frames),
         source_path=None if source_path is None else str(source_path),
+        eef_target_mode=validate_joint_target_mode(artifact.get("eef_target_mode") or JOINT_TARGET_ANCHOR_DELTA),
+        rotation_normalization=artifact.get("rotation_normalization"),
+        gripper_normalization=artifact.get("gripper_normalization"),
     )
 
 
@@ -191,6 +205,71 @@ def load_normalization(path: Union[str, Path], expected_sha256: Optional[str] = 
     if expected_sha256 is not None and digest != expected_sha256.lower().removeprefix("sha256:"):
         raise ValueError(f"normalization artifact sha256 mismatch: {path} has {digest}, expected {expected_sha256}")
     return parse_normalization_artifact(json.loads(raw.decode("utf-8")), source_path=str(path), sha256=digest)
+
+
+_JOINT_TARGET_SLOTS = np.r_[np.arange(LEFT_JOINT.start, LEFT_JOINT.stop), np.arange(RIGHT_JOINT.start, RIGHT_JOINT.stop)]
+_EEF_TARGET_SLOTS = np.r_[
+    np.arange(LEFT_EEF_POSITION.start, LEFT_EEF_POSITION.stop),
+    np.arange(LEFT_EEF_ROTATION.start, LEFT_EEF_ROTATION.stop),
+    np.arange(RIGHT_EEF_POSITION.start, RIGHT_EEF_POSITION.stop),
+    np.arange(RIGHT_EEF_ROTATION.start, RIGHT_EEF_ROTATION.stop),
+]
+
+
+def _action_slots_from_state(norm: Normalization, slots: np.ndarray, **fields) -> Normalization:
+    """Copy of ``norm`` whose action statistics (q01/q99/center/scale/mask) take the state ones on ``slots``."""
+
+    updates = dict(fields)
+    for suffix in ("q01_80", "q99_80", "center80", "scale80", "normalization_mask80"):
+        action = getattr(norm, f"action_{suffix}")
+        state = getattr(norm, f"state_{suffix}")
+        if action is None or state is None:
+            continue
+        action = np.array(action, copy=True)
+        action[slots] = state[slots]
+        updates[f"action_{suffix}"] = action
+    return replace(norm, **updates)
+
+
+def select_joint_target_normalization(norm: Normalization, joint_target_mode: str) -> Normalization:
+    """Port of Sana ``select_joint_target_normalization``: the statistics for one joint target mode.
+
+    Same mode -> unchanged. An anchor-delta artifact serving an absolute line -> the action joint slots take the
+    state statistics (they describe the same absolute joints). Any other combination raises.
+    """
+
+    requested = validate_joint_target_mode(joint_target_mode)
+    if norm.joint_target_mode == requested:
+        return norm
+    if norm.joint_target_mode != JOINT_TARGET_ANCHOR_DELTA or requested != JOINT_TARGET_ABSOLUTE:
+        raise ValueError(
+            f"normalization joint_target_mode differs from the training yaml: expected {requested!r}, "
+            f"got {norm.joint_target_mode!r}"
+        )
+    return _action_slots_from_state(
+        norm, _JOINT_TARGET_SLOTS, joint_target_mode=requested, artifact_joint_target_mode=norm.joint_target_mode
+    )
+
+
+def select_eef_target_normalization(norm: Normalization, eef_target_mode: str) -> Normalization:
+    """Port of Sana ``select_eef_target_normalization``: the statistics for one EEF target mode.
+
+    Same mode -> unchanged. An anchor-delta artifact serving an absolute-EEF line -> the action EEF slots (position
+    and rot6d of both arms) take the state statistics, which describe the same absolute robot-base poses. Any other
+    combination raises. Without this an ``eefabs`` line would be denormalized with anchor-delta EEF statistics.
+    """
+
+    requested = validate_joint_target_mode(eef_target_mode)
+    if norm.eef_target_mode == requested:
+        return norm
+    if norm.eef_target_mode != JOINT_TARGET_ANCHOR_DELTA or requested != JOINT_TARGET_ABSOLUTE:
+        raise ValueError(
+            f"normalization eef_target_mode differs from the training yaml: expected {requested!r}, "
+            f"got {norm.eef_target_mode!r}"
+        )
+    return _action_slots_from_state(
+        norm, _EEF_TARGET_SLOTS, eef_target_mode=requested, artifact_eef_target_mode=norm.eef_target_mode
+    )
 
 
 def _affine_robot80_tensors(
@@ -286,6 +365,24 @@ def normalize_action(values: ArrayLike, valid_mask: ArrayLike, norm: Normalizati
     return _finite_result(
         normalize_robot80_affine(values_t, mask, norm.action_center80, norm.action_scale80, norm.action_normalization_mask80)
     )
+
+
+def normalized_gripper_bounds(norm: Normalization) -> tuple[tuple[float, float], tuple[float, float]]:
+    """``((lo, hi) left, (lo, hi) right)``: the model-domain values of raw gripper closedness 0 and 1 (slots 16 / 45).
+
+    Sana's sampler clamps the gripper slots of the NORMALIZED action to [0, 1], which is the raw closedness range
+    only while the grippers are identity-mapped (every artifact before the 2026-09-20 scheme). The 2026-09-20 artifacts
+    normalize them by statistics (center 0.5, scale 0.5), so raw [0, 1] is [-1, 1] in the model domain and a [0, 1]
+    clamp there cuts the whole open half off (commanded opening never above 0.5)."""
+
+    bounds = []
+    for slot in (16, 45):
+        if bool(np.asarray(norm.action_normalization_mask80)[slot]):
+            center, scale = float(np.asarray(norm.action_center80)[slot]), float(np.asarray(norm.action_scale80)[slot])
+            bounds.append(((0.0 - center) / scale, (1.0 - center) / scale))
+        else:
+            bounds.append((0.0, 1.0))
+    return bounds[0], bounds[1]
 
 
 def denormalize_action(values: ArrayLike, valid_mask: ArrayLike, norm: Normalization) -> torch.Tensor:

@@ -94,13 +94,52 @@ ACTION_MODE_TEXTS = {
 }
 
 
+# robot_base_eef became EEF-only on 2026-09-20 (zekai-merge dc902ddce, rwm/mot 2434e9199; docs/eef_only_action_mode.md):
+# the joint clause left the sentence in both joint target modes. Every robot_base_eef run trained before that date
+# carried the 32-slot sentences above (``ACTION_MODE_TEXTS``); the EEF-only runs carry these.
+EEF_ONLY_ACTION_MODE_TEXTS = {
+    ("anchor_delta", "anchor_delta"): (
+        "robot_base_eef; end-effector motion is relative to the first state "
+        "and expressed in the robot base frame, and gripper targets are "
+        "absolute future targets"
+    ),
+    ("absolute", "anchor_delta"): (
+        "robot_base_eef; end-effector motion is relative to the first state "
+        "and expressed in the robot base frame, while gripper "
+        "targets are absolute future targets"
+    ),
+    ("anchor_delta", "absolute"): (
+        "robot_base_eef; end-effector targets are absolute future poses in the "
+        "robot base frame, and "
+        "gripper targets are absolute future targets"
+    ),
+    ("absolute", "absolute"): (
+        "robot_base_eef; end-effector targets are absolute future poses in the "
+        "robot base frame, and gripper targets are absolute future "
+        "targets"
+    ),
+}
+
+
 def action_mode_text(
     action_mode: str = "joint_only",
     joint_target_mode: str = "anchor_delta",
     eef_target_mode: str = "anchor_delta",
+    eef_only: bool = False,
 ) -> str:
-    """The Action Mode sentence of a line (without the trailing period the field renderer adds)."""
+    """The Action Mode sentence of a line (without the trailing period the field renderer adds).
 
+    ``eef_only`` selects the 2026-09-20 EEF-only ``robot_base_eef`` sentence (no joint clause); it only changes the
+    robot_base_eef sentences.
+    """
+
+    if eef_only and str(action_mode) == "robot_base_eef":
+        try:
+            return EEF_ONLY_ACTION_MODE_TEXTS[(str(joint_target_mode), str(eef_target_mode))]
+        except KeyError as error:
+            raise ValueError(
+                f"unsupported target modes joint={joint_target_mode!r} eef={eef_target_mode!r}"
+            ) from error
     try:
         table = ACTION_MODE_TEXTS[(str(joint_target_mode), str(eef_target_mode))]
     except KeyError as error:

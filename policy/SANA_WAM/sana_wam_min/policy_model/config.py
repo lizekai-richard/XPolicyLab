@@ -25,6 +25,12 @@ SOFTMAX_ATTENTION_NAMES = (
 )
 FFN_NAMES = ("SwiGLU", "SwiGLUFusedAct")
 MULTIVIEW_SPATIAL_ROPE_LAYOUTS = ("local_reset", "semantic_2x2")
+# ``model.extra.rope`` (layers/wan_mrope.py ROPE_MODES, 2026-09-23): ``aligned`` puts the video and the robot rows on one
+# physical clock (the video frame stride folded into the video time axis), ``independent`` keeps the video on its own
+# mRoPE clock and gives the robot tail one local 1D sequence (state 0, actions 1 .. A).
+ROPE_MODES = ("aligned", "independent")
+# ``model.extra.sana_pixel_pad`` (dev/rwm/diffusion/data/sana_pixel_multiview_layout.py SANA_PIXEL_PAD_MODES, 2026-09-27)
+SANA_PIXEL_PAD_MODES = ("unmasked", "masked")
 
 
 def _value(container: Any, name: str, default: Any = None) -> Any:
@@ -104,6 +110,16 @@ class PolicyConfig:
     action_temporal_compression: int = 8
     multiview_spatial_rope_layout: str = "semantic_2x2"
     multiview_spatial_rope_tile_shape: tuple[int, int] = (15, 30)
+    # ``model.extra.rope`` of the training yaml; None = undeclared (every checkpoint trained before 2026-09-23): a dense
+    # batch is ``aligned`` (the only table those runs had) and a strided batch takes the independent table whose first
+    # action sits at ``legacy_strided_action_origin`` (0 before zekai-merge 8a61ae18a, 1 after it). The live model
+    # refuses an undeclared strided batch; the mirror keeps serving the checkpoints trained before the key existed.
+    rope: str | None = None
+    legacy_strided_action_origin: int = 0
+    # The config maps the action stream through its own flow shift (``scheduler.action_flow_shift`` /
+    # ``inference_action_flow_shift``, zekai-merge 4f99eecba): the action rows still share one t per sample, but that t
+    # is the action schedule's, not the video's (sana_qwennext_action_policy.py _assert_policy_lockstep).
+    separate_action_schedule: bool = False
     fp32_attention: bool = True
     out_channels: int = 128
     # One text group shared by every token (G = 1: one query span over the video tokens and the robot tail) --
@@ -114,6 +130,10 @@ class PolicyConfig:
     # appended cross-attention key of the (single) text group instead of riding the self-attention robot tail as
     # a clean token, and the action rows get an independent full-head-dim 1D RoPE over local positions 0..A-1.
     state_as_cross_attention: bool = False
+    # ``model.extra.sana_pixel_pad`` (rwm/zekai-merge 319d3f666): ``masked`` drops the one-view sana_pixel canvas's black
+    # quadrant cells from the token sequence right after x_embedder (their timesteps and RoPE rows with them) and returns
+    # velocity 0 there; only the one bidirectional policy class defines it (sana_qwennext_action_policy.py).
+    sana_pixel_pad: str = "unmasked"
 
     def validate(self) -> "PolicyConfig":
         _require("patch_size", tuple(self.patch_size), (1, 1, 1))
@@ -134,6 +154,9 @@ class PolicyConfig:
                 "multiview_spatial_rope_tile_shape must contain two positive "
                 f"integers, got {tile}"
             )
+        if self.rope is not None:
+            _require_one_of("rope", self.rope, ROPE_MODES)
+        _require_one_of("legacy_strided_action_origin", int(self.legacy_strided_action_origin), (0, 1))
         if self.depth <= 0 or self.attn_res_block_size <= 0:
             raise ValueError("depth and attn_res_block_size must be positive")
         if self.linear_head_dim <= 0 or self.softmax_head_dim <= 0:
@@ -153,6 +176,9 @@ class PolicyConfig:
             raise ValueError("softmax_layer_indices must be non-empty and unique")
         if min(indices) < 0 or max(indices) >= self.depth:
             raise ValueError("softmax_layer_indices fall outside the trunk depth")
+        _require_one_of("sana_pixel_pad", self.sana_pixel_pad, SANA_PIXEL_PAD_MODES)
+        if self.sana_pixel_pad == "masked" and (self.shared_prompt or self.state_as_cross_attention):
+            raise ValueError("sana_pixel_pad masked is implemented by the bidirectional policy only, not the canvas class")
         if self.state_as_cross_attention and not self.shared_prompt:
             # the live model defines the opt-in only on the canvas policy, whose prompt is shared (G = 1)
             raise ValueError(
@@ -219,6 +245,8 @@ class PolicyConfig:
             softmax_head_dim = 2 * linear_head_dim
 
         model_extra = _value(model_cfg, "extra", None) or {}
+        rope = kwargs.get("rope", _value(model_extra, "rope", None))
+        rope = None if rope is None else str(rope).strip().lower()
         state_as_cross_attention = bool(
             kwargs.get(
                 "state_as_cross_attention",
@@ -257,8 +285,11 @@ class PolicyConfig:
             action_dim=ROBOT80_DIM,
             state_dim=ROBOT80_DIM,
             action_temporal_compression=temporal_compression,
+            # The live option existed until 2026-09-21 (default local_reset, but every trainer dump spells the key
+            # out); since then V > 1 is always semantic_2x2 and the key is gone from the yaml, so an absent key means
+            # semantic_2x2 (dev/rwm/diffusion/model/nets/sana_qwennext_multiview.py, rwm/zekai-merge 4798b12e7).
             multiview_spatial_rope_layout=str(
-                _value(model_cfg, "multiview_spatial_rope_layout", "local_reset")
+                _value(model_cfg, "multiview_spatial_rope_layout", "semantic_2x2")
             ),
             multiview_spatial_rope_tile_shape=tuple(
                 int(value)
@@ -275,6 +306,15 @@ class PolicyConfig:
             out_channels=out_channels,
             shared_prompt=bool(kwargs.get("shared_prompt", False)),
             state_as_cross_attention=state_as_cross_attention,
+            rope=rope,
+            legacy_strided_action_origin=int(kwargs.get("legacy_strided_action_origin", 0)),
+            sana_pixel_pad=str(kwargs.get("sana_pixel_pad", _value(model_extra, "sana_pixel_pad", None)) or "unmasked")
+            .strip()
+            .lower(),
+            separate_action_schedule=any(
+                _value(_value(config, "scheduler"), key) is not None
+                for key in ("action_flow_shift", "inference_action_flow_shift")
+            ),
         )
         return resolved.validate()
 
@@ -290,6 +330,7 @@ class PolicyConfig:
 
 
 __all__ = [
+    "ROPE_MODES",
     "FFN_NAMES",
     "LINEAR_ATTENTION_NAMES",
     "MULTIVIEW_SPATIAL_ROPE_LAYOUTS",

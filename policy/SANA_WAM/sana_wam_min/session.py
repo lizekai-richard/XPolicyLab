@@ -3,10 +3,14 @@
 The session owns the four loaded components (policy transformer, LTX-2.3 VAE bundle, Gemma
 tokenizer/encoder, Robot80 normalization) and reproduces the deployment ``predict`` of Sana's
 ``PolicyInferenceSession`` in the same order: token-group prompt encoding, frame-0 VAE encode
-into a zero-filled latent window (per view, packed as one strip -- or the three cameras
-composited into one OpenWAM canvas and encoded once, ``visual_layout`` from the training yaml),
-``data_info`` assembly, video-then-action noise from one generator, Flow-Euler sampling under
-bf16 autocast, then denormalize -> anchor + delta (anchor_delta lines) -> gripper clip.
+into a zero-filled latent window, ``data_info`` assembly, video-then-action noise from one
+generator, Flow-Euler sampling under bf16 autocast, then denormalize -> anchor + delta
+(anchor_delta lines) -> gripper clip. The visual front-end follows the training yaml
+(``visual_layout``): every view on its own, packed as one strip (``sana_latent``), or the three
+cameras composited into ONE canvas encoded once -- OpenWAM's head-over-wrists 384x320 canvas or the
+sana_pixel 2x2 pixel canvas (320x480) -- with the canvas's own text contract (G = 1 or 2 rows,
+the era's layout descriptor). A strided checkpoint (``robot_sft.video_fps``) fills a shorter
+latent window and publishes ``video_frame_stride``, on the strip and on both canvases.
 ``predict_from_latent`` replays the same sampler call from a pre-encoded window (validation
 bundles).
 """
@@ -26,17 +30,34 @@ import torch
 from .actions import model_action_to_absolute
 from .checkpoint import build_policy_model, load_policy_weights, resolve_checkpoint_file
 from .config import (
+    CANVAS_LAYOUTS,
+    ROBOT_BASE_EEF_FULL,
+    ROBOT_BASE_EEF_LAYOUTS,
+    ROBOT_BASE_EEF_ONLY,
     VISUAL_LAYOUT_OPENWAM_CANVAS,
+    VISUAL_LAYOUT_SANA_PIXEL_CANVAS,
     action_mode_from_train_config,
     eef_target_mode_from_train_config,
+    is_openwam_canvas_policy_class,
     joint_target_mode_from_train_config,
     load_train_config,
     policy_config_from_train_config,
+    sana_pixel_pad_from_train_config,
+    view_resize_from_train_config,
+    resolve_canvas_text_contract,
+    resolve_rope_contract,
     resolve_visual_layout,
+    robot_base_eef_layout_from_train_config,
     sampling_defaults_from_train_config,
+    sana_pixel_canvas_hw_from_train_config,
+    sft_options_from_train_config,
+    video_fps_from_train_config,
+    video_frame_stride_from_train_config,
 )
+from .frame_stride import strided_video_frames
 from .multiview import pack_multiview_latents
 from .openwam_canvas import (
+    OPENWAM_PROMPT_TEXTS,
     OPENWAM_VIEW_KEY,
     OPENWAM_VIEW_SLOT_IDS,
     assemble_openwam_canvas,
@@ -44,9 +65,24 @@ from .openwam_canvas import (
     expected_canvas_latent_hw,
     render_canvas_prompt_rows,
 )
+from .sana_pixel_canvas import (
+    SANA_PIXEL_PROMPT_TEXTS,
+    SANA_PIXEL_VIEW_KEY,
+    SANA_PIXEL_VIEW_SLOT_IDS,
+    expected_sana_pixel_latent_hw,
+    sana_pixel_canvas_from_frames,
+)
 from .pixels import frame_to_model_tensor, frames_to_vae_input, latent_frame_count, observation_window, target_size_hw, tier
 from .robodojo_io import ROBODOJO_MODEL_FPS_HZ, ROBODOJO_VIEW_ORDER, VIEW_SLOT_IDS
-from .robot80 import ROBOT80_DIM, Normalization, load_normalization, normalize_state
+from .robot80 import (
+    ROBOT80_DIM,
+    Normalization,
+    load_normalization,
+    normalize_state,
+    normalized_gripper_bounds,
+    select_eef_target_normalization,
+    select_joint_target_normalization,
+)
 from .sampler import sample_policy
 from .text import (
     action_mode_text,
@@ -99,14 +135,31 @@ def find_train_config(checkpoint_dir: str | Path) -> Path:
     )
 
 
-def resolve_normalization_path(checkpoint_dir: str | Path, normalization_path: Optional[str | Path] = None) -> Path:
-    """Explicit path, else ``<ckpt>/normalization/<canonical name>``, else the packaged copy; never a directory scan."""
+def normalization_file_name(num_frames: Optional[int] = None) -> str:
+    """The artifact file name of a ``num_frames``-row window: the training side names it by the window length, so an
+    f33 line ships ``..._f33_normalization.json``, not the f25 name of the historical lines."""
+
+    if num_frames is None:
+        return NORMALIZATION_FILE_NAME
+    return f"robodojo_arx_x5_model_fps_25_f{int(num_frames)}_normalization.json"
+
+
+def resolve_normalization_path(
+    checkpoint_dir: str | Path, normalization_path: Optional[str | Path] = None, num_frames: Optional[int] = None
+) -> Path:
+    """Explicit path, else ``<ckpt>/normalization/<canonical name>``, else the packaged copy; never a directory scan.
+
+    ``num_frames`` (the training window length) picks the canonical name; the f25 name is tried after it so every
+    historical checkpoint resolves exactly as before.
+    """
 
     if normalization_path is not None:
         return Path(normalization_path).expanduser().resolve()
-    canonical = checkpoint_root(checkpoint_dir) / "normalization" / NORMALIZATION_FILE_NAME
-    if canonical.is_file():
-        return canonical
+    root = checkpoint_root(checkpoint_dir) / "normalization"
+    for name in dict.fromkeys((normalization_file_name(num_frames), NORMALIZATION_FILE_NAME)):
+        canonical = root / name
+        if canonical.is_file():
+            return canonical
     return PACKAGED_NORMALIZATION_PATH
 
 
@@ -124,7 +177,9 @@ def load_checked_normalization(
     """
 
     explicit_pin = expected_sha256 is not None
-    norm_path = resolve_normalization_path(checkpoint_dir, normalization_path)
+    norm_path = resolve_normalization_path(
+        checkpoint_dir, normalization_path, num_frames=(train_cfg.get("data") or {}).get("num_frames")
+    )
     if not explicit_pin and norm_path == PACKAGED_NORMALIZATION_PATH:
         expected_sha256 = TRAINING_NORMALIZATION_SHA256
     normalization = load_normalization(norm_path, expected_sha256=expected_sha256)
@@ -134,15 +189,19 @@ def load_checked_normalization(
         # checkpoint served with the packaged joint-only artifact (rot6d slots left native) would otherwise load silently
         raise ValueError(
             f"normalization artifact {norm_path} (sha256 {normalization.sha256[:12]}...) is not the one the training yaml pins "
-            f"(data.extra.robotwin_sft.normalization_sha256 {yaml_pin[:12]}...); put the run's artifact at "
+            f"(data.extra.robot_sft.normalization_sha256 {yaml_pin[:12]}...); put the run's artifact at "
             f"<checkpoint>/normalization/{NORMALIZATION_FILE_NAME} or set normalization_path / normalization_sha256 explicitly"
         )
+    # Same selection as Sana's dataset (select_joint_target_normalization, then select_eef_target_normalization for
+    # every non-qwen action mode): an anchor-delta artifact serving an absolute line hands the state statistics to
+    # the affected action slots; any other mode mismatch raises.
     trained_mode = str(train_cfg["data"]["extra"]["joint_target_mode"])
-    if normalization.joint_target_mode != trained_mode:
-        raise ValueError(
-            f"normalization joint_target_mode {normalization.joint_target_mode!r} differs from "
-            f"the training yaml {trained_mode!r} ({norm_path})"
-        )
+    try:
+        normalization = select_joint_target_normalization(normalization, trained_mode)
+        if action_mode_from_train_config(train_cfg) != "qwen_canonical":
+            normalization = select_eef_target_normalization(normalization, eef_target_mode_from_train_config(train_cfg))
+    except ValueError as error:
+        raise ValueError(f"{error} ({norm_path})") from error
     num_frames = int(train_cfg["data"]["num_frames"])
     if normalization.num_frames is not None and normalization.num_frames != num_frames:
         raise ValueError(f"normalization num_frames {normalization.num_frames} != training {num_frames} ({norm_path})")
@@ -150,13 +209,11 @@ def load_checked_normalization(
 
 
 def training_normalization_pin(train_cfg: dict) -> Optional[str]:
-    """The artifact digest the training yaml pins (``data.extra.robotwin_sft.normalization_sha256``: one digest, or a
-    ``{file name: digest}`` map keyed by the canonical file name), lowercased without a ``sha256:`` prefix; None if absent."""
+    """The artifact digest the training yaml pins (``data.extra.robot_sft.normalization_sha256``, ``robotwin_sft`` before
+    2026-09-24: one digest, or a ``{file name: digest}`` map keyed by the canonical file name), lowercased without a
+    ``sha256:`` prefix; None if absent."""
 
-    try:
-        pin = train_cfg["data"]["extra"]["robotwin_sft"]["normalization_sha256"]
-    except (KeyError, TypeError):
-        return None
+    pin = sft_options_from_train_config(train_cfg).get("normalization_sha256")
     if isinstance(pin, dict):
         pin = pin.get(NORMALIZATION_FILE_NAME)
     if not isinstance(pin, str) or not pin.strip():
@@ -204,6 +261,21 @@ def resolve_branch_cfg_scales(
     return video, action
 
 
+def resolve_action_flow_shift(train_cfg: dict, requested: Optional[float] = None) -> Optional[float]:
+    """The action stream's sampling flow shift, in Sana's order (``resolve_action_flow_shift``, zekai-merge 4f99eecba):
+    an explicit value (deploy ``action_flow_shift``), else ``scheduler.inference_action_flow_shift``, else
+    ``scheduler.action_flow_shift`` (the training shift); None = the video shift, the historical shared schedule."""
+
+    sched = train_cfg.get("scheduler") or {}
+    for value in (requested, sched.get("inference_action_flow_shift"), sched.get("action_flow_shift")):
+        if value is not None:
+            shift = float(value)
+            if not math.isfinite(shift) or shift <= 0:
+                raise ValueError(f"action flow shift must be positive and finite, got {value!r}")
+            return shift
+    return None
+
+
 class PolicyInferenceSession:
     """The loaded policy and its conditioning encoders, driven one observation chunk at a time."""
 
@@ -222,6 +294,11 @@ class PolicyInferenceSession:
         checkpoint_path: Optional[str] = None,
         video_cfg_scale: Optional[float] = None,
         action_cfg_scale: Optional[float] = None,
+        text_groups: Any = None,
+        canvas_prompt: Optional[str] = None,
+        robot_base_eef_layout: Optional[str] = None,
+        action_flow_shift: Optional[float] = None,
+        view_resize: Optional[str] = None,
     ) -> None:
         self.model = model
         self.vae = vae
@@ -236,6 +313,13 @@ class PolicyInferenceSession:
             self.cfg_scale, video_cfg_scale, action_cfg_scale
         )
         self.flow_shift = float(flow_shift)
+        # the action stream's own schedule when the recipe declares one (None = the video shift, shared)
+        self.action_flow_shift = resolve_action_flow_shift(train_config, action_flow_shift)
+        # how the checkpoint's SFT views reached their bucket (crop before rwm/zekai-merge 1061b16f0, stretch after)
+        self.view_resize, self.view_resize_source = view_resize_from_train_config(train_config, view_resize)
+        # model.extra.sana_pixel_pad (zekai-merge 319d3f666): masked drops the canvas's black quadrant from the model's
+        # token sequence (PolicyModel.forward); the observation canvas itself is built exactly as for unmasked
+        self.sana_pixel_pad = sana_pixel_pad_from_train_config(train_config)
         self.checkpoint_path = checkpoint_path
         self.image_size = int(train_config["model"]["image_size"])
         self.multi_fps = train_config["data"].get("multi_fps") or None
@@ -243,15 +327,65 @@ class PolicyInferenceSession:
         # the three cameras of every observation, in the order the strip packs them / the canvas slots take them
         self.view_order = ROBODOJO_VIEW_ORDER
         self.visual_layout = resolve_visual_layout(train_config)
-        self.canvas = self.visual_layout == VISUAL_LAYOUT_OPENWAM_CANVAS
-        self.view_keys = (OPENWAM_VIEW_KEY,) if self.canvas else ROBODOJO_VIEW_ORDER
-        self.view_slot_ids = OPENWAM_VIEW_SLOT_IDS if self.canvas else VIEW_SLOT_IDS
+        self.canvas = self.visual_layout in CANVAS_LAYOUTS
+        self.canvas_policy_class = is_openwam_canvas_policy_class(train_config)
+        if self.visual_layout == VISUAL_LAYOUT_OPENWAM_CANVAS:
+            self.view_keys, self.view_slot_ids = (OPENWAM_VIEW_KEY,), OPENWAM_VIEW_SLOT_IDS
+        elif self.visual_layout == VISUAL_LAYOUT_SANA_PIXEL_CANVAS:
+            self.view_keys, self.view_slot_ids = (SANA_PIXEL_VIEW_KEY,), SANA_PIXEL_VIEW_SLOT_IDS
+        else:
+            self.view_keys, self.view_slot_ids = ROBODOJO_VIEW_ORDER, VIEW_SLOT_IDS
+        # the sana_pixel canvas size the recipe's aspect_ratio_type names (320x480 or 320x512)
+        self.sana_pixel_canvas_hw = (
+            sana_pixel_canvas_hw_from_train_config(train_config) if self.visual_layout == VISUAL_LAYOUT_SANA_PIXEL_CANVAS else None
+        )
+        if self.sana_pixel_pad == "masked":
+            if self.visual_layout != VISUAL_LAYOUT_SANA_PIXEL_CANVAS or tuple(self.sana_pixel_canvas_hw) != (320, 512):
+                raise ValueError(
+                    "model.extra.sana_pixel_pad: masked needs the 320x512 sana_pixel canvas (every quadrant edge on the "
+                    f"latent grid); got {self.visual_layout} {self.sana_pixel_canvas_hw}"
+                )
+            built = getattr(getattr(model, "policy_config", None), "sana_pixel_pad", "masked")
+            if built != "masked":
+                raise ValueError(f"the training yaml masks the sana_pixel pad but the model was built with sana_pixel_pad={built!r}")
+        # strided video (rwm/strided_video, robot_sft.video_fps): the training video sampled every s-th row of the
+        # window while the action rows stayed dense. The observation encode then fills a shorter latent window and the
+        # batch carries the stride so the model expects (F - 1) * 8 * s action rows and places its robot tail / video
+        # clock by the RoPE mode. Both canvases take it too since 2026-09-22 (canvas frame j = window row j * s).
+        self.video_fps = video_fps_from_train_config(train_config)
+        self.video_frame_stride = video_frame_stride_from_train_config(train_config)
+        if self.canvas_policy_class and self.video_frame_stride != 1:
+            raise NotImplementedError(
+                "strided video (data.extra.robot_sft.video_fps) is not defined for the rwm/openwam canvas policy "
+                "class, which predates frame striding"
+            )
+        # text contract: the strip's G = V + 1 rows, or a canvas's G = 1 / 2 rows with the era's layout descriptor
+        self.text_groups, self.canvas_prompt, self.text_contract = resolve_canvas_text_contract(
+            train_config, text_groups, canvas_prompt
+        )
+        if self.visual_layout == VISUAL_LAYOUT_OPENWAM_CANVAS:
+            self.canvas_view_text = OPENWAM_PROMPT_TEXTS[self.canvas_prompt]
+        elif self.visual_layout == VISUAL_LAYOUT_SANA_PIXEL_CANVAS:
+            self.canvas_view_text = SANA_PIXEL_PROMPT_TEXTS[self.canvas_prompt]
+        else:
+            self.canvas_view_text = None
         # the Action Mode sentence of the prompt follows the checkpoint's own action / target modes: the training
         # prompt always carried the sentence of its line, so serving another one is a text-conditioning mismatch
         self.action_mode = action_mode_from_train_config(train_config)
         self.joint_target_mode = joint_target_mode_from_train_config(train_config)
         self.eef_target_mode = eef_target_mode_from_train_config(train_config)
-        self.action_mode_text = action_mode_text(self.action_mode, self.joint_target_mode, self.eef_target_mode)
+        # robot_base_eef became EEF-only on 2026-09-20 (prompt without the joint clause, joints neither fed nor
+        # supervised); ``robot_base_eef_layout`` is resolved from the yaml + normalization markers or given explicitly
+        layout = robot_base_eef_layout or robot_base_eef_layout_from_train_config(train_config, normalization)
+        if layout not in ROBOT_BASE_EEF_LAYOUTS:
+            raise ValueError(f"robot_base_eef_layout must be one of {ROBOT_BASE_EEF_LAYOUTS}, got {layout!r}")
+        self.robot_base_eef_layout = layout if self.action_mode == "robot_base_eef" else None
+        self.action_mode_text = action_mode_text(
+            self.action_mode,
+            self.joint_target_mode,
+            self.eef_target_mode,
+            eef_only=self.robot_base_eef_layout == ROBOT_BASE_EEF_ONLY,
+        )
         self.caption_max_length = int(train_config["text_encoder"]["model_max_length"])
         self._prompt_cache: OrderedDict = OrderedDict()
 
@@ -269,6 +403,12 @@ class PolicyInferenceSession:
         expected_normalization_sha256: Optional[str] = None,
         video_cfg_scale: Optional[float] = None,
         action_cfg_scale: Optional[float] = None,
+        rope_mode: Optional[str] = None,
+        text_groups: Any = None,
+        canvas_prompt: Optional[str] = None,
+        robot_base_eef_layout: Optional[str] = None,
+        action_flow_shift: Optional[float] = None,
+        view_resize: Optional[str] = None,
     ) -> "PolicyInferenceSession":
         """Load every component from disk: train yaml -> normalization -> bf16 model + weights -> VAE -> Gemma.
 
@@ -280,7 +420,10 @@ class PolicyInferenceSession:
         device = torch.device(device)
         config_path = find_train_config(checkpoint_dir)
         train_cfg = load_train_config(str(config_path))
-        policy_config = policy_config_from_train_config(train_cfg)
+        rope, legacy_origin, rope_label = resolve_rope_contract(train_cfg, rope_mode)
+        policy_config = policy_config_from_train_config(train_cfg, rope=rope, legacy_origin=legacy_origin)
+        # the text contract is resolved (and refused) before the multi-minute weight load
+        resolve_canvas_text_contract(train_cfg, text_groups, canvas_prompt)
         steps, cfg_scale, flow_shift = resolve_sampling_knobs(train_cfg, steps, cfg_scale, flow_shift)
         video_cfg_scale, action_cfg_scale = resolve_branch_cfg_scales(cfg_scale, video_cfg_scale, action_cfg_scale)
         normalization = load_checked_normalization(
@@ -306,8 +449,14 @@ class PolicyInferenceSession:
             checkpoint_path=resolve_checkpoint_file(str(checkpoint_dir)),
             video_cfg_scale=video_cfg_scale,
             action_cfg_scale=action_cfg_scale,
+            text_groups=text_groups,
+            canvas_prompt=canvas_prompt,
+            robot_base_eef_layout=robot_base_eef_layout,
+            action_flow_shift=action_flow_shift,
+            view_resize=view_resize,
         )
         session.load_report = load_report
+        session.rope_contract = rope_label
         return session
 
     # -- conditioning --------------------------------------------------------
@@ -346,7 +495,11 @@ class PolicyInferenceSession:
             return cached
         if self.canvas:
             rows = render_canvas_prompt_rows(
-                instruction, include_instruction=True, action_mode_text=self.action_mode_text
+                instruction,
+                include_instruction=True,
+                action_mode_text=self.action_mode_text,
+                view_text=self.canvas_view_text,
+                groups=self.text_groups,
             )
         else:
             rows = render_token_group_rows(
@@ -369,13 +522,15 @@ class PolicyInferenceSession:
             raise ValueError(
                 f"expected {len(self.view_order)} camera frames in order {self.view_order}, got {len(frames_rgb)}"
             )
-        if self.canvas:
+        if self.visual_layout == VISUAL_LAYOUT_OPENWAM_CANVAS:
             return self._encode_canvas_observation(frames_rgb, latent_frames)
+        if self.visual_layout == VISUAL_LAYOUT_SANA_PIXEL_CANVAS:
+            return self._encode_sana_pixel_observation(frames_rgb, latent_frames)
         windows = []
         for frame in frames_rgb:
             frame = np.asarray(frame)
             target = target_size_hw(self.image_size, frame_hw=(int(frame.shape[0]), int(frame.shape[1])))
-            pixels = frame_to_model_tensor(frame, target)
+            pixels = frame_to_model_tensor(frame, target, self.view_resize)
             video = frames_to_vae_input(pixels.unsqueeze(0)).to(device=self.vae.device, dtype=self.vae.dtype)
             latent = encode_video(self.vae, video)
             windows.append(observation_window(latent, latent_frames))
@@ -405,6 +560,26 @@ class PolicyInferenceSession:
         window = observation_window(latent, latent_frames)
         return window, (actual,)
 
+    def _encode_sana_pixel_observation(self, frames_rgb: Sequence[np.ndarray], latent_frames: int) -> tuple[torch.Tensor, tuple]:
+        """Tile the three cameras into the sana_pixel canvas of the recipe (320x480 or 320x512; each view resize-cropped
+        (or, for stretch checkpoints, stretched) to the canvas bucket, halved into its semantic quadrant, the top-right quadrant black), encode it once and return
+        the ``[1, C, F, 10, 15 | 16]`` window with its one-entry view-shape tuple."""
+
+        pixels = sana_pixel_canvas_from_frames(
+            [np.asarray(frame) for frame in frames_rgb], VIEW_SLOT_IDS, self.sana_pixel_canvas_hw, view_resize=self.view_resize
+        )
+        video = frames_to_vae_input(pixels.unsqueeze(0)).to(device=self.vae.device, dtype=self.vae.dtype)
+        latent = encode_video(self.vae, video)
+        expected = expected_sana_pixel_latent_hw(self.vae.spatial_compression, self.sana_pixel_canvas_hw)
+        actual = (int(latent.shape[-2]), int(latent.shape[-1]))
+        if actual != expected:
+            raise ValueError(
+                f"sana_pixel canvas latent grid {actual} differs from the trained {expected} "
+                f"(320x480 canvas at spatial stride {self.vae.spatial_compression})"
+            )
+        window = observation_window(latent, latent_frames)
+        return window, (actual,)
+
     def build_data_info(
         self,
         view_shapes: Sequence[tuple[int, int]],
@@ -414,7 +589,7 @@ class PolicyInferenceSession:
         action_mask80: torch.Tensor,
     ) -> dict:
         """Assemble the conditioning dict the policy forward consumes (the sampler adds the per-step keys);
-        ``view_count`` is 3 for the strip line and 1 for the canvas line (one composite stream)."""
+        ``view_count`` is 3 for the strip and 1 for either canvas (one composite stream, slot id 0)."""
 
         num_views = len(view_shapes)
         if num_views != len(self.view_slot_ids):
@@ -422,7 +597,7 @@ class PolicyInferenceSession:
                 f"view count {num_views} disagrees with the trained view plan {self.view_keys} ({self.visual_layout})"
             )
         device = self.device
-        return {
+        info = {
             "rwm_task": "policy",
             "model_fps": torch.tensor([float(self.fps)], device=device),
             "num_views_per_sample": num_views,
@@ -436,6 +611,11 @@ class PolicyInferenceSession:
             "action_mask80": action_mask80.to(device=device, dtype=torch.bool),
             "camera_conditioning_enabled": False,
         }
+        if self.video_frame_stride != 1:
+            # only above 1, as the training dataset publishes it: a dense checkpoint's batch stays byte-identical to the
+            # historical one (the model reads 1 when the key is absent)
+            info["video_frame_stride"] = torch.tensor([int(self.video_frame_stride)], dtype=torch.int64, device=device)
+        return info
 
     # -- sampling -----------------------------------------------------------
 
@@ -473,6 +653,8 @@ class PolicyInferenceSession:
                 self.flow_shift,
                 video_cfg_scale=self.video_cfg_scale,
                 action_cfg_scale=self.action_cfg_scale,
+                gripper_bounds=normalized_gripper_bounds(self.normalization),
+                action_flow_shift=self.action_flow_shift,
             )
 
     @torch.inference_mode()
@@ -488,7 +670,10 @@ class PolicyInferenceSession:
 
         start = time.perf_counter()
         frames, k_actions = tier(self.fps, None, self.multi_fps)
-        latent_frames = latent_frame_count(frames, self.vae.temporal_compression)
+        # the video of a window is its rows 0, s, 2s, ..: 1 + (rows - 1) / s frames -> the latent window of a strided
+        # checkpoint is shorter than the dense one while the K = rows - 1 action rows stay (stride 1: unchanged)
+        video_frames = strided_video_frames(frames, self.video_frame_stride, self.vae.temporal_compression)
+        latent_frames = latent_frame_count(video_frames, self.vae.temporal_compression)
 
         text = self.encode_instruction(instruction)
         window, view_shapes = self.encode_observation(frames_rgb, latent_frames)
@@ -512,13 +697,20 @@ class PolicyInferenceSession:
             "video_cfg_scale": self.video_cfg_scale,
             "action_cfg_scale": self.action_cfg_scale,
             "flow_shift": self.flow_shift,
+            "action_flow_shift": self.action_flow_shift,
+            "view_resize": self.view_resize, "sana_pixel_pad": self.sana_pixel_pad,
             "seed": None if generator is None else int(generator.initial_seed()),
             "latency_ms": (time.perf_counter() - start) * 1000.0,
             "checkpoint": self.checkpoint_path,
             "normalization_sha256": self.normalization.sha256,
             "visual_layout": self.visual_layout,
+            "text_groups": self.text_groups,
+            "canvas_prompt": self.canvas_prompt,
+            "rope": getattr(self.model, "rope_mode", None),
             "view_latent_shapes": view_shapes,
             "frames": frames,
+            "video_frames": video_frames,
+            "video_frame_stride": self.video_frame_stride,
             "k_actions": k_actions,
         }
         return PredictResult(
@@ -575,5 +767,6 @@ __all__ = [
     "resolve_branch_cfg_scales",
     "resolve_normalization_path",
     "resolve_sampling_knobs",
+    "resolve_action_flow_shift",
     "training_normalization_pin",
 ]

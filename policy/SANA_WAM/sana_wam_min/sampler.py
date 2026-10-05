@@ -113,6 +113,8 @@ def sample_policy(
     generator: torch.Generator | None = None,
     video_cfg_scale: float | None = None,
     action_cfg_scale: float | None = None,
+    gripper_bounds: tuple[tuple[float, float], tuple[float, float]] | None = ((0.0, 1.0), (0.0, 1.0)),
+    action_flow_shift: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run joint Flow-Euler sampling of the video and action streams for the policy task.
 
@@ -140,12 +142,18 @@ def sample_policy(
         data_info: Extra conditioning dict shallow-copied into every model call; the sampler adds
             ``rwm_task``, ``action80``, ``action_mask80`` and ``action_timestep`` per step.
         steps: Number of Euler steps; must be positive.
-        flow_shift: Flow-matching timestep shift; must be positive and finite.
+        flow_shift: Flow-matching timestep shift of the video stream; must be positive and finite.
+        action_flow_shift: Shift of the action stream's own Flow-Euler schedule over the same steps (Sana
+            ``robot_world_model_sampler`` since zekai-merge 4f99eecba, the ``scheduler.inference_action_flow_shift`` /
+            ``action_flow_shift`` recipes); None reuses ``flow_shift`` -- the historical shared schedule, bit-identical.
         generator: Torch generator used only when video_noise / action_noise are None.
+        gripper_bounds: ``((lo, hi) left, (lo, hi) right)`` model-domain clamp of the gripper slots 16 / 45 after the
+            loop; the default [0, 1] is Sana's (raw closedness while the grippers are identity-mapped), a
+            gripper-normalized artifact needs ``robot80.normalized_gripper_bounds``; None skips the clamp.
 
     Returns:
         Tuple (video, action): video in clean_video.dtype, action in clean_action.dtype with gripper
-        slots clamped to [0, 1]; the action is in normalized space.
+        slots clamped to ``gripper_bounds``; the action is in normalized space.
 
     Raises:
         ValueError: Batch size above 1, or shape/mask/steps/flow_shift/CFG argument violations.
@@ -162,6 +170,9 @@ def sample_policy(
         raise ValueError("action_mask must be a bool tensor matching clean_action")
     if steps <= 0 or not math.isfinite(flow_shift) or flow_shift <= 0:
         raise ValueError("steps and flow_shift must be positive")
+    action_flow_shift = float(flow_shift if action_flow_shift is None else action_flow_shift)
+    if not math.isfinite(action_flow_shift) or action_flow_shift <= 0:
+        raise ValueError(f"action flow shift must be positive and finite, got {action_flow_shift!r}")
     video_cfg_scale = float(cfg_scale if video_cfg_scale is None else video_cfg_scale)
     action_cfg_scale = float(cfg_scale if action_cfg_scale is None else action_cfg_scale)
     if not math.isfinite(video_cfg_scale) or not math.isfinite(action_cfg_scale):
@@ -201,10 +212,12 @@ def sample_policy(
     condition_data = dict(data_info)
 
     video_scheduler = make_scheduler(steps, flow_shift, clean_video.device)
-    action_scheduler = make_scheduler(steps, flow_shift, clean_video.device)
+    action_scheduler = make_scheduler(steps, action_flow_shift, clean_video.device)
 
-    def _denoise_step(timestep, video, action):
-        video_timestep, action_timestep = task_timesteps(timestep, task)
+    def _denoise_step(timestep, action_base_timestep, video, action):
+        # each stream reads its own schedule's step (equal when the shifts are); the action rows share one t
+        video_timestep, _ = task_timesteps(timestep, task)
+        _, action_timestep = task_timesteps(action_base_timestep, task)
         video_timesteps = video_timestep.expand(batch, frames).clone()
         video_timesteps[:, 0] = 0
         action_timesteps = action_timestep.expand(clean_action.shape[:2])
@@ -264,19 +277,21 @@ def sample_policy(
         action = _action_step(
             action_scheduler,
             action_prediction,
-            timestep,
+            action_base_timestep,
             action,
             action_timesteps,
         ).masked_fill(~action_mask, 0)
         return video, action
 
     batch, _, frames, _, _ = video.shape
-    for timestep in video_scheduler.timesteps:
-        video, action = _denoise_step(timestep, video, action)
+    for step_index, timestep in enumerate(video_scheduler.timesteps):
+        video, action = _denoise_step(timestep, action_scheduler.timesteps[step_index], video, action)
 
-    action[..., [LEFT_GRIPPER, RIGHT_GRIPPER]] = action[
-        ..., [LEFT_GRIPPER, RIGHT_GRIPPER]
-    ].clamp(0, 1)
+    # Sana clamps the normalized gripper slots to [0, 1] (raw closedness while they were identity-mapped); callers
+    # pass the model-domain image of raw [0, 1] for gripper-normalized artifacts (robot80.normalized_gripper_bounds)
+    if gripper_bounds is not None:
+        for slot, (low, high) in zip((LEFT_GRIPPER, RIGHT_GRIPPER), gripper_bounds):
+            action[..., slot] = action[..., slot].clamp(float(low), float(high))
     if not bool(torch.isfinite(video).all()) or not bool(
         torch.isfinite(action.masked_select(action_mask)).all()
     ):

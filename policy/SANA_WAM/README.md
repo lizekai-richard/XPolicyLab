@@ -60,6 +60,45 @@ The `rwm/openwam` canvas line (`SanaRWMOpenWAMCanvasPolicy_5B_P1_D36` trained on
 
 Verification: `tests/test_canvas_policy_parity_sana.py` pins the mirror bitwise against the live `SanaRWMOpenWAMCanvasPolicy` in both state modes on a tiny CPU model (needs a `rwm/openwam` checkout, `SANA_OPENWAM_REPO`), `tests/test_openwam_canvas*.py` pin the compositor, the pixel transform and the prompt rows against OpenWAM's and Sana's functions. No real canvas checkpoint had been served when this was written (the line had only been smoke-trained).
 
+### Training contracts of 2026-09-20 .. 23 (Sana rwm/zekai-merge up to b13415841)
+
+Five changes of the training pipeline reach inference; the adapter reads each from the checkpoint's `config.yaml` (plus
+its weights / normalization artifact) and serves every earlier checkpoint exactly as before (their resolved contracts
+are unchanged, see Validation). Where a yaml of the in-between days cannot name its contract, the `auto` resolution is
+printed in the ready line and a deploy key overrides it.
+
+- **One policy class, three visual front-ends** (`data.extra.multiview`, 2026-09-21; `sana` was renamed `sana_latent`
+  on 2026-09-22). `sana_latent` = the three-view strip (unchanged). `openwam` = the head-over-wrists 384x320 canvas,
+  now on the standard `..._MultiViewPolicy_5B_P1_D36` class (V = 1, plain mRoPE; the rwm/openwam
+  `SanaRWMOpenWAMCanvasPolicy` class is still served for its own checkpoints). `sana_pixel` (new) = every camera
+  resize-cropped to 320x480, halved (bilinear, an exact 2x2 average) into its semantic 2x2 quadrant of ONE 320x480
+  canvas (head top-left, left wrist bottom-left, right wrist bottom-right, top-right black = -1), encoded once into a
+  10x15 latent grid (`sana_wam_min/sana_pixel_canvas.py`, pixel-identical to Sana's compositor fed by Sana's clip
+  transforms). Both canvases accept strided video (`video_fps`) now.
+- **Canvas text contract.** A canvas ships ONE prompt row (G = 1, one query span over video + robot tail) naming the
+  layout: openwam `two_rows` since 92b9e64d1 ("one image stacking the robot's cameras in two rows, ..."; `l_shape`
+  between 2a10d0d75 and 92b9e64d1), sana_pixel `tiling`. Between b31137206 and 2a10d0d75 the openwam canvas shipped
+  G = 2 (the `composite_view` row + the robot row: campaign 19085339). Keys `text_groups` / `canvas_prompt`.
+- **RoPE modes** (`model.extra.rope`, 2026-09-23): `aligned` = the video latent frame j at `16*j*s/fps` (the video
+  frame stride s folded in) and the robot rows on the same clock (state 0, action k at `16*k/(8*fps)`);
+  `independent` = the video on its own `16*j/fps` clock, the state at the zero phase, the actions a full-head 1D RoPE
+  at `1..A`. Every recipe declares it (dense `aligned`, strided `independent`). Undeclared: dense = aligned; strided =
+  independent with the first action at 0 (before 8a61ae18a, the NSC f33fps8 runs) or at 1 (after it; yamls with
+  `data.extra.multiview`). Key `rope_mode`. V > 1 always uses the semantic 2x2 tile (15, 30) now (the
+  `multiview_spatial_rope_*` yaml keys are gone; an absent key means semantic_2x2).
+- **EEF-only `robot_base_eef`** (2026-09-20): EEF pose + grippers (20 slots), joints neither fed nor supervised, an
+  Action Mode sentence without the joint clause. The adapter narrows the state / action mask to those slots and serves
+  it with `action_type: ee` only (it predicts no joints). Detected from a post-2026-09-20 marker (forced-scheme
+  normalization artifact, `data.extra.multiview`, `model.extra.rope`); the R12 / NSC eefabs checkpoints keep the
+  32-slot meaning. Key `robot_base_eef_layout`.
+- **Normalization scheme** (2026-09-20): every active slot is normalized -- grippers by q01/q99 (center 0.5, scale 0.5)
+  and Rot6D by the fixed [-1, 1] range; the artifacts stamp `gripper_normalization: statistics` /
+  `rotation_normalization: unit_range`. The masked affine map handles both schemes; the start-up check names the
+  scheme instead of warning.
+- **Frame alignment** (2026-09-20, training side only): RoboDojo video frame r is now paired with source row r-1, the
+  state that frame shows. Checkpoints trained on it expect a frame-synchronous evaluator (RoboDojo >= `6e3190f`,
+  2026-09-12 `render_for_capture`); older evaluators hand the policy an image one control step stale.
+
 Place or symlink checkpoints under `checkpoints/` (git-ignored):
 
 ```bash
@@ -68,6 +107,27 @@ ln -sfn /path/to/sana_wam_robodojo_320px_stepNNNNN checkpoints/sana_wam_robodojo
 ```
 
 `ckpt_name` resolves through `XPolicyLab.utils.checkpoint_resolver.resolve_checkpoint_root` in this order: explicit keys `checkpoint_dir` / `checkpoint_path` / `ckpt_dir` / `model_dir` in `deploy.yml` (relative paths against `policy/SANA_WAM/`), then `ckpt_name` given as a path, then `checkpoints/<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>-<seed>/`, then `checkpoints/<ckpt_name>/`. The first existing candidate wins.
+
+### View resize since 2026-09-27 (Sana rwm/zekai-merge 1061b16f0 / 77cf81fbf)
+
+Every SFT view is **stretched** whole into its bucket (`StretchResize`: bilinear, no aspect-ratio preservation): the
+sana_pixel canvas bucket (320x480 / 320x512) and the sana_latent strip's per-view 256x320 bucket; the OpenWAM canvas
+always stretched. 1061b16f0 declared it as `data.extra.robot_sft.view_resize: stretch`; 77cf81fbf removed the key and
+every crop path, so a newer yaml does not record it. The adapter therefore defaults to `view_resize: stretch` (a
+declared yaml key still wins) and keeps `crop` (`ResizeCrop`: scale to cover + centre crop) only as the legacy resize
+of checkpoints trained before 1061b16f0 -- serve those with `view_resize: crop`. Both modes and the canvas tiling are
+byte-checked against the live tree in `tests/test_view_resize_live_parity.py`; the ready log prints
+`view_resize=<mode> (<yaml|deploy|default>)`.
+
+### sana_pixel pad mask (Sana rwm/zekai-merge 319d3f666)
+
+`model.extra.sana_pixel_pad: masked` drops the black top-right quadrant of the one-view 320x512 sana_pixel canvas
+(its 5 x 8 latent cells in every frame) from the policy's token sequence right after `x_embedder`; the video timesteps
+and both RoPE tables follow the same index (kept cells keep their canvas positions), the G = 1 text span covers the kept
+cells, and the video velocity is 0 on the pad. The mirror serves it from the training yaml (no deploy key; the ready log
+prints `sana_pixel_pad=`); 320x480 (a quadrant edge inside a latent cell) is refused, as upstream. Bit parity with the
+live forward of the padmask checkpoints' tree (masked and unmasked, tiny and 10 x 16 grids):
+`tests/test_sana_pixel_pad_mask_parity.py` (`SANA_PADMASK_REPO`, run on its own).
 
 ## Evaluation
 
@@ -111,11 +171,16 @@ The XPolicyLab checkout must live in a parent directory that carries `env_cfg/` 
 | `cfg_scale` | 1.0 | text CFG scale shared by the video and action streams; the holdout validation ran at 1.0, the yaml's `inference_cfg_scale: 6.0` is a training-time visualization knob and is not used |
 | `video_cfg_scale` / `action_cfg_scale` | null / null | per-stream CFG scale; `null` inherits `cfg_scale`. The transformer denoises video and action chunk jointly, so the unconditional forward runs once per step whenever either scale is above 1 (same cost as plain CFG); `cfg_scale: 6` + `action_cfg_scale: 1` guides the video only and the action stream integrates the exact conditional velocity. Each must be >= 1; both effective values are printed in the ready line and recorded in the predict receipt |
 | `flow_shift` | 3.5 | `scheduler.inference_flow_shift` |
+| `view_resize` | null (= stretch) | how each view reaches its bucket: the yaml's `data.extra.robot_sft.view_resize` when declared (a contradicting value is refused), else `stretch` (the only SFT resize since rwm/zekai-merge 1061b16f0); `crop` = the legacy scale-to-cover + centre crop of every checkpoint trained before it. The OpenWAM canvas always stretches |
 | `n_action_steps` | null | joint targets returned per inference. `null` / `0` / `all` returns the whole predicted chunk (24 for the 25-frame tier); a positive `n` returns only its first `n`, so the RoboDojo loop executes `n` control ticks, re-observes and asks for a new chunk -- receding-horizon replanning every `n` ticks at `chunk / n` times the inferences per episode. Values above the chunk length warn once and behave like `all` |
 | `anchor_source` | measured | the joint state the model is conditioned on **and** the anchor its joint deltas are added to (one and the same row in training). `measured` = the evaluator's measured joints (historical behaviour); `last_command` = the last joint target this adapter returned for the previous chunk -- the training corpus records the previous frame's command as the state (`state[i+1] == action[i]`, verified on the public HDF5), so a measured anchor that lags the command it tracks shifts every target of a chunk by that lag; `last_command_clamped` = measured + clip(last_command - measured, +-`anchor_clamp_rad`), a guard against command wind-up under blocking contact. Grippers follow the same source; the first chunk of an episode always uses the measured state; the lag `|last_command - measured|` is printed per chunk in every mode |
+| `trajectory_dump_dir` | null | diagnostic only: directory for a per-episode trajectory dump -- every `update_obs` tick's measured Robot80 joints + grippers (`obs_state`, slots 0-5 / 29-34 / 16 / 45) and, per inference, the measured row, the anchor row and the absolute chunk returned (`chunk_measured`, `chunk_anchor`, `chunk_actions`, `chunk_step` = the tick it was predicted from) as `ep<N>.npz`, rewritten after every chunk and flushed at `reset` / trial end. Leave `null` in evaluations |
 | `anchor_clamp_rad` | 0.05 | radians; only used by `last_command_clamped` |
 | `state_profile` | auto | `joint_only` / `robot_base_eef` / `auto` (= from the training yaml's `data.extra.action_mode_sample_ratio`). `robot_base_eef` checkpoints are conditioned on the flange (`link6`) pose per arm in the arm's `base_link` frame -- position + column rot6d after the mechanical-E axis remap -- which the adapter derives from the row's joints by URDF forward kinematics (`sana_wam_min/eef.py`, vendored `assets/robotwin2_arx_x5.urdf`), exactly as the corpus was packed (`FK(joint drive target)`) |
-| `visual_layout` | auto | `three_view_strip` / `openwam_canvas` / `auto` (= from the training yaml's `model.model` + `data.type`). Strip: each camera resized/cropped to 256x320, encoded on its own, packed as a strip (the 320px lines). Canvas: the three cameras stretched into one 384x320 L-shaped canvas, encoded once, one shared prompt (the `rwm/openwam` line; the ready log prints `visual_layout=` and a `visual layout openwam_canvas:` line). An explicit value must agree with the checkpoint; it cannot re-route one |
+| `visual_layout` | auto | `three_view_strip` / `openwam_canvas` / `sana_pixel_canvas` / `auto` (= from the training yaml's `data.extra.multiview`, else `model.model` + `data.type`). Strip: each camera resized/cropped to 256x320, encoded on its own, packed as a strip. `openwam_canvas`: the three cameras stretched into one 384x320 canvas, encoded once. `sana_pixel_canvas`: the 320x480 2x2 pixel canvas, encoded once. The ready log prints `visual_layout=` and a `visual layout ...:` line. An explicit value must agree with the checkpoint; it cannot re-route one |
+| `rope_mode` | auto | `auto` / `aligned` / `independent` / `independent_from0`: the RoPE contract (see "Training contracts"). `auto` = `model.extra.rope`, else the era's tables; a value contradicting a declared key is refused. Printed as `rope=... (...)` in the ready line |
+| `text_groups` / `canvas_prompt` | auto / auto | canvas modes only: `1` / `2` prompt rows and the Observation View descriptor (`composite_view` / `l_shape` / `two_rows` for openwam, `composite_view` / `tiling` for sana_pixel). `auto` = the era's contract; printed in the `text contract:` line |
+| `robot_base_eef_layout` | auto | robot_base_eef checkpoints: `full` (joints + EEF + grippers, before 2026-09-20) / `eef_only` (EEF + grippers; `action_type: ee` required). `auto` = from the run's markers |
 | `action_type` | joint | `joint` = 24 joint-target dicts (works for every checkpoint; a robot_base_eef checkpoint's predicted EEF slots are reconstructed but not emitted); `ee` = 24 `left_ee_pose` / `right_ee_pose` (+ gripper) dicts -- the predicted anchor-relative E pose made absolute, mapped back to `link6` and into the env-relative world frame through `robot_root_poses`; the evaluator solves cuRobo IK per tick. Needs a robot_base_eef checkpoint and `anchor_source: measured` |
 | `eef_pose_check` | true | once per episode, log the gap between the evaluator's `*_ee_pose` observation and FK(measured joints); warn above 5 mm / 1 deg |
 | `urdf_path` / `robot_root_poses` | null / null | overrides for the packaged URDF and the ARX-X5 root poses (`env_cfg/robot/dual_x5.yml`: left (-0.3, -0.45, 0.765), right (0.3, -0.45, 0.765), quaternion wxyz (0.707, 0, 0, 0.707)) |
@@ -128,8 +193,9 @@ The XPolicyLab checkout must live in a parent directory that carries `env_cfg/` 
 
 ## Notes
 
+- Strided-video checkpoints (Sana `rwm/strided_video`, yaml key `data.extra.robotwin_sft.video_fps`): the training video sampled every `s`-th row of the window (`s = (rows - 1) / video_fps`, e.g. `video_fps: 16` on 33-row windows = stride 2 = 17 video frames) while the action rows stayed dense. The adapter reads the key from the checkpoint's yaml, encodes the observation into the correspondingly shorter latent window (`1 + video_fps / 8` frames) and passes `data_info["video_frame_stride"]`, which makes the policy expect `(F - 1) * 8 * s` action rows and puts the action rows on the independent local 1D RoPE (the video keeps its physical-time RoPE; the state token sits at phase 0). Dense checkpoints carry no key and run the historical, bit-identical path. `video_fps` / `video_frame_stride` are printed in the ready line and recorded in the receipt (`video_frames`). Since 2026-09-22 both canvas modes take a stride too; the RoPE of a strided batch follows `rope_mode` (the paragraph above describes the pre-`model.extra.rope` table: `independent`, first action at 0 or 1 by era).
 - Actions: 24 absolute joint targets per inference (0.96 s at 25 Hz), all executed before the next inference unless `n_action_steps` is set, in which case only the first `n` are returned and the loop replans after them (the environment re-observes after every tick either way; the model itself is Markov in the current observation, so truncation needs no history bookkeeping). Joint targets are `anchor + delta` with the anchor being the raw joint state of the observation used for the chunk (`anchor_source: measured`), or the last target returned for the previous chunk (`last_command`, see Configuration): in the training corpus the recorded state IS the previous command, so the model learned command increments relative to the previous command, not to a lagging measurement.
-- Robot-base EEF (the `..._unified_eef_...` SFT line, `action_mode_sample_ratio [0, 1, 0]`): the state row carries, per arm, `T_base_E = FK_base->link6(joints) @ LINK6_FROM_E` (rotation-only remap +X approach / +Y down / +Z left) as position (slots 7-9 / 36-38) and column rot6d (10-15 / 39-44); targets are `p_t - p_anchor` and `R_t R_anchor^T` -> rot6d, reconstructed by `eef.reconstruct_absolute_eef`. Verified: FK(recorded joint state) composed with the root poses reproduces the dataset's recorded `state/*_ee_poses` to 0.14 mm / 0.017 deg. All 32 dual_arm32 slots are supervised by such a checkpoint, so it can be deployed either through joints (`action_type: joint`) or through EE poses (`action_type: ee`).
+- Robot-base EEF (the `..._unified_eef_...` SFT line, `action_mode_sample_ratio [0, 1, 0]`): the state row carries, per arm, `T_base_E = FK_base->link6(joints) @ LINK6_FROM_E` (rotation-only remap +X approach / +Y down / +Z left) as position (slots 7-9 / 36-38) and column rot6d (10-15 / 39-44); targets are `p_t - p_anchor` and `R_t R_anchor^T` -> rot6d, reconstructed by `eef.reconstruct_absolute_eef`. Verified: FK(recorded joint state) composed with the root poses reproduces the dataset's recorded `state/*_ee_poses` to 0.14 mm / 0.017 deg. All 32 dual_arm32 slots are supervised by such a checkpoint (the pre-2026-09-20 meaning), so it can be deployed either through joints (`action_type: joint`) or through EE poses (`action_type: ee`); an EEF-only checkpoint (2026-09-20 on) supervises the 20 EEF + gripper slots only and is served through EE poses.
 - Prompt: the `Action Mode` sentence of every prompt row follows the checkpoint's training yaml (`data.extra.action_mode_sample_ratio`, `joint_target_mode`, `eef_target_mode`; `sana_wam_min/text.py::action_mode_text`, byte-identical to Sana's `build_token_group_prompts` for every mode) and the ready log prints it. Before 2026-09-16 the adapter always rendered the joint_only / anchor_delta sentence, so the `s55k_video` (absolute joints) and `s55k_eef` (robot_base_eef) evaluations ran with an `Action Mode` line their training never showed.
 - Grippers: XPolicyLab `*_ee_joint_state` is the normalized opening (1 = open); the model works in closedness (1 = closed); the adapter inverts on both boundaries and clamps the model output to [0, 1].
 - Images: RGB end to end. The checkpoint was trained on RGB frames; no channel conversion anywhere. Frames must arrive as decoded uint8 HxWx3 arrays; any other dtype is rejected with a `ValueError` naming the camera (a float frame's value range is unknowable, so it is never rescaled).

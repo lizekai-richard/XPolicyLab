@@ -172,9 +172,10 @@ def build_components(args, device: torch.device) -> dict:
 
     normalization = None
     if args.normalization_path:
+        from sana_wam_min.config import sft_options_from_train_config
         from sana_wam_min.robot80 import load_normalization
 
-        expected = ((cfg.get("data") or {}).get("extra") or {}).get("robotwin_sft", {}).get("normalization_sha256")
+        expected = sft_options_from_train_config(cfg).get("normalization_sha256")
         normalization = load_normalization(str(args.normalization_path), expected_sha256=expected)
         log(f"normalization sha256={normalization.sha256} joint_target_mode={normalization.joint_target_mode}")
 

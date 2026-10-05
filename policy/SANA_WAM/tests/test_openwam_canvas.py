@@ -4,6 +4,7 @@ training-yaml resolution of the rwm/openwam canvas line (visual layout, action /
 from __future__ import annotations
 
 import copy
+import dataclasses
 import importlib.util
 import os
 import sys
@@ -160,7 +161,7 @@ def _load(path: str) -> dict:
 def test_resolve_visual_layout_from_the_two_fixtures():
     assert wam_config.resolve_visual_layout(_load(THREE_VIEW_YAML)) == "three_view_strip"
     assert wam_config.resolve_visual_layout(_load(CANVAS_YAML)) == "openwam_canvas"
-    assert wam_config.VISUAL_LAYOUTS == ("three_view_strip", "openwam_canvas")
+    assert wam_config.VISUAL_LAYOUTS == ("three_view_strip", "openwam_canvas", "sana_pixel_canvas")
 
 
 def test_resolve_visual_layout_refuses_inconsistent_declarations():
@@ -182,9 +183,20 @@ def test_resolve_visual_layout_refuses_inconsistent_declarations():
     with pytest.raises(ValueError, match="ASPECT_RATIO_OPENWAM_LSHAPE_384_320"):
         wam_config.resolve_visual_layout(bad)
     three = _load(THREE_VIEW_YAML)
+    # since 2026-09-21 the ONE policy class serves the canvas too: a canvas dataset type selects the openwam mode, and
+    # then the canvas's own aspect bucket is required
     bad = copy.deepcopy(three)
     bad["data"]["type"] = "RoboDojoOpenWAMCanvasSFTDataset"
-    with pytest.raises(ValueError, match="three-view policy"):
+    with pytest.raises(ValueError, match="ASPECT_RATIO_OPENWAM_LSHAPE_384_320"):
+        wam_config.resolve_visual_layout(bad)
+    bad["data"]["aspect_ratio_type"] = "ASPECT_RATIO_OPENWAM_LSHAPE_384_320"
+    assert wam_config.resolve_visual_layout(bad) == "openwam_canvas"
+    bad["data"]["extra"]["multiview"] = "sana_latent"
+    with pytest.raises(ValueError, match="serves multiview 'openwam' but the yaml declares 'sana_latent'"):
+        wam_config.resolve_visual_layout(bad)
+    bad = copy.deepcopy(three)
+    bad["data"]["extra"]["openwam_canvas"] = {"source_hdf5_root": "/x"}
+    with pytest.raises(ValueError, match="no data.extra.multiview"):
         wam_config.resolve_visual_layout(bad)
     bad = copy.deepcopy(three)
     bad["model"]["model"] = "SomeOtherPolicy_5B"
@@ -209,7 +221,7 @@ def test_canvas_policy_config_resolves_shared_prompt_and_the_state_flag():
     assert three_cfg.shared_prompt is False and three_cfg.state_as_cross_attention is False
     assert three_cfg.multiview_spatial_rope_layout == "semantic_2x2"
     three["model"]["extra"]["state_as_cross_attention"] = True
-    with pytest.raises(ValueError, match="only defined for the OpenWAM canvas"):
+    with pytest.raises(ValueError, match="only defined for the rwm/openwam canvas policy class"):
         wam_config.state_as_cross_attention_from_train_config(three)
     assert wam_config.sampling_defaults_from_train_config(cfg) == {"steps": 50, "flow_shift": 3.5, "cfg_scale": 1.0}
 
@@ -225,7 +237,11 @@ def test_policy_config_tolerates_the_source_yaml_of_the_canvas_line():
     ):
         cfg["model"].pop(key, None)
     cfg["text_encoder"].pop("caption_channels", None)
-    assert wam_config.policy_config_from_train_config(cfg) == resolved
+    # the spatial-RoPE key left the yaml on 2026-09-21 (V > 1 is always semantic_2x2 since); the canvas is V = 1, so
+    # the layout field is inert here and everything else must resolve identically
+    source = wam_config.policy_config_from_train_config(cfg)
+    assert source.multiview_spatial_rope_layout == "semantic_2x2" and resolved.multiview_spatial_rope_layout == "local_reset"
+    assert dataclasses.replace(source, multiview_spatial_rope_layout="local_reset") == resolved
     assert resolved.caption_channels == 2304 and resolved.multiview_spatial_rope_tile_shape == (15, 30)
 
 

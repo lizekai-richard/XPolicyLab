@@ -64,9 +64,9 @@ def test_resize_crop_geometry_offsets():
     assert pixels.resize_crop_geometry(480, 640, 480, 640) == (480, 640, 0, 0)
 
 
-def test_frame_to_model_tensor_matches_reference_640x480():
+def test_legacy_crop_frame_to_model_tensor_matches_reference_640x480():
     frame = _gradient_frame(480, 640)
-    out = pixels.frame_to_model_tensor(frame, (256, 320))
+    out = pixels.frame_to_model_tensor(frame, (256, 320), "crop")      # the pre-2026-09-27 ResizeCrop contract
     assert out.shape == (3, 256, 320)
     assert out.dtype == torch.float32
     assert float(out.min()) >= -1.0 and float(out.max()) <= 1.0

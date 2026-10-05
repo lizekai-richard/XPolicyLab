@@ -31,8 +31,25 @@ OPENWAM_TOP_HEIGHT_RATIO = 2.0 / 3.0
 # Model-facing metadata of the one composite stream (the dataset's ``_rewrite_openwam_data_info``).
 OPENWAM_VIEW_KEY = "openwam_canvas"
 OPENWAM_VIEW_SLOT_IDS = (0,)
-# Observation View text of the shared prompt (the dataset's ``_OPENWAM_COMPOSITE_DESCRIPTOR``).
+# Observation View text of the composite-view row (the dataset's ``_OPENWAM_COMPOSITE_DESCRIPTOR``), by era:
+#   composite_view -- rwm/openwam and zekai-merge up to 2a10d0d75 (the canvas class's G = 1 row, then the G = 2 view row);
+#   l_shape        -- zekai-merge 2a10d0d75 .. 92b9e64d1 (2026-09-22/23, G = 1);
+#   two_rows       -- zekai-merge 92b9e64d1 / rwm/mot 3ea1f9af9 on (G = 1; "L shape" was only OpenWAM's historical name for
+#                     the filled head-over-wrists rectangle).
 OPENWAM_COMPOSITE_VIEW_TEXT = "a composite view combining the head camera above the left and right wrist cameras"
+OPENWAM_L_SHAPE_TEXT = (
+    "one image compositing the robot's cameras in an L shape, with the head camera across the top two "
+    "thirds and the left and right wrist cameras side by side below it"
+)
+OPENWAM_TWO_ROWS_TEXT = (
+    "one image stacking the robot's cameras in two rows, with the head camera across the full width of "
+    "the top two thirds and the left and right wrist cameras side by side in the bottom third"
+)
+OPENWAM_PROMPT_TEXTS = {
+    "composite_view": OPENWAM_COMPOSITE_VIEW_TEXT,
+    "l_shape": OPENWAM_L_SHAPE_TEXT,
+    "two_rows": OPENWAM_TWO_ROWS_TEXT,
+}
 
 
 def canvas_slot_boxes(
@@ -138,23 +155,26 @@ def render_canvas_prompt_rows(
     include_instruction: bool = True,
     embodiment: str = ROBODOJO_EMBODIMENT,
     view_text: str = OPENWAM_COMPOSITE_VIEW_TEXT,
+    groups: int = 1,
 ) -> tuple[str, ...]:
-    """The ONE prompt row shared by the video and action tokens (the canvas dataset's ``_rebuild_openwam_prompt``).
+    """The token-group rows of a canvas (a composited single visual stream), ``build_token_group_prompts`` with ONE view.
 
-    It is the composite view's token-group prompt -- ``Embodiment Type`` / ``Action Mode`` / ``Observation View``
-    / ``Instruction`` lines joined by ``"\\n"`` -- with the former robot row dropped; ``include_instruction=False``
-    renders the CFG unconditional row. ``action_mode_text`` has no default on purpose: it must be the sentence of
-    the checkpoint's own joint / EEF target modes (``text.action_mode_text``).
+    ``groups=1`` (the rwm/openwam canvas class; both canvas modes since 2026-09-22): the composite view's row alone --
+    ``Embodiment Type`` / ``Action Mode`` / ``Observation View`` / ``Instruction`` lines joined by ``"\\n"`` -- shared
+    by the video and action tokens, the view-less robot row dropped. ``groups=2`` (zekai-merge 2026-09-21 .. 22): the
+    standard payload of one view, (composite-view row, robot row). ``include_instruction=False`` renders the CFG
+    unconditional rows. ``action_mode_text`` has no default on purpose: it must be the sentence of the checkpoint's
+    own action / target modes (``text.action_mode_text``); ``view_text`` is the era's descriptor.
     """
 
-    lines = [
-        prompt_field("Embodiment Type", embodiment),
-        prompt_field("Action Mode", action_mode_text),
-        prompt_field("Observation View", view_text),
-    ]
-    if include_instruction:
-        lines.append(prompt_field("Instruction", instruction))
-    return ("\n".join(lines),)
+    if int(groups) not in (1, 2):
+        raise ValueError(f"a canvas prompt carries G = 1 or G = 2 rows, got {groups!r}")
+    common = [prompt_field("Embodiment Type", embodiment), prompt_field("Action Mode", action_mode_text)]
+    instruction_lines = [prompt_field("Instruction", instruction)] if include_instruction else []
+    view_row = "\n".join(common + [prompt_field("Observation View", view_text)] + instruction_lines)
+    if int(groups) == 1:
+        return (view_row,)
+    return (view_row, "\n".join(common + instruction_lines))
 
 
 __all__ = [
@@ -162,7 +182,10 @@ __all__ = [
     "OPENWAM_CANVAS_HEIGHT",
     "OPENWAM_CANVAS_WIDTH",
     "OPENWAM_COMPOSITE_VIEW_TEXT",
+    "OPENWAM_L_SHAPE_TEXT",
+    "OPENWAM_PROMPT_TEXTS",
     "OPENWAM_TOP_HEIGHT_RATIO",
+    "OPENWAM_TWO_ROWS_TEXT",
     "OPENWAM_VIEW_KEY",
     "OPENWAM_VIEW_SLOT_IDS",
     "assemble_openwam_canvas",

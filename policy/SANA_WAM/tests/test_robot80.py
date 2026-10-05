@@ -192,3 +192,32 @@ def test_affine_shape_and_finite_guards(norm):
     bad[0] = float("nan")
     with pytest.raises(ValueError):
         robot80.normalize_state(bad, _mask14(), norm)
+
+
+def test_select_target_normalization_hands_state_statistics_to_absolute_slots(norm):
+    # Sana select_joint/eef_target_normalization: an anchor-delta artifact serving an absolute line takes the STATE
+    # statistics on the affected action slots (the same absolute joints / robot-base poses); the rest is untouched.
+    assert norm.joint_target_mode == "anchor_delta" and norm.eef_target_mode == "anchor_delta"
+    assert robot80.select_joint_target_normalization(norm, "anchor_delta") is norm
+    assert robot80.select_eef_target_normalization(norm, "anchor_delta") is norm
+    joints = np.r_[0:6, 29:35]
+    eef = np.r_[7:16, 36:45]
+    other = np.setdiff1d(np.arange(80), np.r_[joints, eef])
+    j = robot80.select_joint_target_normalization(norm, "absolute")
+    assert j.joint_target_mode == "absolute" and j.artifact_joint_target_mode == "anchor_delta"
+    e = robot80.select_eef_target_normalization(norm, "absolute")
+    assert e.eef_target_mode == "absolute" and e.artifact_eef_target_mode == "anchor_delta"
+    for suffix in ("center80", "scale80", "q01_80", "q99_80", "normalization_mask80"):
+        action, state = getattr(norm, f"action_{suffix}"), getattr(norm, f"state_{suffix}")
+        np.testing.assert_array_equal(getattr(j, f"action_{suffix}")[joints], state[joints])
+        np.testing.assert_array_equal(getattr(j, f"action_{suffix}")[eef], action[eef])
+        np.testing.assert_array_equal(getattr(e, f"action_{suffix}")[eef], state[eef])
+        np.testing.assert_array_equal(getattr(e, f"action_{suffix}")[joints], action[joints])
+        for sel in (j, e):
+            np.testing.assert_array_equal(getattr(sel, f"action_{suffix}")[other], action[other])
+            np.testing.assert_array_equal(getattr(sel, f"state_{suffix}"), state)
+    # absolute artifacts cannot serve anchor-delta lines
+    with pytest.raises(ValueError, match="joint_target_mode"):
+        robot80.select_joint_target_normalization(j, "anchor_delta")
+    with pytest.raises(ValueError, match="eef_target_mode"):
+        robot80.select_eef_target_normalization(e, "anchor_delta")

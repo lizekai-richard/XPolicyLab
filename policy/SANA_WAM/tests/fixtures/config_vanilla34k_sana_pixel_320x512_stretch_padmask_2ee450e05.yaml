@@ -1,0 +1,180 @@
+task: ltx
+report_to: wandb
+tracker_project_name: sana-rwm
+name: sft_robodojo_rwm_eefabs_sana_pixel_320x512_pretrained34500_aligned_f33fps8_stretch_padmask
+work_dir: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/output/sft_robodojo_vanilla34k_eefabs_f33fps8_sana_pixel_aligned_stretch_padmask_nsc
+
+data:
+  data_dir:
+    RoboDojo-ARX-X5: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/RoboDojo/converted/RoboDojo/arx-x5_zip_nsc
+  dataset_repeats:
+    RoboDojo-ARX-X5: 1
+  image_size: 320
+  json_cache_dir: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/data_cache_robodojo_absolute_aligned_f33_lezhao_sft_20260923T050329Z
+  caption_proportion:
+    detailed_caption: 1
+  embodiment_type_only: false
+  external_data_filter:
+    RoboDojo-ARX-X5:
+      _model_fps: {min: 25, max: 25}
+  load_text_feat: false
+  transform: default_train_video
+  type: RoboDojoSFTDataset
+  extra:
+    multiview: sana_pixel
+    action_representation: current_anchor_qwen
+    action_mode_sample_ratio: [0.0, 1.0, 0.0]
+    joint_target_mode: absolute
+    eef_target_mode: absolute
+    camera_conditioning: true
+    recaption_instruction: false
+    robot_sft:
+      tasks: null
+      splits: [default]
+      holdout_episodes_per_task_split: 0
+      holdout_mode: train
+      tier_num_frames: 33
+      instruction_source: dataset_seen
+      normalization_num_frames: 33
+      normalization_sha256: 9f8b98ede445f554cafef99974a0ef67ce4d59292578ccbdeaba704c9cedd5ba
+      vae_latent_cache_dir: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/sana_pixel_vae_latents
+      allow_online_encode: false
+      tail_windows:
+        enabled: true
+        min_rows: 2
+        padding: freeze
+      video_fps: 8
+      view_resize: stretch
+    use_mobile_base: false
+  num_frames: 33
+  aspect_ratio_type: ASPECT_RATIO_SANA_PIXEL_2X2_320_512
+  sort_dataset: false
+  shuffle_dataset: false
+  resample_fps: false
+  multi_fps:
+    "25": [33]
+  load_vae_feat: false
+
+model:
+  model: SanaRWMVideoQwenNextSubAttnResV2SelfFlowWorldModelCameraConditionMultiViewPolicy_5B_P1_D36
+  extra:
+    action_dim: 80
+    state_dim: 80
+    rope: aligned
+    sana_pixel_pad: masked
+  image_size: 320
+  mixed_precision: bf16
+  fp32_attention: true
+  load_from: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/warmstart_ckpt_vault/sana_rwm_pretrained_vanilla_e6s34500
+  multi_scale: true
+  softmax_ratio: 0.25
+  linear_attn_type: GatedDeltaNet
+  softmax_attn_type: GatedSoftmaxAttention
+  linear_head_dim: 128
+  softmax_head_dim: 256
+  ffn_type: SwiGLU
+  mlp_ratio: 4.0
+  use_pe: true
+  pos_embed_type: wan_rope
+  qk_norm: true
+  cross_norm: true
+  class_dropout_prob: 0.1
+  use_attn_res: true
+  use_time_conditioning: false
+  attn_res_block_size: 8
+
+vae:
+  vae_type: LTX2VAE_diffusers
+  vae_pretrained: Efficient-Large-Model/LTX-2.3-Diffusers
+  weight_dtype: bfloat16
+  vae_latent_dim: 128
+  vae_downsample_rate: 32
+  vae_stride:
+    - 8
+    - 32
+    - 32
+  cache_dir: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/vae_cache
+  if_cache: false
+  use_causal_encode: true
+
+text_encoder:
+  text_encoder_name: gemma-2-2b-it-local
+  y_norm: true
+  y_norm_scale_factor: 0.01
+  model_max_length: 300
+  chi_prompt: []
+
+scheduler:
+  predict_flow_v: true
+  noise_schedule: linear_flow
+  pred_sigma: false
+  flow_shift: 5.0
+  action_flow_shift: 1.0
+  flow_shift_by_token_count: null
+  flow_shift_type: standard
+  inference_flow_shift: 5.0
+  inference_action_flow_shift: 1.0
+  inference_cfg_scale: 6.0
+  min_train_timestep: 1
+  weighting_scheme: uniform
+  logit_mean: 0.0
+  logit_std: 0.95
+  tail_floor_left: 0.12
+  tail_floor_right: 0.16
+  tail_floor_power: 1.2
+  tail_floor_body_weight: 0.925
+
+train:
+  timestep_loss_weighting: openwam
+  min_weight: 0.1
+  global_distributed_multiframe: true
+  null_embed_root: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/pretrained_embeds
+  valid_prompt_embed_root: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/tmp_embed/sft_robodojo_vanilla34k_eefabs_f33fps8_sana_pixel_aligned_stretch_padmask_nsc
+  use_fsdp: true
+  num_workers: 10
+  seed: 1
+  train_batch_size: 32
+  num_epochs: 10
+  gradient_accumulation_steps: 1
+  grad_checkpointing: true
+  gradient_clip: 1.0
+  optimizer:
+    betas:
+      - 0.9
+      - 0.999
+    eps: 1.0e-10
+    lr: 1.0e-4
+    type: AdamW
+    weight_decay: 1.0e-4
+    paramwise_cfg:
+      bias_decay_mult: 0.0
+      norm_decay_mult: 0.0
+  auto_lr: null
+  lr_schedule: cosine
+  lr_schedule_args:
+    num_warmup_steps: 2000
+    num_training_steps: 36180
+    final_lr: 0.01
+  local_save_vis: true
+  visualize: false
+  eval_sampling_steps: 1000000000
+  log_interval: 10
+  save_model_epochs: 5
+  save_model_steps: 500
+  load_from_optimizer: false
+  load_from_lr_scheduler: false
+  deterministic_validation: false
+  joint_training_interval: 0
+  ltx_image_condition_prob: 1.0
+  extra:
+    rwm_task: policy
+    unified_wm: true
+    instruction_dropout_probability: 0.1
+    action_loss_weight: 1.0
+    max_save_limit: 3
+    keep_milestone_steps: 0
+    rwm_validation_steps: 50
+    rwm_validation_seed: 1
+    rwm_validation_samples_per_dataset: 10
+    rwm_validation_video_samples_per_dataset: 4
+    rwm_validation_action_overlay: false

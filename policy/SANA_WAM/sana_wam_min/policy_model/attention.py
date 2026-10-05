@@ -271,6 +271,7 @@ class MultiHeadCrossAttention(nn.Module):
         d_model: int,
         num_heads: int,
         use_xformers: bool | None = None,
+        context_dim: int | None = None,
     ) -> None:
         super().__init__()
         if d_model % num_heads:
@@ -280,9 +281,12 @@ class MultiHeadCrossAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        # width of the keys/values' source (layers/cross_attention.py ``context_dim``, 2026-09-22): the MoT canvas
+        # builds feed the action expert (d_model 1024) the video-width (2560) shared caption embedding
+        self.context_dim = d_model if context_dim is None else int(context_dim)
 
         self.q_linear = nn.Linear(d_model, d_model)
-        self.kv_linear = nn.Linear(d_model, d_model * 2)
+        self.kv_linear = nn.Linear(self.context_dim, d_model * 2)
         self.attn_drop = nn.Dropout(0.0)
         self.proj = nn.Linear(d_model, d_model)
         self.proj_drop = nn.Dropout(0.0)
@@ -343,7 +347,7 @@ class MultiHeadCrossAttention(nn.Module):
         ._forward_grouped.
         """
 
-        if cond.shape[0] != x.shape[0] or cond.shape[-1] != x.shape[-1]:
+        if cond.shape[0] != x.shape[0] or cond.shape[-1] != self.context_dim:
             raise ValueError("grouped condition batch/channels must match query tokens")
         if mask is not None and tuple(mask.shape[:2]) != tuple(cond.shape[:2]):
             raise ValueError("grouped text mask must start with [B,G]")

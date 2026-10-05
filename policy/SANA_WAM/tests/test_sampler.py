@@ -352,3 +352,48 @@ def test_per_stream_cfg_scales_guide_only_their_own_stream():
             cond, cond_mask, None, None, 1.0, data_info, 2, SHIFT,
             generator=torch.Generator().manual_seed(0), video_cfg_scale=float("nan"),
         )
+
+
+class _ScheduleProbe:
+    """Velocity field depending on x, the video t, the action t and the text, recording both timesteps per call."""
+
+    def __init__(self):
+        self.seen = []
+
+    def __call__(self, x, timestep, y, mask=None, data_info=None):
+        t = timestep.reshape(timestep.shape[0], -1).float()
+        ta = data_info["action_timestep"].float()
+        self.seen.append((t.clone(), ta.clone()))
+        a = data_info["action80"]
+        return {"x": torch.tanh(x * 0.7 + t[:, None, :, None, None] / 1000.0 + y.float().mean()).to(x.dtype),
+                "action_pred": torch.sin(a * 1.3 + ta[..., None] / 700.0).to(a.dtype)}
+
+
+def test_a_separate_action_flow_shift_gives_the_action_stream_its_own_schedule():
+    """zekai-merge 4f99eecba / rwm/mot b865ad732 (the vanilla34k recipes: video 5, action 1): the action stream follows
+    its own Flow-Euler schedule; None keeps the historical shared schedule bit for bit (bitwise parity with the live
+    sampler of 5295c208d is checked by the live parity script of 2026-09-26)."""
+
+    clean_video, clean_action, action_mask, cond, cond_mask, uncond, uncond_mask, data_info = _make_inputs()
+
+    def run(**kwargs):
+        probe = _ScheduleProbe()
+        g = torch.Generator().manual_seed(11)
+        video, action = sample_policy(
+            probe, clean_video, None, None, clean_action, action_mask, cond, cond_mask, uncond, uncond_mask,
+            1.0, data_info, 10, 5.0, generator=g, gripper_bounds=None, **kwargs,
+        )
+        return video, action, probe
+
+    v_shared, a_shared, _ = run()
+    v_equal, a_equal, _ = run(action_flow_shift=5.0)
+    assert torch.equal(v_shared, v_equal) and torch.equal(a_shared, a_equal)
+    v_sep, a_sep, probe = run(action_flow_shift=1.0)
+    video_steps = make_scheduler(10, 5.0, torch.device("cpu")).timesteps
+    action_steps = make_scheduler(10, 1.0, torch.device("cpu")).timesteps
+    assert torch.equal(torch.stack([t[0, -1] for t, _ in probe.seen]), video_steps.float())
+    assert torch.equal(torch.stack([ta[0, 0] for _, ta in probe.seen]), action_steps.float())
+    assert all(bool((ta == ta[:, :1]).all()) for _, ta in probe.seen)      # one shared t over the action rows
+    assert not torch.equal(a_sep, a_shared)
+    with pytest.raises(ValueError, match="action flow shift"):
+        run(action_flow_shift=0.0)

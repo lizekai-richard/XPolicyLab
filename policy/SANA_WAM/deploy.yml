@@ -26,13 +26,25 @@ text_encoder_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/
 vae_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/LTX-2.3-Diffusers
 sampling_steps: 50
 cfg_scale: 1.0
-# Per-stream text CFG: null inherits cfg_scale (one knob for both streams, the historical behaviour). The policy
-# transformer denoises the video and the action chunk jointly, so the unconditional forward runs once per step
-# whenever either scale is above 1; e.g. cfg_scale 6 + action_cfg_scale 1 guides the video only and the action
-# stream integrates the exact conditional velocity. Each must be >= 1.
+# Per-stream text CFG: null inherits cfg_scale. The policy transformer denoises the video and the action chunk jointly,
+# so the unconditional forward runs once per step whenever either scale is above 1. DEFAULT action_cfg_scale 1.0 (user,
+# 2026-09-25): cfg_scale 6 then guides the VIDEO stream only and the action stream integrates the exact conditional
+# velocity -- on sanavideo_eefabs_f33fps8_sana_pixel 118 vs 56 successes over 1950 episodes against action CFG 6.
+# action_cfg_scale null (or 6) restores the historical single knob. Each must be >= 1.
 video_cfg_scale: null
-action_cfg_scale: null
+action_cfg_scale: 1.0
 flow_shift: 3.5
+# The ACTION stream's own sampling shift: null = the checkpoint's scheduler.inference_action_flow_shift (else
+# action_flow_shift) when its recipe declares one (zekai-merge 4f99eecba / rwm/mot b865ad732: e.g. the vanilla34k
+# recipes train video 5 / action 1), otherwise flow_shift for both streams (the historical shared schedule).
+action_flow_shift: null
+# How each camera view reaches its bucket (the sana_pixel canvas bucket, the sana_latent per-view bucket; the OpenWAM
+# canvas always stretches): null = the training yaml's data.extra.robot_sft.view_resize when it declares one, else
+# stretch -- the whole frame bilinearly resized, the only SFT resize since rwm/zekai-merge 1061b16f0 / rwm/mot 034e55dca
+# (77cf81fbf / f06615b2f dropped the yaml key). crop = scale to cover + centre crop, the LEGACY resize of every checkpoint
+# trained before those commits: serve those with view_resize: crop (the RoboDojo eval worker does so for every label in
+# its pre_stretch_labels.txt). A value that contradicts a declared yaml key is refused.
+view_resize: null
 # Targets returned per inference: null/0/all -> the whole predicted chunk (24 joint targets for the 25-frame tier);
 # a positive n returns only the first n, so the RoboDojo loop executes n control ticks, re-observes and asks for a
 # new chunk (receding-horizon replanning every n ticks; inferences per episode grow by chunk/n).
@@ -48,17 +60,46 @@ n_action_steps: null
 # |last_command - measured| is logged per chunk in every mode.
 anchor_source: measured
 anchor_clamp_rad: 0.05
+# Diagnostic only (null = off): directory for a per-episode trajectory dump -- every update_obs tick's measured Robot80
+# joints + grippers (slots 0-5, 29-34, 16, 45) and, per inference, the measured row, the anchor row and the absolute
+# chunk this adapter returned (ep<N>.npz, rewritten after every chunk). Leave null in evaluations.
+trajectory_dump_dir: null
 # Which Robot80 slots the checkpoint is conditioned on and supervised: auto (default) reads the training yaml's
 # data.extra.action_mode_sample_ratio -> joint_only (6 joints + gripper per arm) or robot_base_eef (plus the flange
 # link6 pose in the arm's base frame: position + rot6d, from URDF FK of the row's joints, E-axis remap; the eef SFT line).
 state_profile: auto
-# Visual front-end of the checkpoint: auto (default) reads its training yaml (model.model + data.type):
-#   three_view_strip  the 320px lines -- every camera resized/cropped to 256x320, encoded on its own, packed as a strip
-#   openwam_canvas    the rwm/openwam canvas line (SanaRWMOpenWAMCanvasPolicy) -- the three cameras stretched into one
-#                     384x320 L-shaped RGB canvas (head 256x320 above the left/right wrists 128x160), encoded ONCE;
-#                     one prompt shared by the video and action tokens
+# Visual front-end of the checkpoint: auto (default) reads its training yaml (data.extra.multiview since 2026-09-21,
+# before that model.model + data.type):
+#   three_view_strip   multiview sana_latent (the 320px lines) -- every camera resized/cropped to 256x320, encoded on its
+#                      own, packed as a strip; G = V + 1 = 4 prompt rows, semantic 2x2 spatial RoPE
+#   openwam_canvas     multiview openwam, or the rwm/openwam canvas class (SanaRWMOpenWAMCanvasPolicy) -- the three cameras
+#                      stretched into one 384x320 RGB canvas (head 256x320 above the left/right wrists 128x160), encoded
+#                      ONCE on the plain 12x10 grid
+#   sana_pixel_canvas  multiview sana_pixel (2026-09-22) -- every camera resize-cropped to 320x480 and halved into its 2x2
+#                      quadrant of one 320x480 canvas (head top-left, wrists bottom-left/right, top-right black), encoded
+#                      ONCE on the plain 10x15 grid
 # An explicit value must agree with the checkpoint: it documents the intent and cannot re-route a checkpoint.
 visual_layout: auto
+# RoPE contract (model.extra.rope since 2026-09-23): auto (default) = the yaml's key, else the tables of the run's era
+# (dense -> aligned; strided -> state 0 + independent actions from 0 before zekai-merge 8a61ae18a, from 1 after it,
+# decided by the presence of data.extra.multiview). aligned | independent force a mode; independent_from0 forces the
+# pre-8a61ae18a strided table. A value contradicting a declared key is refused.
+#   aligned      video latent j at 16*j*s/fps (video frame stride s folded in), state 0, action k at 16*k/(8*fps)
+#   independent  video on its own clock 16*j/fps, state 0, actions a full-head 1D RoPE at 1..A
+rope_mode: auto
+# Text contract of the canvas modes (auto = resolved from the yaml era; the strip ignores both keys):
+#   text_groups    1 = ONE shared row (the canvas class; both canvas modes since 2026-09-22), 2 = composite-view row +
+#                  robot row (zekai-merge 2026-09-21..22). auto: model.extra.rope present -> 1; openwam without it -> 2
+#                  (campaign 19085339 at a5c7909ae); sana_pixel without it -> 1
+#   canvas_prompt  the Observation View descriptor: openwam composite_view | l_shape | two_rows, sana_pixel
+#                  composite_view | tiling. auto: rope declared -> two_rows / tiling; otherwise composite_view (openwam),
+#                  tiling (sana_pixel)
+text_groups: auto
+canvas_prompt: auto
+# robot_base_eef checkpoints only: full (joints + EEF + grippers, every run before 2026-09-20) | eef_only (EEF pose +
+# grippers; joints neither fed nor supervised -> serve with action_type ee). auto: eef_only when the run carries a
+# post-2026-09-20 marker (normalization artifact of the forced scheme, data.extra.multiview, model.extra.rope).
+robot_base_eef_layout: auto
 # action_type (top of this file, normally set by eval.sh): joint = 24 joint-target dicts (any checkpoint);
 # ee = 24 {left,right}_ee_pose dicts (link6 in the env-relative world frame, xyz + wxyz; the evaluator runs cuRobo IK
 # per tick) -- requires a robot_base_eef checkpoint and anchor_source measured.
