@@ -1,0 +1,60 @@
+policy_name: SANA_WAM_CAUSAL
+protocol: ws
+host: localhost
+port: null
+bench_name: null
+task_name: null
+ckpt_name: null
+env_cfg_type: null
+seed: null
+action_type: ee
+gpu_id: null
+eval_batch: false
+
+# One get_action = the commit of the executed chunk (2 forwards with CFG) + sampling_steps x 2 forwards; the first call
+# of an episode also encodes the prompt. The RoboDojo client times every RPC out after 120 s whatever this says.
+request_timeout_s: 600.0
+
+# --- SANA_WAM_CAUSAL keys (see README "Configuration") ---
+# HF-style checkpoint dir of a CAUSAL run: config.yaml (model.model ...MultiViewCausal_5B_P1_D36) +
+# model/pytorch_model_fsdp.bin [+ normalization/*.json]. null -> XPolicyLab resolution of ckpt_name.
+checkpoint_dir: null
+# An SFT (bidirectional) checkpoint has no GDN recurrence parameters; true serves it as the causal policy's step-0 model
+# (recurrence initialized as the causal trainer does on its first load). Pipeline checks only, never an evaluation.
+allow_donor_checkpoint: false
+# null -> <checkpoint_dir>/normalization/<f33 name>, else the packaged copy (refused by the yaml pin of an EEF line)
+normalization_path: null
+normalization_sha256: null
+text_encoder_path: null
+vae_path: null
+# Sampling: the RoboDojo defaults of every SANA evaluation (10 Euler steps, video CFG 6, action CFG 1; the flow shifts
+# from the checkpoint's scheduler.inference_flow_shift / inference_action_flow_shift when null).
+sampling_steps: 10
+cfg_scale: 6.0
+video_cfg_scale: null
+action_cfg_scale: 1.0
+flow_shift: null
+action_flow_shift: null
+# Softmax read rule of the cached windows:
+#   training  the newest sliding_window_chunks entries of [observation, chunk 0, chunk 1, ..]; the observation evicts
+#             like any other entry (the two-stream training forward's rule, at physical positions)
+#   keep_obs  the observation entry plus the newest sliding_window_chunks - 1 chunks (what Sana's deploy KV manager
+#             reads; for A/B only)
+softmax_window: training
+# What enters memory as the executed chunk's actions: executed = the EE commands actually sent (gripper closedness
+# clipped to [0, 1], rot6d through the rotation it encodes) re-normalized; predicted = the raw model output.
+commit_actions: executed
+# Refuse an episode longer than this many chunks (null = no limit; GDN extrapolates past the 48-chunk training windows)
+max_chunks_per_episode: null
+# Per-chunk log of the relative RMSE between the predicted and the observed target latent of the committed chunk
+log_world_model_error: true
+# null = stretch (the only SFT view resize of the causal line's donors); a contradicting value is refused
+view_resize: null
+diffusion_seed_base: 20261003
+eef_pose_check: true
+urdf_path: null
+robot_root_poses: null
+device: cuda
+weight_dtype: bfloat16
+strict_image_size: false
+default_instruction: follow the instruction
