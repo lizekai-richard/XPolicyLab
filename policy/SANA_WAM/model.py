@@ -237,6 +237,12 @@ class Model(ModelTemplate):
         # grippers of every update_obs, per inference the measured row, the anchor row and the absolute chunk this
         # adapter returned -> <dir>/ep<N>.npz (rewritten after every chunk, flushed at reset / trial end)
         self.trajectory_dump_dir = self._resolve_trajectory_dump_dir(cfg)
+        # Diagnostic predicted-video dump (prediction_latent_dir, null = off): per inference the sampled video latent (the
+        # world model's own prediction of the chunk, fp16, still packed / normalized) + its layout ->
+        # <dir>/ep<E>_env<V>_chunk<C>.npz; decode offline with tools/decode_prediction_latents.py (no VAE decode here, so
+        # the timed inference only gains one device->host copy)
+        self.prediction_latent_dir = self._resolve_trajectory_dump_dir(cfg, "prediction_latent_dir")
+        self._pred_tick: dict[int, int] = {}
         self._traj_slots = TRAJ_SLOTS + (TRAJ_EEF_SLOTS if self.include_eef else ())
         self._traj_obs: list[tuple[int, int, int, np.ndarray]] = []
         self._traj_chunks: list[dict[str, Any]] = []
@@ -313,6 +319,7 @@ class Model(ModelTemplate):
             + f" canvas_prompt={getattr(self.session, 'canvas_prompt', None)}"
             + (f" robot_base_eef_layout={self.robot_base_eef_layout}" if self.include_eef else "")
             + (f" trajectory_dump_dir={self.trajectory_dump_dir}" if self.trajectory_dump_dir is not None else "")
+            + (f" prediction_latent_dir={self.prediction_latent_dir}" if self.prediction_latent_dir is not None else "")
         )
         prompt_sentence = getattr(self.session, "action_mode_text", None)
         if prompt_sentence is not None:
@@ -653,6 +660,8 @@ class Model(ModelTemplate):
                 assert action["left_ee_joint_state"].shape == (int(ee_dims[0]),)
                 assert action["right_ee_joint_state"].shape == (int(ee_dims[1]),)
         actions = self._select_actions_to_execute(actions)
+        if self.prediction_latent_dir is not None:
+            self._save_prediction_latent(env_idx, result, instruction, len(actions))
         self._remember_last_command(env_idx, action80, len(actions))
         self._traj_record_chunk(env_idx, state80_measured, state80_raw, action80, len(actions))
         return [{k: np.ascontiguousarray(a[k], dtype=np.float32) for k in keys} for a in actions]
@@ -724,10 +733,10 @@ class Model(ModelTemplate):
     # -- diagnostic trajectory dump ----------------------------------------------
 
     @staticmethod
-    def _resolve_trajectory_dump_dir(cfg: Mapping[str, Any]) -> Optional[Path]:
-        """``trajectory_dump_dir``: null/empty = off; otherwise a directory (created) for per-episode ``ep<N>.npz`` dumps."""
+    def _resolve_trajectory_dump_dir(cfg: Mapping[str, Any], key: str = "trajectory_dump_dir") -> Optional[Path]:
+        """``trajectory_dump_dir`` / ``prediction_latent_dir``: null/empty = off; otherwise a directory (created)."""
 
-        raw = cfg.get("trajectory_dump_dir")
+        raw = cfg.get(key)
         if raw is None or raw is False or str(raw).strip().lower() in ("", "null", "none", "false", "off"):
             return None
         path = Path(str(raw)).expanduser()
@@ -847,7 +856,36 @@ class Model(ModelTemplate):
             results.append(self._predict_one(obs))
         return results
 
+    def _save_prediction_latent(self, env_idx: int, result: Any, instruction: str, executed: int) -> None:
+        """Write this chunk's sampled video latent: ``video_latent`` [1, C, F, h, W] fp16 (packed strip / canvas, normalized
+        like the training latents), the control tick it was predicted at, how many targets were executed, and the layout
+        needed to unpack and decode it (``view_latent_shapes``, ``visual_layout``, ``video_frames``, ``video_frame_stride``)."""
+
+        receipt = result.receipt
+        tick = self._pred_tick.get(env_idx, 0)
+        name = f"ep{int(self._episode_index):04d}_env{int(env_idx):02d}_chunk{int(self._chunk_index - 1):03d}"
+        out = self.prediction_latent_dir / f"{name}.npz"
+        tmp = self.prediction_latent_dir / f"{name}.tmp.npz"
+        np.savez_compressed(
+            tmp,
+            video_latent=result.video_latent.detach().to(device="cpu", dtype=torch.float16).numpy(),
+            episode=np.int64(self._episode_index),
+            env=np.int64(env_idx),
+            chunk=np.int64(self._chunk_index - 1),
+            tick=np.int64(tick),
+            executed=np.int64(executed),
+            view_latent_shapes=np.asarray(receipt.get("view_latent_shapes", ()), dtype=np.int64),
+            visual_layout=np.asarray(str(receipt.get("visual_layout"))),
+            video_frames=np.int64(receipt.get("video_frames") or 0),
+            video_frame_stride=np.int64(receipt.get("video_frame_stride") or 1),
+            frames=np.int64(receipt.get("frames") or 0),
+            instruction=np.asarray(str(instruction)),
+        )
+        os.replace(tmp, out)
+        self._pred_tick[env_idx] = tick + int(executed)
+
     def reset(self) -> None:
+        self._pred_tick = {}
         self._traj_flush()
         self._traj_obs, self._traj_chunks, self._traj_step = [], [], 0
         self._obs, self._order = {}, []

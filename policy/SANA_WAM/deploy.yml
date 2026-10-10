@@ -64,6 +64,10 @@ anchor_clamp_rad: 0.05
 # joints + grippers (slots 0-5, 29-34, 16, 45) and, per inference, the measured row, the anchor row and the absolute
 # chunk this adapter returned (ep<N>.npz, rewritten after every chunk). Leave null in evaluations.
 trajectory_dump_dir: null
+# Diagnostic only (null = off): directory for the world model's predicted video -- per inference the sampled video
+# latent (fp16, packed / normalized as in training) + its layout (ep<E>_env<V>_chunk<C>.npz). No VAE decode inside the
+# timed inference; decode offline with tools/decode_prediction_latents.py. Leave null in evaluations.
+prediction_latent_dir: null
 # Which Robot80 slots the checkpoint is conditioned on and supervised: auto (default) reads the training yaml's
 # data.extra.action_mode_sample_ratio -> joint_only (6 joints + gripper per arm) or robot_base_eef (plus the flange
 # link6 pose in the arm's base frame: position + rot6d, from URDF FK of the row's joints, E-axis remap; the eef SFT line).

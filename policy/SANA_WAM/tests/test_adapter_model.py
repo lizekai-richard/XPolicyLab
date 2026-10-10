@@ -853,3 +853,32 @@ def test_shipped_deploy_yml_defaults_to_video_only_cfg():
 
     deploy = _yaml.safe_load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "deploy.yml")))
     assert deploy["action_cfg_scale"] == 1.0 and deploy["video_cfg_scale"] is None
+
+
+# -- prediction_latent_dir: the world model's predicted video, saved per chunk --------------------------------------------
+
+
+def test_prediction_latent_dir_writes_one_npz_per_chunk(patched, ckpt_dir, tmp_path):
+    out = tmp_path / "pred"
+    model = adapter.Model(base_cfg(ckpt_dir, n_action_steps=8, prediction_latent_dir=str(out)))
+    assert model.prediction_latent_dir == out and out.is_dir()
+    for _ in range(2):
+        model.update_obs(fake_obs())
+        model.get_action()
+    files = sorted(p.name for p in out.glob("*.npz"))
+    assert files == [f"ep{model._episode_index:04d}_env00_chunk000.npz", f"ep{model._episode_index:04d}_env00_chunk001.npz"]
+    first, second = (np.load(out / f) for f in files)
+    assert first["video_latent"].dtype == np.float16 and int(first["executed"]) == 8
+    assert (int(first["tick"]), int(second["tick"])) == (0, 8) and int(second["chunk"]) == 1
+    assert not list(out.glob("*.tmp.npz"))
+    model.reset()                                   # a new episode restarts the tick count
+    model.update_obs(fake_obs())
+    model.get_action()
+    newest = np.load(out / f"ep{model._episode_index:04d}_env00_chunk000.npz")
+    assert int(newest["tick"]) == 0
+
+
+@pytest.mark.parametrize("value", [None, "", "null", "off"])
+def test_prediction_latent_dir_off_writes_nothing(patched, ckpt_dir, value):
+    model = adapter.Model(base_cfg(ckpt_dir, prediction_latent_dir=value))
+    assert model.prediction_latent_dir is None

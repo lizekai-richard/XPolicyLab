@@ -773,3 +773,51 @@ def test_the_pantheon33k_sana_latent_serves_like_the_pantheon2k_stretch_strip():
     assert not ((cfg.get("train") or {}).get("extra") or {}).get("video_augmentation")
     session = _session(cfg)
     assert (session.view_resize, session.view_resize_source) == ("stretch", "default")
+
+
+# logits/sft_robodojo_eefabs_sana_pixel_320x512_vanilla_pantheon14k_aligned_f33fps8_videoaug (zekai-merge 27ed33fc6): the Pantheon14k
+# pixel recipe with a train-only video augmentation (p 0.5) and the VAE encoded online; every served key equals the Pantheon14k
+# pixel's (stretch by default, pad unmasked, norm 9f8b98e)
+PANTHEON14K_PIXEL_VIDEOAUG = os.path.join(
+    os.path.dirname(__file__), "fixtures", "config_pantheon14k_sana_pixel_320x512_videoaug_27ed33fc6.yaml"
+)
+
+
+def test_the_pantheon14k_sana_pixel_videoaug_serves_like_the_pantheon14k_pixel():
+    cfg, twin = wam_config.load_train_config(PANTHEON14K_PIXEL_VIDEOAUG), wam_config.load_train_config(PANTHEON14K_PIXEL)
+    flat, twin_flat = _flat(cfg), _flat(twin)
+    differ = {key for key in flat.keys() | twin_flat.keys() if flat.get(key) != twin_flat.get(key)}
+    training_only = {"name", "work_dir", "train.valid_prompt_embed_root", "vae.cache_dir", "vae.vae_pretrained",
+                     "data.extra.robot_sft.allow_online_encode", "data.extra.robot_sft.vae_latent_cache_dir"}
+    assert differ - training_only == {key for key in differ if key.startswith("train.extra.video_augmentation.")}
+    assert flat["train.extra.video_augmentation.enabled"] is True and flat["model.load_from"] == twin_flat["model.load_from"]
+    assert wam_config.view_resize_from_train_config(cfg) == ("stretch", "default")
+    assert wam_config.sana_pixel_pad_from_train_config(cfg) == "unmasked"
+    assert wam_config.sana_pixel_canvas_hw_from_train_config(cfg) == (320, 512)
+    assert wam_config.policy_config_from_train_config(cfg) == wam_config.policy_config_from_train_config(twin)
+    assert wam_config.resolve_canvas_text_contract(cfg) == wam_config.resolve_canvas_text_contract(twin)
+    assert cfg["data"]["extra"]["robot_sft"]["normalization_sha256"].startswith("9f8b98ed")
+    session = _session(cfg)
+    assert (session.sana_pixel_pad, session.view_resize, session.view_resize_source) == ("unmasked", "stretch", "default")
+    assert tuple(session.sana_pixel_canvas_hw) == (320, 512)
+
+
+# logits/sft_robodojo_eefabs_sana_latent_256x320_pantheon33k_aligned_f33fps8_videoaug (zekai-merge c391260a4, the recipe's own
+# commit): the Pantheon33k sana_latent strip (donor sana_rwm_pretrained_vanilla_sanalatent_pantheon_e8s33139) on STRETCHED views
+# encoded online, with a train-only video augmentation (p 0.5) and norm 1fe3b7e7; the newer trainer dumps every default, so the
+# yaml is compared through the adapter's resolved contracts rather than key by key
+PANTHEON33K_LATENT_VIDEOAUG = os.path.join(os.path.dirname(__file__), "fixtures", "config_pantheon33k_sana_latent_videoaug_c391260a4.yaml")
+
+
+def test_the_pantheon33k_sana_latent_videoaug_serves_like_the_pantheon33k_strip():
+    cfg, twin = legacy(PANTHEON33K_LATENT_VIDEOAUG), legacy(PANTHEON33K_LATENT)
+    _assert_serves_like_the_vanilla34k_strip(cfg, legacy(VANILLA34K_LATENT))
+    assert wam_config.policy_config_from_train_config(cfg) == wam_config.policy_config_from_train_config(twin)
+    assert wam_config.resolve_canvas_text_contract(cfg) == wam_config.resolve_canvas_text_contract(twin)
+    assert cfg["model"]["load_from"].rsplit("/", 1)[-1] == twin["model"]["load_from"].rsplit("/", 1)[-1]
+    assert "sanalatent_pantheon_e8s33139" in cfg["model"]["load_from"]
+    assert "view_resize" not in cfg["data"]["extra"]["robot_sft"]
+    assert cfg["data"]["extra"]["robot_sft"]["normalization_sha256"].startswith("1fe3b7e7")
+    assert cfg["train"]["extra"]["video_augmentation"]["enabled"] is True
+    session = _session(cfg)
+    assert (session.view_resize, session.view_resize_source) == ("stretch", "default")
