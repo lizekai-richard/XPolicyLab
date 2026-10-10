@@ -12,14 +12,23 @@ One emitted chunk per cycle, mirroring the robot loop:
    strided, VAE-encoded, the anchor latent dropped), the executed actions and the chunk-start state; it reads like a
    generation of that chunk, then writes the next GDN state and appends its K/V as entry E_{c+1}.
 
-Softmax read rule (``window_rule``):
+Softmax read rule (``window_rule``), N = ``sliding_window_chunks``:
 
-* ``training`` (default): the forward on chunk c reads the newest ``min(c + 1, N)`` entries of [E_0, E_1, .., E_c],
-  N = ``sliding_window_chunks``; the observation entry evicts like any other once c >= N. This is the two-stream
-  training forward's rule (Sana ``CachedChunkCausalPolicySoftmaxAttention._two_stream_spans``: noisy chunk c reads
-  clean entries ``max(0, c + 1 - N) .. c``; clean entry j reads ``max(0, j - N) .. j``), at the same physical positions.
-* ``keep_obs``: E_0 plus the newest ``N - 1`` chunk entries (Sana's deploy KV manager always reads the observation
-  entry; this keeps its read set at physical positions, as ``kv_position_mode="absolute"`` would).
+* ``training`` (default): the forward on chunk c reads the newest ``min(c + 1, N)`` entries of [E_0, E_1, .., E_c];
+  the observation entry evicts like any other once c >= N. This is the two-stream training forward's read set (Sana
+  ``CachedChunkCausalPolicySoftmaxAttention._two_stream_spans``: noisy chunk c reads clean entries
+  ``max(0, c + 1 - N) .. c``; clean entry j reads ``max(0, j - N) .. j``).
+* ``sink``: the observation as an ATTENTION SINK -- E_0 plus the newest ``N - 1`` chunk entries (N entries, the
+  training budget); equal to ``training`` while E_0 fits the window.
+
+Positions. Softmax entries are kept BEFORE the rotary embedding and rotated on the fly at every read, on a clock
+numbered from 0 at the read's ORIGIN O = the oldest chunk read (``read_plan``): E_0 at latent frame 0, chunk k at chunk
+slot k - O (frames from ``(k - O) * f_c + 1``, state at step ``(k - O) * C``), and the window of chunk c at slot c - O.
+While nothing has slid out (O = 0) that is the physical clock; afterwards ``training`` reads exactly the positions of
+training's chunk N (the oldest chunk in slot 0, frame 0 empty) and ``sink`` those of training's chunk N - 1 (E_0 at
+frame 0, the chunks from slot 0) -- Sana's deploy rank clock (``kv_position_mode="rank"``). The softmax layers thus
+only ever see position ids of a training window. The GDN layers are never windowed: their state keeps keys rotated at
+the physical positions of the whole episode, and their window runs on that clock.
 
 Conditional and unconditional text streams hold separate memories (the caption reaches every layer through
 cross-attention). Latents are ``[1, C_lat, F, H, W]`` canvas grids; actions and states are in the normalized space.
@@ -30,31 +39,33 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import torch
 
 from .shared import SANA_WAM_POLICY_DIR  # noqa: F401  (sys.path bridge first)
 
 from sana_wam_min.sampler import _action_step, _video_step, make_scheduler  # noqa: E402
+from sana_wam_min.policy_model.attention import apply_rotary_emb_fp64_softmax  # noqa: E402
 
 from .layers import GDN_KIND, LayerCache  # noqa: E402
 from .model import CausalPolicyModel  # noqa: E402
 
-WINDOW_RULES = ("training", "keep_obs")
+WINDOW_RULES = ("training", "sink")
 LEFT_GRIPPER, RIGHT_GRIPPER = 16, 45
 
 
 class CausalMemory:
-    """One text stream's committed memory: every GDN layer's ``(S, z)`` and every softmax layer's entries."""
+    """One text stream's committed memory: every GDN layer's ``(S, z)`` and every softmax layer's entries, the latter
+    as (PRE-RoPE k, v), rotated by ``layer_caches`` on the clock of each read (module docstring, "Positions")."""
 
     def __init__(self, model: CausalPolicyModel, window: Optional[int], rule: str = "training") -> None:
         if rule not in WINDOW_RULES:
             raise ValueError(f"window_rule must be one of {WINDOW_RULES}, got {rule!r}")
         if window is not None and int(window) < 1:
             raise ValueError(f"the softmax window must be >= 1 entries or None, got {window}")
-        if rule == "keep_obs" and window is not None and int(window) < 2:
-            raise ValueError("keep_obs needs a window of at least 2 entries (the observation + one chunk)")
+        if rule == "sink" and window is not None and int(window) < 2:
+            raise ValueError("sink needs a window of at least 2 entries (the observation + one chunk)")
         self.window = None if window is None else int(window)
         self.rule = rule
         self.kinds = [block.attn_type for block in model.blocks]
@@ -80,10 +91,15 @@ class CausalMemory:
             return ids[-self.window :]
         return ids[:1] + ids[1:][-(self.window - 1) :]
 
-    def _context(self, index: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        if self.entries == 0:
-            return None
+    def read_plan(self) -> tuple[list[int], int]:
+        """(entry ids read, origin O): O = the oldest CHUNK read (0 when no chunk is read). The read is numbered from 0
+        at O: E_0 at frame 0, chunk k at slot k - O, the forward's own chunk c at slot c - O."""
+
         ids = self.read_entry_ids()
+        chunk_ids = [entry for entry in ids if entry > 0]
+        return ids, (chunk_ids[0] - 1 if chunk_ids else 0)
+
+    def _entries(self, index: int, ids: Sequence[int]) -> list[tuple[torch.Tensor, torch.Tensor]]:
         kept = list(self.chunks[index])          # the newest chunk entries, oldest first
         first_kept = self.entries - len(kept)    # entry id of kept[0]
         parts = []
@@ -97,21 +113,36 @@ class CausalMemory:
                 if position < 0:
                     raise RuntimeError(f"entry {entry} was evicted but the read rule asks for it")
                 parts.append(kept[position])
-        if not parts:
-            return None
-        return torch.cat([k for k, _ in parts], dim=1), torch.cat([v for _, v in parts], dim=1)
+        return parts
 
-    def layer_caches(self, *, commit: bool) -> list[LayerCache]:
+    def layer_caches(self, *, commit: bool, rope_of: Optional[Callable[[Optional[int]], torch.Tensor]] = None) -> list[LayerCache]:
+        """One ``LayerCache`` per block for one forward. The softmax entries read are rotated here, once for every
+        forward that shares this read (the denoising steps of a chunk reuse the caches): ``rope_of(slot)`` is the
+        softmax rotary table of an entry at chunk slot ``slot`` (None = the observation at frame 0), the model's
+        ``softmax_entry_rope``."""
+
+        ids, origin = self.read_plan()
+        rope = None
+        if ids:
+            if rope_of is None:
+                raise ValueError("a read needs rope_of: softmax entries are kept before the rotary embedding")
+            rope = torch.cat([rope_of(None if entry == 0 else entry - 1 - origin) for entry in ids], dim=2)
         caches = []
         for index, kind in enumerate(self.kinds):
             if kind == GDN_KIND:
                 caches.append(LayerCache(commit=commit, gdn_state=self.gdn[index]))
-            else:
-                caches.append(LayerCache(commit=commit, softmax_context=self._context(index)))
+                continue
+            context = None
+            if ids:
+                parts = self._entries(index, ids)
+                k = torch.cat([k for k, _ in parts], dim=1)
+                v = torch.cat([v for _, v in parts], dim=1)
+                context = (apply_rotary_emb_fp64_softmax(k, rope.to(k.device)), v)
+            caches.append(LayerCache(commit=commit, softmax_context=context))
         return caches
 
     def absorb(self, caches: Sequence[LayerCache]) -> None:
-        """Keep what a commit forward left in its caches: the next GDN states and the new softmax entry."""
+        """Keep what a commit forward left in its caches: the next GDN states and the new (pre-RoPE) softmax entry."""
 
         for index, (kind, cache) in enumerate(zip(self.kinds, caches)):
             if kind == GDN_KIND:
@@ -184,6 +215,7 @@ class CausalPolicySession:
         self.window_rule = window_rule
         self.chunk_idx = 0
         self.obs_latent: Optional[torch.Tensor] = None
+        self._rope_tables: dict = {}   # softmax rotary table per chunk slot of a read (None = the observation)
 
     # -- helpers -----------------------------------------------------------------------------------------------------
 
@@ -205,6 +237,24 @@ class CausalPolicySession:
         """Entry ids the next forward reads (0 = observation, k + 1 = chunk k); the same in every stream."""
 
         return self.streams[0][1].read_entry_ids()
+
+    def softmax_origin(self) -> int:
+        """The next read's origin O (the oldest chunk read): the softmax layers number that read from 0 there."""
+
+        return self.streams[0][1].read_plan()[1]
+
+    def _rope_of(self, slot: Optional[int]) -> torch.Tensor:
+        if slot not in self._rope_tables:
+            like = self.obs_latent
+            patch = self.model.patch_size
+            self._rope_tables[slot] = self.model.softmax_entry_rope(
+                slot, self.model_fps, like.shape[-2] // patch[1], like.shape[-1] // patch[2], like.device
+            )
+        return self._rope_tables[slot]
+
+    def _softmax_offsets(self, frame_offset: int, step_offset: int) -> tuple[int, int]:
+        origin = self.softmax_origin()
+        return frame_offset - origin * self.f_chunk, step_offset - origin * self.chunk_actions
 
     # -- the cycle ---------------------------------------------------------------------------------------------------
 
@@ -260,7 +310,10 @@ class CausalPolicySession:
         action = action_noise.to(device=device, dtype=like.dtype).masked_fill(~action_mask, 0)
         video_scheduler = make_scheduler(self.steps, self.flow_shift, device)
         action_scheduler = make_scheduler(self.steps, self.action_flow_shift, device)
-        caches_by_stream = [None if self.chunk_idx == 0 else memory.layer_caches(commit=False) for _, memory in self.streams]
+        caches_by_stream = [
+            None if self.chunk_idx == 0 else memory.layer_caches(commit=False, rope_of=self._rope_of)
+            for _, memory in self.streams
+        ]
         state = anchor_state.reshape(1, -1)
         state_mask = anchor_state_mask.reshape(1, -1).to(torch.bool)
         with self._autocast(device):
@@ -269,6 +322,7 @@ class CausalPolicySession:
                 video_t = timestep.reshape(1, 1).expand(1, self.f_chunk).to(torch.float32)
                 action_t = action_timestep.reshape(1, 1).expand(1, chunk).to(torch.float32)
                 latent, window_t, frame_offset, step_offset = self._window(self.chunk_idx, video, video_t)
+                soft_frame, soft_step = self._softmax_offsets(frame_offset, step_offset)
                 robot = {
                     "state80": state,
                     "state_mask80": state_mask,
@@ -282,7 +336,7 @@ class CausalPolicySession:
                         self.model.forward_window(
                             latent, window_t, caption.y, caption.mask,
                             model_fps=self.model_fps, frame_offset=frame_offset, step_offset=step_offset,
-                            robot=robot, caches=caches,
+                            robot=robot, caches=caches, softmax_frame_offset=soft_frame, softmax_step_offset=soft_step,
                         )
                     )
                 cond = outputs[0]
@@ -343,13 +397,14 @@ class CausalPolicySession:
         video_t = torch.zeros(1, self.f_chunk, device=device)
         frame_offset = self.chunk_idx * self.f_chunk + 1
         step_offset = self.chunk_idx * chunk
+        soft_frame, soft_step = self._softmax_offsets(frame_offset, step_offset)   # the read of chunk c's generation
         with self._autocast(device):
             for caption, memory in self.streams:
-                caches = memory.layer_caches(commit=True)
+                caches = memory.layer_caches(commit=True, rope_of=self._rope_of)
                 self.model.forward_window(
                     chunk_latent, video_t, caption.y, caption.mask,
                     model_fps=self.model_fps, frame_offset=frame_offset, step_offset=step_offset,
-                    robot=robot, caches=caches,
+                    robot=robot, caches=caches, softmax_frame_offset=soft_frame, softmax_step_offset=soft_step,
                 )
                 memory.absorb(caches)
         self.chunk_idx += 1

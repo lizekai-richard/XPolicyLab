@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 from types import SimpleNamespace
 
@@ -76,19 +77,31 @@ class _Model:
         self.blocks = [type("B", (), {"attn_type": kind})() for kind in kinds]
 
 
-def _fill(memory: CausalMemory, entries: int) -> None:
+def _add(memory: CausalMemory) -> None:
+    """Commit ONE entry numbered by the memory's count: softmax (pre-RoPE k, v) = (id * (1 + i), id) as [1, 1, 1, 2]."""
+
     from sana_wam_causal.layers import LayerCache
 
-    for entry in range(entries):
-        caches = []
-        for kind in memory.kinds:
-            cache = LayerCache(commit=True)
-            if kind == "GatedDeltaNet":
-                cache.gdn_next = (torch.full((1,), float(entry)), torch.full((1,), float(entry)))
-            else:
-                cache.softmax_new = (torch.full((1, 1, 1, 1), float(entry)), torch.full((1, 1, 1, 1), float(entry)))
-            caches.append(cache)
-        memory.absorb(caches)
+    entry = memory.entries
+    caches = []
+    for kind in memory.kinds:
+        cache = LayerCache(commit=True)
+        if kind == "GatedDeltaNet":
+            cache.gdn_next = (torch.full((1,), float(entry)), torch.full((1,), float(entry)))
+        else:
+            cache.softmax_new = (torch.full((1, 1, 1, 2), float(entry), dtype=torch.float64),
+                                 torch.full((1, 1, 1, 2), float(entry), dtype=torch.float64))
+        caches.append(cache)
+    memory.absorb(caches)
+
+
+def _fill(memory: CausalMemory, entries: int) -> None:
+    for _ in range(entries):
+        _add(memory)
+
+
+def _identity_rope(slot):
+    return torch.ones(1, 1, 1, 1, dtype=torch.complex128)   # [B, 1, T = 1, D / 2 = 1]
 
 
 @pytest.mark.parametrize(
@@ -99,19 +112,74 @@ def _fill(memory: CausalMemory, entries: int) -> None:
         (3, "training", 3, [0, 1, 2]),
         (3, "training", 4, [1, 2, 3]),
         (3, "training", 7, [4, 5, 6]),
-        (3, "keep_obs", 7, [0, 5, 6]),
         (1, "training", 4, [3]),
+        (3, "sink", 3, [0, 1, 2]),
+        (3, "sink", 7, [0, 5, 6]),
+        (2, "sink", 5, [0, 4]),
     ],
 )
 def test_read_rules(window, rule, entries, expected):
     memory = CausalMemory(_Model(["GatedDeltaNet", "GatedSoftmaxAttention"]), window, rule)
     _fill(memory, entries)
     assert memory.read_entry_ids() == expected
-    k, _v = memory._context(1)
-    assert k.reshape(-1).tolist() == [float(e) for e in expected]
+    k, v = memory.layer_caches(commit=False, rope_of=_identity_rope)[1].softmax_context
+    assert k[..., 0].reshape(-1).tolist() == v[..., 0].reshape(-1).tolist() == [float(e) for e in expected]
     assert memory.gdn[0][0].item() == float(entries - 1)
     if rule == "training" and window is not None and entries > window:
         assert memory.obs[1] is None  # the observation entry is dropped once it can never be read again
+    if rule == "sink":
+        assert memory.obs[1] is not None
+
+
+@pytest.mark.parametrize(
+    "rule,window,entries,ids,origin,slots",
+    [
+        ("training", 3, 3, [0, 1, 2], 0, [None, 0, 1]),
+        ("training", 3, 4, [1, 2, 3], 0, [0, 1, 2]),      # E_0 gone: chunks 0..2 keep their slots, frame 0 empty
+        ("training", 3, 7, [4, 5, 6], 3, [0, 1, 2]),      # chunks 3..5 read in slots 0..2 = training's chunk N
+        ("sink", 3, 3, [0, 1, 2], 0, [None, 0, 1]),
+        ("sink", 3, 4, [0, 2, 3], 1, [None, 0, 1]),       # E_0 at frame 0, chunks 1..2 in slots 0..1
+        ("sink", 3, 7, [0, 5, 6], 4, [None, 0, 1]),       # = training's chunk N - 1
+        ("training", None, 6, [0, 1, 2, 3, 4, 5], 0, [None, 0, 1, 2, 3, 4]),
+    ],
+)
+def test_every_read_is_numbered_from_zero(rule, window, entries, ids, origin, slots):
+    memory = CausalMemory(_Model(["GatedSoftmaxAttention"]), window, rule)
+    _fill(memory, entries)
+    assert memory.read_plan() == (ids, origin)
+    asked = []
+
+    def rope_of(slot):
+        asked.append(slot)
+        return _identity_rope(slot)
+
+    memory.layer_caches(commit=False, rope_of=rope_of)
+    assert asked == slots
+
+
+def test_reads_rotate_the_pre_rope_keys_at_their_slots():
+    """The stored keys are pre-RoPE: a read multiplies them by its own phase per slot, values stay untouched."""
+
+    memory = CausalMemory(_Model(["GatedSoftmaxAttention"]), 3, "sink")
+    _fill(memory, 6)   # E_0 + chunks 0..4; the read takes E_0, chunks 3, 4 (origin 3)
+
+    def rope_of(slot):
+        angle = 0.25 if slot is None else 1.0 + slot
+        return torch.polar(torch.ones(1, 1, 1, 1, dtype=torch.float64), torch.full((1, 1, 1, 1), angle, dtype=torch.float64))
+
+    k, v = memory.layer_caches(commit=False, rope_of=rope_of)[0].softmax_context
+    expected = []
+    for entry, angle in ((0, 0.25), (4, 1.0), (5, 2.0)):
+        z = complex(entry, entry) * complex(math.cos(angle), math.sin(angle))
+        expected.append([z.real, z.imag])
+    torch.testing.assert_close(k.reshape(3, 2), torch.tensor(expected, dtype=torch.float64), rtol=0, atol=1e-12)
+    assert v[..., 0].reshape(-1).tolist() == [0.0, 4.0, 5.0]
+    with pytest.raises(ValueError, match="rope_of"):
+        memory.layer_caches(commit=False)
+    with pytest.raises(ValueError, match="at least 2"):
+        CausalMemory(_Model(["GatedSoftmaxAttention"]), 1, "sink")
+    with pytest.raises(ValueError, match="window_rule"):
+        CausalMemory(_Model(["GatedSoftmaxAttention"]), 3, "keep_obs")
 
 
 def _tiny_model(window=2):

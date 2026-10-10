@@ -72,7 +72,13 @@ from sana_wam_min.robot80 import normalize_action, normalize_state, normalized_g
 
 TAG = "[SANA_WAM_CAUSAL]"
 CHECKPOINT_EXPLICIT_KEYS = ("checkpoint_dir", "checkpoint_path", "ckpt_dir", "model_dir")
-COMMIT_ACTIONS = ("executed", "predicted")
+# What memory keeps as an executed chunk's 32 action rows: executed = the EE commands sent (the default); predicted =
+# the raw model output; reached = the poses the arms actually reached (FK of the measured joints after each action,
+# gripper as observed) -- training's rows are both at once (the dataset state is the previous command)
+COMMIT_ACTIONS = ("executed", "predicted", "reached")
+# full = the deployment (memory of the whole episode); none = the memory ablation: every chunk is a cold start whose
+# memory holds only that chunk's start frame (chunk 0 of a fresh session: the cache-free [observation | targets] window)
+MEMORY_MODES = ("full", "none")
 SEED_DOMAIN = "sana_wam_causal_xpolicylab.diffusion_seed.v1"
 MAX_JSON_SAFE_INTEGER = 2**53 - 1
 DEFAULT_INSTRUCTION = "follow the instruction"
@@ -140,6 +146,36 @@ def executed_rows(action80_raw: torch.Tensor, action_mask: torch.Tensor) -> torc
     return torch.from_numpy(rows)
 
 
+def command_vs_reached(commanded_raw: np.ndarray, reached_raw: np.ndarray, mask: np.ndarray) -> dict[str, tuple[float, float, float, float]]:
+    """Per arm, over a chunk's active rows: (mean position gap [m], max position gap [m], max rotation gap [deg],
+    max gripper closedness gap) between the commanded EE targets and the poses reached after them."""
+
+    commanded = np.asarray(commanded_raw, dtype=np.float64)
+    reached = np.asarray(reached_raw, dtype=np.float64)
+    mask = np.asarray(mask, dtype=np.bool_)
+    gaps = {}
+    for side, _joints, position_slice, rotation_slice, gripper in ARM_FIELDS:
+        rows = np.flatnonzero(mask[:, position_slice].all(axis=1) & mask[:, rotation_slice].all(axis=1))
+        if rows.size == 0:
+            continue
+        position = np.linalg.norm(commanded[rows, position_slice] - reached[rows, position_slice], axis=1)
+        angles = []
+        for k in rows:
+            relative = rot6d_to_matrix(commanded[k, rotation_slice]).T @ rot6d_to_matrix(reached[k, rotation_slice])
+            angles.append(np.degrees(np.arccos(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))))
+        grip_rows = rows[mask[rows, gripper]]
+        grip = float(np.abs(commanded[grip_rows, gripper] - reached[grip_rows, gripper]).max()) if grip_rows.size else 0.0
+        gaps[side] = (float(position.mean()), float(position.max()), float(max(angles)), grip)
+    return gaps
+
+
+def format_command_vs_reached(gaps: Mapping[str, tuple[float, float, float, float]]) -> str:
+    return " | ".join(
+        f"{side[0].upper()} pos {1000 * mean:.1f}/{1000 * peak:.1f} mm rot {deg:.2f} deg grip {grip:.2f}"
+        for side, (mean, peak, deg, grip) in gaps.items()
+    )
+
+
 class Model(ModelTemplate):
     """SANA_WAM_CAUSAL policy: one teacher-forced commit + one chunk generation per ``get_action``."""
 
@@ -179,6 +215,9 @@ class Model(ModelTemplate):
         self.commit_actions = str(cfg.get("commit_actions") or "executed").strip().lower()
         if self.commit_actions not in COMMIT_ACTIONS:
             raise ValueError(f"commit_actions must be one of {COMMIT_ACTIONS}, got {self.commit_actions!r}")
+        self.memory_mode = str(cfg.get("memory_mode") or "full").strip().lower()
+        if self.memory_mode not in MEMORY_MODES:
+            raise ValueError(f"memory_mode must be one of {MEMORY_MODES}, got {self.memory_mode!r}")
         window_rule = str(cfg.get("softmax_window") or "training").strip().lower()
         if window_rule not in WINDOW_RULES:
             raise ValueError(f"softmax_window must be one of {WINDOW_RULES}, got {window_rule!r}")
@@ -231,6 +270,7 @@ class Model(ModelTemplate):
         self._latest_obs: Optional[Mapping[str, Any]] = None
         self._tau: Optional[int] = None
         self._frames: dict[int, list[np.ndarray]] = {}
+        self._reached: dict[int, np.ndarray] = {}   # tick tau -> raw measured row (the pose reached after action tau - 1)
         self._pending: Optional[dict[str, Any]] = None
         self._instruction: Optional[str] = None
         self._size_warned = False
@@ -240,6 +280,7 @@ class Model(ModelTemplate):
             f"steps={frontend.steps} video_cfg_scale={frontend.video_cfg_scale} action_cfg_scale={frontend.action_cfg_scale} "
             f"flow_shift={frontend.flow_shift} action_flow_shift={frontend.action_flow_shift} "
             f"view_resize={frontend.view_resize} ({frontend.view_resize_source}) commit_actions={self.commit_actions} "
+            f"memory_mode={self.memory_mode} "
             f"gdn_recurrence={report.get('gdn_recurrence')} normalization_sha256={self.normalization.sha256} "
             f"device={self.device} action_type={self.action_type}",
             flush=True,
@@ -281,6 +322,7 @@ class Model(ModelTemplate):
             )
         if self._tau % self.frame_stride == 0:
             self._frames[self._tau] = self._frames_from_obs(obs)
+        self._reached[self._tau] = self._measured_row(obs)
 
     def update_obs_batch(self, obs_list) -> None:
         if isinstance(obs_list, Mapping):
@@ -291,13 +333,21 @@ class Model(ModelTemplate):
 
     # -- actions -----------------------------------------------------------------------------------------------------
 
+    def _measured_row(self, obs: Mapping[str, Any]) -> np.ndarray:
+        """The raw Robot80 row of an observation: measured joints, their URDF-FK base-frame E poses (position +
+        rot6d) and the observed gripper closedness -- the chunk-start state, and under ``commit_actions: reached`` the
+        action row of the action that led to it."""
+
+        state80, _ = state80_from_obs(obs["state"])
+        state80, _ = fill_eef_state_slots(state80, eef_state_slot_mask(True), self.kinematics)
+        return state80
+
     def _anchor(self, obs: Mapping[str, Any], *, check_pose: bool = False) -> tuple[np.ndarray, np.ndarray, torch.Tensor]:
         """(raw state80, EEF-only mask80, normalized state [80]) of the chunk-start observation: measured joints ->
         URDF FK -> base-frame E pose (position + rot6d), gripper closedness from the observed opening; joints masked.
         ``check_pose`` (chunk 0 of an episode) also runs the observed-pose check."""
 
-        state80, mask80 = state80_from_obs(obs["state"])
-        state80, mask80 = fill_eef_state_slots(state80, eef_state_slot_mask(True), self.kinematics)
+        state80, mask80 = self._measured_row(obs), eef_state_slot_mask(True)
         mask80 = np.array(mask80, dtype=np.bool_, copy=True)
         mask80[list(ROBOT80_JOINT_SLOTS_12)] = False
         if check_pose and self.eef_pose_check:
@@ -322,7 +372,11 @@ class Model(ModelTemplate):
         if any(pos > EEF_POSE_CHECK_WARN_M or deg > EEF_POSE_CHECK_WARN_DEG for pos, deg in gaps.values()):
             warnings.warn(f"observed end-effector pose disagrees with FK(measured joints): {text}", stacklevel=2)
 
-    def _commit_pending(self, timings: dict) -> Optional[float]:
+    def _commit_pending(self, timings: dict, *, commit: bool = True) -> tuple[Optional[float], str]:
+        """Fold the executed chunk into memory (``commit``); return the world-model error of its prediction and the
+        commanded-vs-reached gap of its actions. ``commit=False`` (``memory_mode: none``) only encodes it for that
+        error and drops it."""
+
         pending = self._pending
         if self._tau != self.chunk_actions:
             raise RuntimeError(
@@ -333,11 +387,22 @@ class Model(ModelTemplate):
         missing = [t for t in ticks if t not in self._frames]
         if missing:
             raise RuntimeError(f"{TAG} frames of ticks {missing} were not observed for chunk {pending['chunk']}")
+        # the pose reached after action j is the one measured at tick j + 1
+        reached = np.stack([self._reached[t] for t in range(1, self.chunk_actions + 1)])
+        mask_cpu = pending["mask_cpu"]
+        gap = format_command_vs_reached(command_vs_reached(pending["executed_raw"].numpy(), reached, mask_cpu.numpy()))
+        if commit and self.commit_actions == "reached":
+            committed = normalize_action(torch.from_numpy(reached), mask_cpu, self.normalization).masked_fill(~mask_cpu, 0)
+            pending["committed_action"] = committed.unsqueeze(0).to(device=self.runtime.device)
+        if not commit and not self.log_world_model_error:
+            return None, gap
         latent, timings["encode_s"] = timed(self.runtime.encode_executed_chunk, [self._frames[t] for t in ticks])
         wm_error = None
         if self.log_world_model_error and pending.get("predicted_latent") is not None:
             predicted = pending["predicted_latent"].float()
             wm_error = float(((predicted - latent.float()) ** 2).mean().sqrt() / (latent.float() ** 2).mean().sqrt().clamp_min(1e-8))
+        if not commit:
+            return wm_error, gap
         _, timings["commit_s"] = timed(
             self._session.commit_chunk,
             latent,
@@ -346,7 +411,7 @@ class Model(ModelTemplate):
             anchor_state_mask=pending["anchor_mask"],
             action_mask=pending["action_mask"],
         )
-        return wm_error
+        return wm_error, gap
 
     def get_action(self) -> list[dict[str, np.ndarray]]:
         obs = self._latest_obs
@@ -356,7 +421,7 @@ class Model(ModelTemplate):
         timings: dict[str, float] = {}
         frames = self._frames_from_obs(obs)
         instruction = self._instruction_from_obs(obs)
-        wm_error = None
+        wm_error, gap = None, None
         if self._session is None:
             self._session = self.runtime.new_session(instruction)
             self._instruction = instruction
@@ -369,11 +434,19 @@ class Model(ModelTemplate):
                     f"{TAG} the instruction changed within episode {self._episode_index} ({self._instruction!r} -> "
                     f"{instruction!r}); the memory is caption-conditioned"
                 )
-            wm_error = self._commit_pending(timings)
-        chunk = self._session.chunk_idx
+            wm_error, gap = self._commit_pending(timings, commit=self.memory_mode == "full")
+            if self.memory_mode == "none":
+                # the memory ablation: a fresh memory whose only entry is THIS chunk's start frame, so the chunk is
+                # generated exactly like chunk 0 of an episode (the cache-free [observation | targets] window)
+                self._session = self.runtime.new_session(instruction)
+                obs_latent, timings["obs_encode_s"] = timed(self.runtime.encode_observation, frames)
+                _, timings["obs_commit_s"] = timed(self._session.commit_observation, obs_latent)
+        # the episode's chunk index (noise seed, logs); a memory_mode none session always stands at its chunk 0
+        chunk = self._session.chunk_idx if self.memory_mode == "full" else self._chunk_index
         if self.max_chunks_per_episode is not None and chunk >= self.max_chunks_per_episode:
             raise RuntimeError(f"{TAG} episode {self._episode_index} reached max_chunks_per_episode={self.max_chunks_per_episode}")
-        read_ids = [] if chunk == 0 else self._session.read_entry_ids()
+        read_ids = [] if self._session.chunk_idx == 0 else self._session.read_entry_ids()
+        origin = 0 if self._session.chunk_idx == 0 else self._session.softmax_origin()   # the read is numbered from 0 here
 
         anchor_raw, anchor_mask, anchor_norm = self._anchor(obs, check_pose=chunk == 0)
         device = self.runtime.device
@@ -409,15 +482,19 @@ class Model(ModelTemplate):
             "action_mask": action_mask,
             "committed_action": committed.unsqueeze(0).to(device=device),
             "predicted_latent": predicted_latent.detach() if self.log_world_model_error else None,
+            "executed_raw": executed_raw,
+            "mask_cpu": mask_cpu,
         }
         self._frames = {0: frames}
+        self._reached = {}
         self._tau = 0
         self._chunk_index = chunk + 1
         total = time.perf_counter() - start
         detail = " ".join(f"{k}={v:.2f}" for k, v in timings.items())
         print(
-            f"{TAG} ep {self._episode_index} chunk {chunk}: read_entries={read_ids} {detail} total_s={total:.2f}"
-            + ("" if wm_error is None else f" world_model_rel_rmse(chunk {chunk - 1})={wm_error:.4f}"),
+            f"{TAG} ep {self._episode_index} chunk {chunk}: read_entries={read_ids} origin={origin} {detail} total_s={total:.2f}"
+            + ("" if wm_error is None else f" world_model_rel_rmse(chunk {chunk - 1})={wm_error:.4f}")
+            + ("" if gap is None else f" cmd_vs_reached(chunk {chunk - 1}): {gap}"),
             flush=True,
         )
         return [
@@ -439,6 +516,7 @@ class Model(ModelTemplate):
         self._latest_obs = None
         self._tau = None
         self._frames = {}
+        self._reached = {}
         self._pending = None
         self._instruction = None
         self._chunk_index = 0

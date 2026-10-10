@@ -113,7 +113,7 @@ Server log lines to check:
   [SANA_WAM_CAUSAL] ep E chunk c: read_entries=[...] encode_s=.. commit_s=.. generate_s=.. total_s=.. world_model_rel_rmse(chunk c-1)=..
   ```
 
-  `read_entries` lists the memory entries the generation reads: 0 = the observation, k + 1 = chunk k. `world_model_rel_rmse` is the relative RMSE between the latent the model predicted for the previous chunk and the latent of what was actually observed.
+  `read_entries` lists the memory entries the generation reads: 0 = the observation, k + 1 = chunk k. `world_model_rel_rmse` is the relative RMSE between the latent the model predicted for the previous chunk and the latent of what was actually observed. `cmd_vs_reached(chunk c-1)` compares the previous chunk's EE commands with the poses reached after them, per arm (`L`/`R`): mean/max position gap in mm, max rotation gap in degrees, max gripper closedness gap.
 
 The RoboDojo client times every RPC out after 120 s whatever `request_timeout_s` says. One `get_action` takes about 2 s.
 
@@ -131,8 +131,9 @@ The RoboDojo client times every RPC out after 120 s whatever `request_timeout_s`
 | `sampling_steps` | 10 | Euler steps per chunk |
 | `cfg_scale` / `video_cfg_scale` / `action_cfg_scale` | 6.0 / null / 1.0 | per-stream text CFG as in SANA_WAM: video CFG 6, action CFG 1 (one unconditional forward per step either way). Each must be >= 1 |
 | `flow_shift` / `action_flow_shift` | null / null | null = the yaml's `scheduler.inference_flow_shift` / `inference_action_flow_shift` (5 / 1 for m48n24) |
-| `softmax_window` | training | read rule of the softmax memory: `training` = the newest `sliding_window_chunks` entries of [observation, chunk 0, chunk 1, ...], so the observation evicts like any other entry, which is the two-stream training forward's rule; `keep_obs` = the observation plus the newest N - 1 chunks, as Sana's deploy KV manager reads (A/B only) |
-| `commit_actions` | executed | what enters memory as an executed chunk's actions: `executed` = the EE commands actually sent, re-normalized; `predicted` = the raw model output (A/B only) |
+| `softmax_window` | training | read set of the softmax memory: `training` = the newest `sliding_window_chunks` entries of [observation, chunk 0, chunk 1, ...], so the observation evicts like any other entry (the two-stream training forward's rule); `sink` = the observation plus the newest N - 1 chunks (see Notes). Either way every read is rotated on a clock numbered from 0 |
+| `memory_mode` | full | `full` = the deployment above; `none` = the **memory ablation**: every chunk is a cold start whose memory holds only its own start frame, so it is generated exactly like chunk 0 (the cache-free [observation | targets] window, which every training window's first chunk trains). Nothing is committed; the executed chunk is still encoded for `world_model_rel_rmse`, and the noise seed keeps the episode's chunk index |
+| `commit_actions` | executed | what enters memory as an executed chunk's actions: `executed` = the EE commands actually sent, re-normalized; `predicted` = the raw model output (A/B only); `reached` = the poses the arms actually reached (URDF FK of the joints measured after each action, the observed gripper), re-normalized. In the training data the two coincide (the dataset state is the previous command, `state[i+1] == action[i]`), so only `reached` keeps training's invariants in closed loop: the action rows agree with the observed video, and the last row equals the next chunk's state slot |
 | `max_chunks_per_episode` | null | refuse an episode longer than this many chunks; null = no limit (GDN extrapolates past the 48-chunk training windows) |
 | `log_world_model_error` | true | the per-chunk `world_model_rel_rmse` in the server log |
 | `view_resize` | null (= stretch) | as in SANA_WAM: the yaml's `data.extra.robot_sft.view_resize` when declared (a contradicting value is refused), else `stretch`. Every causal recipe trains on Sana code where stretch is the only SFT view resize, whatever resize its donor saw |
@@ -168,7 +169,13 @@ The chunk length, the video stride, the window and the canvas are properties of 
 - its actions sit at steps 32c+1 .. 32c+32;
 - its target latent is frame c+1.
 
-The softmax K/V are stored post-RoPE at their physical positions, as the two-stream forward rotates its prefix once over the whole canvas. GDN numerators use complex64 RoPE; softmax layers use fp64 RoPE cast back to the activation dtype and fp32 attention, as in Sana.
+**Positions of the softmax reads** (2026-10-06):
+- The softmax entries are kept BEFORE the rotary embedding and rotated on the fly at every read, on a clock numbered from 0 at the read's origin O, the oldest chunk read. The observation sits at frame 0, chunk k in chunk slot k - O, and the window of chunk c in slot c - O. A read is rotated once per chunk; the 10 denoising steps reuse it.
+- **While nothing has slid out** (O = 0), this is the episode's physical clock.
+- **After that,** `training` reads exactly the position ids of training's chunk N: the oldest chunk in slot 0, with frame 0 empty. `sink` reads those of training's chunk N - 1: the observation at frame 0, the chunks from slot 0.
+- The softmax layers therefore never see a position id outside a training window (at most N chunks). In exact arithmetic RoPE logits depend only on position differences, so this changes the numerics only by rounding, and keeps the ids in the trained range for episodes of any length.
+- **GDN layers** are never windowed. Their state keeps keys rotated at the physical positions of the whole episode, and their window runs on that clock.
+- **Precision:** GDN numerators use complex64 RoPE; softmax layers use fp64 RoPE cast back to the activation dtype and fp32 attention, as in Sana.
 
 **State and actions** (the D5 contract):
 
@@ -176,7 +183,13 @@ The softmax K/V are stored post-RoPE at their physical positions, as the two-str
 - **Returned actions.** The 32 sampled rows are denormalized as absolute EEF targets. Gripper closedness is clipped to [0, 1]. Each rot6d is replaced by the rotation it encodes (Gram-Schmidt), and the rows are returned as `{left,right}_ee_pose` (link6 in the env-relative world frame, xyz + wxyz) plus `{left,right}_ee_joint_state` (opening).
 - **Commit.** These *executed* rows, re-normalized with the same artifact, are what the next commit feeds the model. On an unchanged slot they equal the model output to fp32 rounding.
 
-**Departures from Sana's own deploy session** (`dev/rwm/deploy/causal/session.py`, `CausalPolicyChunkSession`). Its KV cache is append-only, it always reads the observation entry, and by default it renumbers positions by rank. From chunk 24 on (more than 768 steps), its read set and positions therefore differ from the training forward's. This adapter follows the training spans and keeps Sana's always-read-the-observation rule as `softmax_window: keep_obs`, at physical positions. Sana's chunk-0 forward also raises whenever `sliding_window_chunks` is set (its validator unsets it), whereas the port serves the cache-free chunk-0 window directly.
+**Observation sink (`softmax_window: sink`, 2026-10-06).** The read set is the observation plus the newest N - 1 chunks: N entries, the training budget.
+- **While the observation fits the window** (chunks 0 .. N - 1), the rule is the training rule, bit for bit.
+- **From chunk N on,** the observation stays in the read as an attention sink, at frame 0 of the read's clock, followed by the N - 1 chunks in slots 0 .. N - 2 and the window in slot N - 1. That is exactly the position ids of training's chunk N - 1.
+- This is Sana's deploy rank clock (`kv_position_mode="rank"` with `softmax_context_len = N - 2`), with which the sink agrees to fp64 round-off (see Validation).
+- **Training never used a sink.** In the causal trainer the observation evicts at chunk N. A sink is therefore a deployment choice whose value is an empirical question.
+
+**Departures from Sana's own deploy session** (`dev/rwm/deploy/causal/session.py`, `CausalPolicyChunkSession`). Its KV cache is append-only, it always reads the observation entry, and by default it renumbers positions by rank. From chunk 24 on (more than 768 steps), its read set and positions therefore differ from the training forward's. This adapter follows the training spans by default (`softmax_window: training`); Sana's always-read-the-observation rule is `softmax_window: sink`, on the same rank clock. Sana's chunk-0 forward also raises whenever `sliding_window_chunks` is set (its validator unsets it), whereas the port serves the cache-free chunk-0 window directly.
 
 **Train/deploy gaps that remain:**
 
@@ -194,7 +207,7 @@ The last two are shared with the bidirectional lane. Two RoboDojo tasks run past
 | commit (2 forwards, one per text stream) | ~0.17 s |
 | generation (10 x 2 forwards) | ~1.53 s |
 
-The first chunk instead pays a 0.1 s single-frame encode and the observation commit. The softmax memory is bf16 post-RoPE K/V of at most 24 entries x 193 tokens x 8 layers per text stream; the GDN state is per layer.
+The first chunk instead pays a 0.1 s single-frame encode and the observation commit. The softmax memory is bf16 pre-RoPE K/V of at most 24 entries x 193 tokens x 8 layers per text stream, plus one rotated copy per chunk; the GDN state is per layer.
 
 **Known limitations:**
 
@@ -214,10 +227,19 @@ DISABLE_XFORMERS=1 CUDA_VISIBLE_DEVICES="" SANA_CAUSAL_REPO=~/zekail/Sana python
 - **Deploy = training** (`tests/test_causal_live_parity.py`, against live Sana @ `c391260a4`; tiny architecture with identical random weights; CPU fp64; `flash_attn` bound to an fp64 reference varlen as Sana's own tests do).
   - The decisive check: Sana's two-stream training forward over [obs | clean 0..L-2 | noisy 0..L-1] equals, chunk by chunk, the streaming chain of this port (observation prefill, cache-free chunk-0 window, then for every chunk a cached denoising window followed by the commit of the clean chunk). It holds for softmax windows None / 1 / 2 / 3 (so the observation evicts) and video strides 1 / 4, to 1e-9 relative.
   - The chunk-0 window equals Sana's single-window forward.
-  - `keep_obs` equals `training` while the observation fits the window and differs once it is evicted (negative control).
+  - `sink` equals `training` while the observation fits the window and differs once it is evicted (negative control).
   - One GDN layer's scan matches Sana's `gdn_scan` / `_readout` to 1e-12.
   - The fp32-attention chain matches at fp32 tolerance.
   - The full session (10-step sampler, per-stream CFG, memory) matches Sana's `CausalPolicyChunkSession` under no CFG, video CFG and both-stream CFG over the chunks where both read the same entries.
+  - The `sink` rule matches Sana's `CausalPolicyChunkSession` with `softmax_context_len = N - 2` (observation + newest N - 1 chunks) on its rank clock, across the window boundary (6 chunks; N = 3 and 2; 1 and 2 latent frames per chunk), to 1e-9.
+    - Discrimination control: the same read set on the physical clock matches only until compaction starts, then deviates beyond the tolerance.
+    - Every rotary table built in a 6-chunk chain (N = 3) is checked: the softmax positions stay within chunk slot N (`training`) or N - 1 (`sink`), while the GDN window runs on the physical clock.
+    - While the observation fits the window, `sink` equals `training` bit for bit.
+- **Real-weight teacher-forcing parity** (`tools/teacher_forcing_parity.py`, 2026-10-06, s7646 checkpoint, RTX A6000).
+  - Setup: Sana's own causal class at the training commit `958be1587`, built and loaded as its validator does, runs ONE two-stream training forward over [obs | 29 clean | 30 noisy chunks]. Against it, the adapter's KV-cache chain: `commit_observation`, the cached denoising window of each noisy chunk, `commit_chunk` of each clean chunk.
+  - Inputs: the same Gemma caption, VAE latents of smooth synthetic frames, EEF-only states and actions, and per-chunk video / action noise levels 0.15 .. 0.85.
+  - **fp32 (TF32 off):** relative error at most 4.1e-6 (video velocity) and 3.8e-6 (action velocity) over all 30 chunks, including the 6 past the 24-chunk window (eviction, reads numbered from 0).
+  - **bf16:** 1.0-1.9e-2, the size of the training forward's own bf16-vs-fp32 noise (1.2-2.2e-2). The bf16 adapter is as close to the fp32 reference (1.2-2.3e-2) as bf16 training itself, with no growth along the episode.
 - **Normalization (D5)** (`tests/test_normalization_commit.py`, on the vanilla52k f33 artifact).
   - The EEF-only slots and schemes.
   - Executed commands commit as the model output when nothing was clipped.

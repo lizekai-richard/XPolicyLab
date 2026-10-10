@@ -44,6 +44,7 @@ def main() -> int:
     parser.add_argument("--chunks", type=int, default=4)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--window-override", type=int, default=None)
+    parser.add_argument("--softmax-window", default="training", help="training | sink")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -51,13 +52,14 @@ def main() -> int:
     runtime = CausalRuntime.from_paths(
         args.checkpoint_dir, text_encoder_path=args.text_encoder_path, vae_path=args.vae_path, device=args.device,
         steps=args.steps, cfg_scale=6.0, action_cfg_scale=1.0, allow_donor_checkpoint=args.allow_donor_checkpoint,
+        window_rule=args.softmax_window,
     )
     print(f"[first-light] load {time.perf_counter() - start:.1f}s report={json.dumps({k: v for k, v in runtime.load_report.items() if k != 'stripped'}, default=str)}")
     contract = runtime.contract
     if args.window_override is not None:
         contract = type(contract)(**{**contract.__dict__, "sliding_window_chunks": args.window_override})
         runtime.contract = contract
-    print(f"[first-light] contract {contract.describe()} | steps {runtime.frontend.steps} "
+    print(f"[first-light] contract {contract.describe()} | softmax_window {runtime.window_rule} | steps {runtime.frontend.steps} "
           f"cfg {runtime.frontend.video_cfg_scale}/{runtime.frontend.action_cfg_scale} "
           f"shift {runtime.frontend.flow_shift}/{runtime.frontend.action_flow_shift}")
     device = runtime.device
@@ -92,13 +94,15 @@ def main() -> int:
             else:
                 timings["encode"], timings["commit"] = t_enc, t_commit
             read = session.read_entry_ids() if c else []
+            origin = session.softmax_origin() if c else 0
             generator = torch.Generator(device=device).manual_seed(1000 + c)
             (action, video), timings["generate"] = timed(
                 session.generate_chunk, anchor_state=anchor, anchor_state_mask=mask.to(device), action_mask=action_mask,
                 generator=generator, gripper_bounds=normalized_gripper_bounds(normalization),
             )
             finite = bool(torch.isfinite(action).all()) and bool(torch.isfinite(video).all())
-            print(f"[first-light] chunk {c}: read={read} " + " ".join(f"{k}={v:.3f}s" for k, v in timings.items())
+            print(f"[first-light] chunk {c}: read={read}" + (f" origin={origin}" if origin else "") + " "
+                  + " ".join(f"{k}={v:.3f}s" for k, v in timings.items())
                   + f" finite={finite} |a|max={float(action.abs().max()):.3f} video_rms={float(video.float().pow(2).mean().sqrt()):.3f}")
             out.append((action, video))
             tick += contract.actions_per_chunk

@@ -209,7 +209,15 @@ class Twins:
 
         mirror, f_c, chunk = self.mirror, self.f_chunk, self.chunk
         memory = CausalMemory(mirror, self.window, rule)
-        caches = memory.layer_caches(commit=True)
+
+        def rope_of(slot):
+            return mirror.softmax_entry_rope(slot, FPS, VIEW[0], VIEW[1], torch.device("cpu"))
+
+        def soft(k):   # chunk k's window on the softmax clock of its read (numbered from 0 at the read's origin)
+            origin = memory.read_plan()[1]
+            return {"softmax_frame_offset": (k - origin) * f_c + 1, "softmax_step_offset": (k - origin) * chunk}
+
+        caches = memory.layer_caches(commit=True, rope_of=rope_of)
         mirror.forward_window(
             self.grid(self.obs), torch.zeros(1, 1, dtype=torch.float64), self.y, self.mask,
             model_fps=FPS, frame_offset=0, step_offset=0, robot=None, caches=caches,
@@ -230,15 +238,16 @@ class Twins:
                 out = mirror.forward_window(
                     self.grid(self.noisy[k]), t_video, self.y, self.mask, model_fps=FPS,
                     frame_offset=k * f_c + 1, step_offset=k * chunk,
-                    robot=self.robot(k, noisy=True), caches=memory.layer_caches(commit=False),
+                    robot=self.robot(k, noisy=True), caches=memory.layer_caches(commit=False, rope_of=rope_of), **soft(k),
                 )
                 outputs.append((out["x"], out["action_pred"]))
             if k < length - 1:
-                caches = memory.layer_caches(commit=True)
+                offsets = soft(k)
+                caches = memory.layer_caches(commit=True, rope_of=rope_of)
                 mirror.forward_window(
                     self.grid(self.clean[k]), torch.zeros(1, f_c, dtype=torch.float64), self.y, self.mask,
                     model_fps=FPS, frame_offset=k * f_c + 1, step_offset=k * chunk,
-                    robot=self.robot(k, noisy=False), caches=caches,
+                    robot=self.robot(k, noisy=False), caches=caches, **offsets,
                 )
                 memory.absorb(caches)
         return outputs
@@ -288,17 +297,9 @@ def test_the_observation_entry_matters_until_it_slides_out():
     memory = CausalMemory(twins.mirror, 2, "training")
     memory.entries = 4
     assert memory.read_entry_ids() == [2, 3]
-    keep = CausalMemory(twins.mirror, 3, "keep_obs")
-    keep.entries = 5
-    assert keep.read_entry_ids() == [0, 3, 4]
-
-
-def test_keep_obs_rule_matches_the_training_rule_while_the_observation_fits():
-    twins = Twins(window=3, chunks=3)
-    a = twins.streaming(3, "training")
-    b = twins.streaming(3, "keep_obs")
-    for (xa, aa), (xb, ab) in zip(a, b):
-        assert torch.equal(xa, xb) and torch.equal(aa, ab)
+    sink = CausalMemory(twins.mirror, 3, "sink")
+    sink.entries = 5
+    assert sink.read_plan() == ([0, 3, 4], 2)
 
 
 def test_layer_cache_gdn_commit_is_the_live_scan():
@@ -341,15 +342,15 @@ def test_fp32_attention_chain_stays_within_float32_round_off():
 
 
 def test_the_wrong_window_rule_is_caught():
-    """Negative control: keeping the observation entry past the window (Sana's deploy KV manager) does NOT reproduce
-    the training forward once the observation has slid out -- the parity test above can tell the rules apart."""
+    """Negative control: keeping the observation entry past the window (the sink) does NOT reproduce the training
+    forward once the observation has slid out -- the parity test above can tell the rules apart."""
 
     twins = Twins(window=2, chunks=5)
     training = twins.two_stream(5)
-    keep_obs = twins.streaming(5, "keep_obs")
+    sink = twins.streaming(5, "sink")
     for k in (0, 1):
-        torch.testing.assert_close(keep_obs[k][0], training[k][0], **CLOSE)
-    gaps = [_max_abs(keep_obs[k][0], training[k][0]) for k in (2, 3, 4)]
+        torch.testing.assert_close(sink[k][0], training[k][0], **CLOSE)
+    gaps = [_max_abs(sink[k][0], training[k][0]) for k in (2, 3, 4)]
     assert min(gaps) > 1e-6, gaps
 
 
@@ -399,3 +400,113 @@ def test_session_matches_the_live_deploy_session(video_cfg, action_cfg):
         live.commit_chunk(twins.clean[k], twins.a_clean[k], anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask)
         ours.commit_chunk(twins.grid(twins.clean[k]), twins.a_clean[k], anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask)
     assert ours.chunk_idx == live.chunk_idx == chunks
+
+
+def test_the_sink_rule_is_the_training_rule_while_the_observation_fits():
+    """sink == training (bitwise) while E_0 is inside the window; past it the sink differs from the training rule
+    (which no longer reads E_0)."""
+
+    twins = Twins(window=3, chunks=5)
+    training = twins.streaming(5, "training")
+    sink = twins.streaming(5, "sink")
+    for k in range(3):
+        assert torch.equal(sink[k][0], training[k][0]) and torch.equal(sink[k][1], training[k][1])
+    for k in (3, 4):
+        assert _max_abs(sink[k][0], training[k][0]) > 1e-6
+
+
+@pytest.mark.parametrize(
+    "window,stride,chunk", [(3, 4, 32), (2, 4, 32), (3, 1, 16)], ids=["N3-s4c32", "N2-s4c32", "N3-s1c16"]
+)
+def test_the_sink_rule_matches_the_live_deploy_session_at_rank_positions(window, stride, chunk):
+    """The sink == Sana's CausalPolicyChunkSession reading the observation + the newest N - 1 chunks
+    (``softmax_context_len = N - 2``: E_0 and the most recent chunk are always read) on its compressed RANK clock
+    (``kv_position_mode="rank"``: E_0 at frame 0, the read chunks contiguous after it, the window right after them).
+    The adapter numbers every softmax read from 0 at its origin -- the same clock -- so the outputs agree to fp64
+    round-off across the window boundary."""
+
+    from dev.rwm.deploy.causal.session import CausalPolicyChunkSession
+
+    from sana_wam_causal.session import Caption, CausalPolicySession
+
+    chunks, steps = 6, 3
+    twins = Twins(stride=stride, chunk=chunk, chunks=chunks)
+    twins.live.sliding_window_chunks = None   # the live session windows through its KV manager (softmax_context_len)
+    y_null = torch.randn(1, 1, 1, TEXT_LEN, TEXT_CH, dtype=torch.float64, generator=torch.Generator().manual_seed(5))
+    live = CausalPolicyChunkSession(
+        twins.live, actions_per_chunk=twins.chunk, caption_embeds=twins.y, caption_mask=twins.mask, steps=steps,
+        flow_shift=5.0, data_info=dict(twins.info()), unconditional_caption_embeds=y_null,
+        unconditional_caption_mask=twins.mask, cfg_scale=3.0, action_flow_shift=1.0, action_cfg_scale=1.0,
+        kv_max_length=chunks + 2, softmax_context_len=window - 2, kv_position_mode="rank",
+    )
+    def session(rule):
+        return CausalPolicySession(
+            twins.mirror, caption=Caption(twins.y, twins.mask), unconditional_caption=Caption(y_null, twins.mask),
+            steps=steps, flow_shift=5.0, action_flow_shift=1.0, video_cfg_scale=3.0, action_cfg_scale=1.0,
+            model_fps=FPS, window=window, window_rule=rule, autocast_dtype=None,
+        )
+
+    ours, physical = session("sink"), session("sink")
+    for _caption, memory in physical.streams:   # control: the same read set on the PHYSICAL clock (origin forced to 0)
+        memory.read_plan = (lambda m: (lambda: (m.read_entry_ids(), 0)))(memory)
+    live.commit_observation(twins.obs)
+    ours.commit_observation(twins.grid(twins.obs))
+    physical.commit_observation(twins.grid(twins.obs))
+    gaps = []
+    mask = torch.ones(1, twins.chunk, 80, dtype=torch.bool)
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    g = torch.Generator().manual_seed(23)
+    origins = []
+    for k in range(chunks):
+        origins.append(ours.softmax_origin())
+        video_noise = torch.randn(1, C_LAT, twins.f_chunk, 1, twins.width, generator=g, dtype=torch.float64)
+        action_noise = torch.randn(1, twins.chunk, 80, generator=g, dtype=torch.float64)
+        a_live, v_live = live.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask,
+            video_noise=video_noise, action_noise=action_noise,
+        )
+        a_ours, v_ours = ours.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask,
+            video_noise=twins.grid(video_noise), action_noise=action_noise,
+        )
+        torch.testing.assert_close(a_ours, a_live, **CLOSE, msg=lambda m: f"chunk {k} action: {m}")
+        torch.testing.assert_close(v_ours, twins.grid(v_live), **CLOSE, msg=lambda m: f"chunk {k} video: {m}")
+        _a_phys, v_phys = physical.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask,
+            video_noise=twins.grid(video_noise), action_noise=action_noise,
+        )
+        gaps.append(_max_abs(v_phys, twins.grid(v_live)))
+        live.commit_chunk(twins.clean[k], twins.a_clean[k], anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask)
+        for s in (ours, physical):
+            s.commit_chunk(twins.grid(twins.clean[k]), twins.a_clean[k], anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask)
+    # discrimination: the physical clock matches the rank clock only while nothing is compacted
+    assert max(gaps[:window]) < 1e-12 and min(gaps[window:]) > 1e-9, gaps
+    # chunk k reads E_0 + chunks 0..k-1 while k + 1 <= N, then E_0 + chunks k - N + 1 .. k - 1 (origin k - N + 1)
+    assert origins == [0 if k + 1 <= window else k - window + 1 for k in range(chunks)]
+
+
+@pytest.mark.parametrize("rule", ["training", "sink"])
+def test_the_softmax_clock_starts_at_zero_and_the_gdn_clock_is_physical(rule):
+    """Every rotary table the mirror builds during a 6-chunk chain with N = 3: the softmax layers' positions stay
+    inside a training window (at most chunk slot N for ``training``, N - 1 for ``sink``), the GDN layers' window
+    runs on the physical clock of the episode."""
+
+    window, length = 3, 6
+    twins = Twins(window=window, chunks=length)
+    mirror, f_c, chunk = twins.mirror, twins.f_chunk, twins.chunk
+    calls = []
+    original = mirror.window_rope
+
+    def recording(rope, fps, frames, height, width, robot_rows, frame_offset, step_offset, device):
+        calls.append((rope is mirror.rope_softmax, frames, robot_rows, frame_offset, step_offset))
+        return original(rope, fps, frames, height, width, robot_rows, frame_offset, step_offset, device)
+
+    mirror.window_rope = recording
+    twins.streaming(length, rule)
+    soft = [c for c in calls if c[0]]
+    gdn = [c for c in calls if not c[0]]
+    top_slot = window if rule == "training" else window - 1
+    assert max(c[3] + c[1] - 1 for c in soft) == (top_slot + 1) * f_c          # the last frame of slot top_slot
+    assert max(c[4] for c in soft if c[2]) == top_slot * chunk                  # its state row
+    assert max(c[3] for c in gdn) == (length - 1) * f_c + 1                     # GDN: chunk length - 1, physical
+    assert max(c[4] for c in gdn) == (length - 1) * chunk

@@ -11,9 +11,11 @@ Ports of Sana rwm/zekai-merge (c391260a4):
   numerator path only).
 * ``CausalSoftmaxAttention`` <- ``layers/chunk_causal_softmax.py`` ``CachedChunkCausalPolicySoftmaxAttention``: q/k
   RMSNorm, fp64 RoPE cast back to the activation dtype, then attention over ``[context entries | this window]``. The
-  context entries are post-RoPE keys rotated at their physical positions when they were committed, which is what
-  the two-stream training forward reads (its prefix keys are rotated once over the whole canvas); the training
-  spans, not Sana's deploy KV manager, are the reference (the manager always reads the observation entry).
+  two-stream training forward's spans are the reference for the read SET (which entries a forward reads). A commit
+  keeps its keys BEFORE the rotary embedding; the session rotates
+  the entries a read takes on the fly, on that read's own clock numbered from 0 (Sana's deploy KV manager keeps
+  pre-RoPE keys and rotates at read time the same way), so the softmax layers only ever see the positions of a
+  training window. The GDN state, which never slides, keeps keys rotated at their physical positions.
 * ``CausalPolicyBlock`` <- ``layers/chunk_causal_block.py`` ``ChunkWiseCausalPolicyBlock``: the bidirectional
   block's AdaLN / cross-attention / SwiGLU with the two shells above.
 
@@ -57,8 +59,9 @@ class LayerCache:
     commit: bool = False
     gdn_state: Optional[tuple[torch.Tensor, torch.Tensor]] = None       # (S [B,H,D,D], z [B,H,D]); None = zeros
     gdn_next: Optional[tuple[torch.Tensor, torch.Tensor]] = None        # written on commit
-    softmax_context: Optional[tuple[torch.Tensor, torch.Tensor]] = None  # (k, v) [B,T,H,D] post-RoPE, oldest first
-    softmax_new: Optional[tuple[torch.Tensor, torch.Tensor]] = None      # this window's (k, v), written on commit
+    # (k, v) [B,T,H,D] of the entries this forward reads, oldest first, k already rotated on THIS read's clock
+    softmax_context: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    softmax_new: Optional[tuple[torch.Tensor, torch.Tensor]] = None      # this window's (PRE-RoPE k, v), written on commit
 
 
 def rope_bhnd_complex64(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -193,11 +196,12 @@ class CausalSoftmaxAttention(GatedSoftmaxAttention):
         q = self.q_norm(q).reshape(batch, tokens, self.heads, self.dim)
         k = self.k_norm(k).reshape(batch, tokens, self.heads, self.dim)
         v = v.reshape(batch, tokens, self.heads, self.dim)
+        if cache is not None and cache.commit:
+            # kept BEFORE the rotary embedding: every later read rotates it on the fly at that read's own positions
+            cache.softmax_new = (k.detach(), v.detach())
         if rotary_emb is not None:
             q = apply_rotary_emb_fp64_softmax(q, rotary_emb)
             k = apply_rotary_emb_fp64_softmax(k, rotary_emb)
-        if cache is not None and cache.commit:
-            cache.softmax_new = (k.detach(), v.detach())
         if cache is not None and cache.softmax_context is not None:
             context_k, context_v = cache.softmax_context
             k = torch.cat((context_k.to(k.dtype), k), dim=1)

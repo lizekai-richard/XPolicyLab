@@ -177,6 +177,21 @@ class CausalPolicyModel(PolicyModel):
             ids = torch.cat((ids, robot.expand(batch, -1, -1)), dim=1)
         return rope.from_position_ids(ids)
 
+    def softmax_entry_rope(self, slot: Optional[int], model_fps: Any, height: int, width: int, device) -> torch.Tensor:
+        """Softmax rotary table of one committed entry read at chunk slot ``slot`` of a read numbered from 0.
+
+        ``None`` = the observation entry: one video-only latent frame at frame 0. Slot j = a chunk entry in the token
+        order of a chunk window: its ``f_c`` target frames from latent frame ``j * f_c + 1``, then its state row (step
+        ``j * C``) and its C action rows -- where training's chunk j sits in a window that starts at its observation."""
+
+        fps = PhysicalTimeWanRotaryPosEmbed._normalize_fps(model_fps, 1, device)
+        if slot is None:
+            return self.window_rope(self.rope_softmax, fps, 1, height, width, 0, 0, 0, device)
+        f_c, chunk = int(self.latent_frames_per_chunk), int(self.chunk_actions)
+        return self.window_rope(
+            self.rope_softmax, fps, f_c, height, width, 1 + chunk, int(slot) * f_c + 1, int(slot) * chunk, device
+        )
+
     # -- the trunk -----------------------------------------------------------------------------------------------------
 
     @torch.no_grad()
@@ -240,6 +255,8 @@ class CausalPolicyModel(PolicyModel):
         step_offset: int,
         robot: Optional[Mapping[str, torch.Tensor]] = None,
         caches: Optional[Sequence[LayerCache]] = None,
+        softmax_frame_offset: Optional[int] = None,
+        softmax_step_offset: Optional[int] = None,
     ) -> dict[str, torch.Tensor]:
         """Evaluate one single-segment window.
 
@@ -248,7 +265,11 @@ class CausalPolicyModel(PolicyModel):
             video_timesteps: ``[B, F]`` raw per-frame timesteps (0 for clean frames).
             y / mask: ``[B, 1, 1, L, C_text]`` caption embeddings and ``[B, 1, L]`` key mask (G = 1).
             model_fps: the batch fps (25 for RoboDojo).
-            frame_offset / step_offset: physical index of the window's first latent frame and first robot step.
+            frame_offset / step_offset: physical index of the window's first latent frame and first robot step (the
+                GDN layers' clock: their state keeps keys rotated at the physical positions of the whole episode).
+            softmax_frame_offset / softmax_step_offset: the same window on the softmax layers' clock, numbered from 0
+                at the read's origin (the session's ``read_plan``; the cached entries are rotated on that clock too);
+                None = the physical offsets (nothing slid out of the window yet).
             robot: None for the video-only observation prefill, else ``state80`` / ``state_mask80`` ``[B, 80]``,
                 ``action80`` / ``action_mask80`` ``[B, C, 80]`` and ``action_timesteps`` ``[B, C]`` (raw).
             caches: None for the cache-free chunk-0 window, else one ``LayerCache`` per block.
@@ -318,7 +339,10 @@ class CausalPolicyModel(PolicyModel):
             self.rope_linear, fps, self.f, self.h, self.w, robot_rows, frame_offset, step_offset, device
         )
         rope_softmax = self.window_rope(
-            self.rope_softmax, fps, self.f, self.h, self.w, robot_rows, frame_offset, step_offset, device
+            self.rope_softmax, fps, self.f, self.h, self.w, robot_rows,
+            frame_offset if softmax_frame_offset is None else softmax_frame_offset,
+            step_offset if softmax_step_offset is None else softmax_step_offset,
+            device,
         )
         time_embedding = self.t_embedder(token_timestep.flatten()).unflatten(0, token_timestep.shape)
         modulation = self.t_block(time_embedding)
