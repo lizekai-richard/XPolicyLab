@@ -1,20 +1,23 @@
-"""Inference-only mirror of the chunk-causal policy (Sana ``sana_qwennext_policy_causal.py`` at c391260a4).
+"""Inference-only mirror of the chunk-causal policy (Sana ``sana_qwennext_policy_causal.py``, per-chunk observation
+protocol: ``61aad2d58`` / ``3a6b2bf07``, checked against ``9ee9c2d9d``).
 
 The model is the bidirectional policy trunk (``sana_wam_min.policy_model.PolicyModel``: embedders, AdaLN table,
 Block AttnRes V2, text cross-attention, final layer, action head) with every block rebuilt around the chunk-causal
 shells of ``layers.py``. It evaluates ONE deploy window per call, always a single chunk segment, which is every form
 the streaming session needs (Sana ``CausalPolicyChunkSession`` + ``forward_chunk``):
 
-* the observation prefill: the episode's first frame as a video-only clean entry, t = 0 (``commit_observation``);
-* the chunk-0 window under ``obs_in_first_chunk``: [observation (t = 0) | chunk-0 targets] + [state | C actions], no
-  cache -- the bidirectional single-chunk window with the causal GDN formula;
-* the cached chunk window: [chunk-c targets] + [state | C actions] reading the session memory, either a denoising
-  step (reads only) or the commit of the executed chunk at t = 0 (reads, then writes its GDN state and softmax K/V).
+* the denoising window of chunk c: [observation_c (t = 0) | chunk-c targets] + [state | C actions] -- the two-stream
+  noisy chunk c, which reads the session memory (chunk 0 reads nothing: the bidirectional single-chunk window with the
+  causal GDN formula);
+* the commit of the executed chunk c at t = 0: [chunk-c targets] + [state | C actions] under ``memory_content``
+  video_and_action, the targets alone (no robot rows) under video_only -- the two-stream clean chunk c, which reads
+  like the generation of chunk c, then writes its GDN state and softmax K/V.
 
 RoPE (``rope: aligned``): latent frame phi sits at ``base_fps * phi / (fps / s)`` (s = the video frame stride) and
-robot step n at ``base_fps * n / (8 * fps)``; chunk c's targets are latent frame ``c * f_chunk + 1`` onwards, its state
-row step ``c * C`` and its actions steps ``c * C + 1 .. c * C + C`` (the chunk-0 window starts both clocks at 0). The
-canvas keeps the plain (t, y, x) grid; the robot rows carry spatial ids 0. One text group (G = 1) spans the window.
+robot step n at ``base_fps * n / (8 * fps)``; chunk c's observation is latent frame ``c * f_chunk`` (the instant of
+chunk c - 1's last target), its targets ``c * f_chunk + 1`` onwards, its state row step ``c * C`` and its actions steps
+``c * C + 1 .. c * C + C`` (Sana ``_physical_frame_ids``, ``forward_chunk``). The canvas keeps the plain (t, y, x)
+grid; the robot rows carry spatial ids 0. One text group (G = 1) spans the window.
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ from sana_wam_min.policy_model.geometry import strip_to_view_tokens, view_to_str
 from sana_wam_min.policy_model.model import PolicyModel  # noqa: E402
 from sana_wam_min.policy_model.rope import PhysicalTimeWanRotaryPosEmbed, WanRotaryPosEmbed  # noqa: E402
 
-from .contract import ACTION_TEMPORAL_COMPRESSION, CausalContract  # noqa: E402
+from .contract import ACTION_TEMPORAL_COMPRESSION, MEMORY_VIDEO_AND_ACTION, CausalContract  # noqa: E402
 from .layers import GDN_KIND, CausalPolicyBlock, LayerCache  # noqa: E402
 
 GDN_RECURRENCE_KEYS = ("gate_proj.weight", "gate_proj.bias", "A_log", "dt_bias", "recall_gate")
@@ -90,6 +93,7 @@ class CausalPolicyModel(PolicyModel):
         self.chunk_actions = int(contract.actions_per_chunk)
         self.video_frame_stride = int(contract.video_frame_stride)
         self.latent_frames_per_chunk = int(contract.latent_frames_per_chunk)
+        self.memory_content = str(contract.memory_content)
 
         self.x_embedder = PatchEmbedMS3D(config.patch_size, config.in_channels, config.hidden_size)
         self.t_embedder = TimestepEmbedder(config.hidden_size)
@@ -177,19 +181,18 @@ class CausalPolicyModel(PolicyModel):
             ids = torch.cat((ids, robot.expand(batch, -1, -1)), dim=1)
         return rope.from_position_ids(ids)
 
-    def softmax_entry_rope(self, slot: Optional[int], model_fps: Any, height: int, width: int, device) -> torch.Tensor:
-        """Softmax rotary table of one committed entry read at chunk slot ``slot`` of a read numbered from 0.
+    def softmax_entry_rope(self, slot: int, model_fps: Any, height: int, width: int, device) -> torch.Tensor:
+        """Softmax rotary table of the committed chunk read at chunk slot ``slot`` of a read numbered from 0.
 
-        ``None`` = the observation entry: one video-only latent frame at frame 0. Slot j = a chunk entry in the token
-        order of a chunk window: its ``f_c`` target frames from latent frame ``j * f_c + 1``, then its state row (step
-        ``j * C``) and its C action rows -- where training's chunk j sits in a window that starts at its observation."""
+        A committed chunk in its window's token order: its ``f_c`` target frames from latent frame ``slot * f_c + 1``,
+        then, under ``memory_content`` video_and_action, its state row (step ``slot * C``) and its C action rows --
+        where training's clean chunk ``slot`` sits in a window that starts at its first chunk."""
 
         fps = PhysicalTimeWanRotaryPosEmbed._normalize_fps(model_fps, 1, device)
-        if slot is None:
-            return self.window_rope(self.rope_softmax, fps, 1, height, width, 0, 0, 0, device)
         f_c, chunk = int(self.latent_frames_per_chunk), int(self.chunk_actions)
+        robot_rows = 1 + chunk if self.memory_content == MEMORY_VIDEO_AND_ACTION else 0
         return self.window_rope(
-            self.rope_softmax, fps, f_c, height, width, 1 + chunk, int(slot) * f_c + 1, int(slot) * chunk, device
+            self.rope_softmax, fps, f_c, height, width, robot_rows, int(slot) * f_c + 1, int(slot) * chunk, device
         )
 
     # -- the trunk -----------------------------------------------------------------------------------------------------
@@ -258,7 +261,8 @@ class CausalPolicyModel(PolicyModel):
         softmax_frame_offset: Optional[int] = None,
         softmax_step_offset: Optional[int] = None,
     ) -> dict[str, torch.Tensor]:
-        """Evaluate one single-segment window.
+        """Evaluate one single-segment window: a chunk's denoising window [observation | targets] + robot rows, or
+        the commit of an executed chunk [targets] (+ robot rows under ``memory_content`` video_and_action).
 
         Args:
             latent: ``[B, C, F, H, W]`` canvas latent frames of the window (observation and / or chunk targets).
@@ -266,16 +270,19 @@ class CausalPolicyModel(PolicyModel):
             y / mask: ``[B, 1, 1, L, C_text]`` caption embeddings and ``[B, 1, L]`` key mask (G = 1).
             model_fps: the batch fps (25 for RoboDojo).
             frame_offset / step_offset: physical index of the window's first latent frame and first robot step (the
-                GDN layers' clock: their state keeps keys rotated at the physical positions of the whole episode).
+                GDN layers' clock: their state keeps keys rotated at the physical positions of the whole episode):
+                ``c * f_c`` / ``c * C`` for chunk c's denoising window, ``c * f_c + 1`` / ``c * C`` for its commit.
             softmax_frame_offset / softmax_step_offset: the same window on the softmax layers' clock, numbered from 0
                 at the read's origin (the session's ``read_plan``; the cached entries are rotated on that clock too);
                 None = the physical offsets (nothing slid out of the window yet).
-            robot: None for the video-only observation prefill, else ``state80`` / ``state_mask80`` ``[B, 80]``,
-                ``action80`` / ``action_mask80`` ``[B, C, 80]`` and ``action_timesteps`` ``[B, C]`` (raw).
-            caches: None for the cache-free chunk-0 window, else one ``LayerCache`` per block.
+            robot: None for a robotless window (the commit under ``memory_content`` video_only), else ``state80`` /
+                ``state_mask80`` ``[B, 80]``, ``action80`` / ``action_mask80`` ``[B, C, 80]`` and ``action_timesteps``
+                ``[B, C]`` (raw).
+            caches: None for a window that reads nothing (chunk 0), else one ``LayerCache`` per block.
 
         Returns:
-            ``{}`` for a prefill; else ``{"x": [B, C, F, H, W] velocity, "action_pred": [B, C, 80] velocity}``.
+            ``{}`` for a robotless window (nothing reads its prediction); else ``{"x": [B, C, F, H, W] velocity,
+            "action_pred": [B, C, 80] velocity}``.
         """
 
         if self.training:

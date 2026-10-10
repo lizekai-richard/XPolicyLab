@@ -5,7 +5,7 @@ causal checkpoint's *bidirectional view* (``contract.bidirectional_view``): the 
 VAE encode, the G = 1 canvas prompt rows and their Gemma encoding (conditional + unconditional), the normalization
 artifact resolved and selected exactly as for the parent SFT checkpoint (f33 file name, yaml sha pin, absolute-EEF
 statistics), and the action denormalization. This module adds what only the causal deploy needs: the causal model,
-the 9-frame encode of an executed chunk and the per-episode ``CausalPolicySession``.
+the per-chunk observation encode, the 9-frame encode of an executed chunk and the per-episode ``CausalPolicySession``.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from sana_wam_min.vae import encode_video, load_vae  # noqa: E402
 from .checkpoint import load_causal_weights  # noqa: E402
 from .contract import CausalContract, bidirectional_view, resolve_causal_contract  # noqa: E402
 from .model import CausalPolicyModel, build_causal_policy  # noqa: E402
-from .session import WINDOW_RULES, Caption, CausalPolicySession  # noqa: E402
+from .session import Caption, CausalPolicySession  # noqa: E402
 
 
 @dataclass
@@ -51,7 +51,6 @@ class CausalRuntime:
     frontend: PolicyInferenceSession
     contract: CausalContract
     train_config: dict
-    window_rule: str = "training"
     load_report: dict = field(default_factory=dict)
 
     # -- loading ------------------------------------------------------------------------------------------------------
@@ -74,13 +73,10 @@ class CausalRuntime:
         action_flow_shift: Optional[float] = None,
         view_resize: Optional[str] = None,
         allow_donor_checkpoint: bool = False,
-        window_rule: str = "training",
     ) -> "CausalRuntime":
         """Load in the validated order: yaml -> contract (refusals before any weight) -> normalization -> bf16 causal
         model + weights -> VAE -> Gemma -> the shared front-end."""
 
-        if window_rule not in WINDOW_RULES:
-            raise ValueError(f"softmax_window must be one of {WINDOW_RULES}, got {window_rule!r}")
         device = torch.device(device)
         train_cfg = load_train_config(str(find_train_config(checkpoint_dir)))
         contract = resolve_causal_contract(train_cfg)
@@ -122,7 +118,6 @@ class CausalRuntime:
             frontend=frontend,
             contract=contract,
             train_config=train_cfg,
-            window_rule=window_rule,
             load_report=load_report,
         )
         runtime._check_front_end()
@@ -159,7 +154,6 @@ class CausalRuntime:
             action_cfg_scale=frontend.action_cfg_scale,
             model_fps=self.contract.model_fps,
             window=self.contract.sliding_window_chunks,
-            window_rule=self.window_rule,
         )
 
     def _canvas(self, frames_rgb: Sequence[np.ndarray]) -> torch.Tensor:
@@ -185,14 +179,17 @@ class CausalRuntime:
         return latent
 
     def encode_observation(self, frames_rgb: Sequence[np.ndarray]) -> torch.Tensor:
-        """The episode's first frame: ``[1, C_lat, 1, H, W]`` (the single-frame encode, latent 0 of a training window)."""
+        """A chunk's observation: its start frame encoded alone, ``[1, C_lat, 1, H, W]`` -- by the causal VAE the anchor
+        latent of the chunk's own C+1-row encode, which is the observation every noisy chunk carries in training
+        (store member ``w{s + cC}``, latent 0)."""
 
         return self.encode_frames([self._canvas(frames_rgb)])
 
-    def encode_executed_chunk(self, frames_per_view: Sequence[Sequence[np.ndarray]]) -> torch.Tensor:
-        """The executed chunk's target latents: the 1 + C/s observed frames (ticks 0, s, .., C of the chunk) encoded as
-        one clip, the anchor latent dropped -> ``[1, C_lat, f_c, H, W]`` (training: store member ``w{s + cC}``,
-        latent 1..)."""
+    def encode_executed_chunk(self, frames_per_view: Sequence[Sequence[np.ndarray]]) -> tuple[torch.Tensor, torch.Tensor]:
+        """The executed chunk's 1 + C/s observed frames (ticks 0, s, .., C of the chunk) encoded as one clip ->
+        (target latents ``[1, C_lat, f_c, H, W]``, the committed memory, training's ``w{s + cC}`` latents 1..; anchor
+        latent ``[1, C_lat, 1, H, W]``, which equals the chunk's single-frame observation encode under the causal
+        VAE -- the adapter logs their gap)."""
 
         expected = 1 + self.contract.actions_per_chunk // self.contract.video_frame_stride
         if len(frames_per_view) != expected:
@@ -203,7 +200,7 @@ class CausalRuntime:
             raise ValueError(
                 f"the chunk clip encoded to {latent.shape[2]} latent frames; expected 1 + {self.contract.latent_frames_per_chunk}"
             )
-        return targets
+        return targets, latent[:, :, :1]
 
 
 def timed(fn, *args, **kwargs):

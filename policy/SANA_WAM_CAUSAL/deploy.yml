@@ -11,13 +11,16 @@ action_type: ee
 gpu_id: null
 eval_batch: false
 
-# One get_action = the commit of the executed chunk (2 forwards with CFG) + sampling_steps x 2 forwards; the first call
-# of an episode also encodes the prompt. The RoboDojo client times every RPC out after 120 s whatever this says.
+# One get_action = the commit of the executed chunk (2 forwards with CFG) + the chunk's observation encode +
+# sampling_steps x 2 forwards; the first call of an episode encodes the prompt instead of committing. The RoboDojo
+# client times every RPC out after 120 s whatever this says.
 request_timeout_s: 600.0
 
 # --- SANA_WAM_CAUSAL keys (see README "Configuration") ---
-# HF-style checkpoint dir of a CAUSAL run: config.yaml (model.model ...MultiViewCausal_5B_P1_D36) +
-# model/pytorch_model_fsdp.bin [+ normalization/*.json]. null -> XPolicyLab resolution of ckpt_name.
+# HF-style checkpoint dir of a CAUSAL run of the per-chunk observation protocol (Sana 61aad2d58 on, e.g. the pantheon14k
+# m48n24 runs): config.yaml (model.model ...MultiViewCausal_5B_P1_D36; model.extra.chunk_causal_policy.memory_content
+# video_and_action | video_only, absent = video_and_action; a config naming obs_in_first_chunk is a retired layout and
+# is refused) + model/pytorch_model_fsdp.bin [+ normalization/*.json]. null -> XPolicyLab resolution of ckpt_name.
 checkpoint_dir: null
 # An SFT (bidirectional) checkpoint has no GDN recurrence parameters; true serves it as the causal policy's step-0 model
 # (recurrence initialized as the causal trainer does on its first load). Pipeline checks only, never an evaluation.
@@ -35,19 +38,15 @@ video_cfg_scale: null
 action_cfg_scale: 1.0
 flow_shift: null
 action_flow_shift: null
-# Softmax read set of the cached windows (every read is rotated on the fly on a clock numbered from 0 at its oldest
-# chunk read: the softmax layers only see the position ids of a training window; the GDN state stays physical):
-#   training  the newest sliding_window_chunks entries of [observation, chunk 0, chunk 1, ..]; the observation evicts
-#             like any other entry (the two-stream training forward's rule)
-#   sink      the observation as an attention sink: the observation + the newest sliding_window_chunks - 1 chunks
-#             (Sana's deploy rank clock); equals training while the observation fits the window
-softmax_window: training
-# Memory of the episode: full = the deployment (every executed chunk is committed); none = the memory ABLATION, every
-# chunk a cold start whose memory holds only its own start frame (generated exactly like chunk 0: the cache-free
-# [observation | targets] window, in distribution for every training window's first chunk); nothing is committed,
-# the executed chunk is still encoded for world_model_rel_rmse
+# Every chunk is denoised as [its observation | its targets] + [state | actions] reading the memory: the GDN state of
+# every committed chunk and, in the softmax layers, the newest sliding_window_chunks committed chunks, each read rotated
+# on a clock numbered from 0 at its oldest chunk (training's positions; Sana's deploy rank clock).
+# Memory of the episode: full = the deployment (every executed chunk is committed); none = the memory ABLATION, nothing
+# is committed and every chunk reads an empty memory (generated exactly like chunk 0, the [observation | targets]
+# window every training window opens with); the executed chunk is still encoded for world_model_rel_rmse
 memory_mode: full
-# What enters memory as the executed chunk's actions: executed = the EE commands actually sent (gripper closedness
+# What enters memory as the executed chunk's actions (memory_content video_and_action only; a video_only memory keeps
+# the target latents alone and refuses any other value): executed = the EE commands actually sent (gripper closedness
 # clipped to [0, 1], rot6d through the rotation it encodes) re-normalized; predicted = the raw model output;
 # reached = the poses the arms actually REACHED (URDF FK of the joints measured after each action, the observed
 # gripper), so the last row equals the next chunk's state slot as in training (dataset state = previous command).
@@ -55,7 +54,8 @@ memory_mode: full
 commit_actions: executed
 # Refuse an episode longer than this many chunks (null = no limit; GDN extrapolates past the 48-chunk training windows)
 max_chunks_per_episode: null
-# Per-chunk log of the relative RMSE between the predicted and the observed target latent of the committed chunk
+# Per-chunk log of the relative RMSE between the predicted and the observed target latent of the executed chunk (and,
+# whenever the chunk is encoded, obs_anchor_gap: its single-frame observation vs the anchor latent of its clip encode)
 log_world_model_error: true
 # null = stretch (the only SFT view resize of the causal line's donors); a contradicting value is refused
 view_resize: null

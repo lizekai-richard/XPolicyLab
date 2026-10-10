@@ -593,10 +593,10 @@
       "filter_sidecar_names": [],
       "filter_sidecar_receipts_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
       "items": 3500,
-      "path": "/scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/data_cache_robodojo_absolute_aligned_f33_lezhao_sft_20260923T050329Z/RoboDojo-ARX-X5-4_model_fps_25.0-25.0_f33_videoaction_cached_dataset.json",
+      "path": "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/data_cache_rwm_zekail_absolute_aligned/RoboDojo-ARX-X5-4_model_fps_25.0-25.0_f33_videoaction_cached_dataset.json",
       "sha256": "be10a21d753999432448ea664d8fc6a20506746a6c81b786550bf25ac05d0289",
-      "summary_path": "/scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/data_cache_robodojo_absolute_aligned_f33_lezhao_sft_20260923T050329Z/RoboDojo-ARX-X5-4_model_fps_25.0-25.0_f33_videoaction_cache_summary.json",
-      "summary_sha256": "90512dee0f839fd2deedacd2ad34cad498f959582f7736ed7e351d1fad84fe4f"
+      "summary_path": "/lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/data_cache_rwm_zekail_absolute_aligned/RoboDojo-ARX-X5-4_model_fps_25.0-25.0_f33_videoaction_cache_summary.json",
+      "summary_sha256": "bcde65ea45f63eee977fd8dbfb6e730e7bdbc1274929015d63ccb1eae32120fd"
     }
   ],
   "joint_target_mode": "absolute",
@@ -789,7 +789,7 @@
           -1.0,
           -1.0,
           -1.0,
-          0.0,
+          -0.0,
           -1.0,
           -1.0,
           -1.0,
@@ -818,7 +818,7 @@
           -1.0,
           -1.0,
           -1.0,
-          0.0,
+          -0.0,
           -1.0,
           -1.0,
           -1.0,
@@ -1189,7 +1189,7 @@
         "disk_shards_written": 3500,
         "source_episodes_loaded": 3500,
         "windows_collected": 3500,
-        "worker_processes": 16
+        "worker_processes": 8
       },
       "model_active_slots_observed": [
         0,
@@ -1408,7 +1408,7 @@
           -1.0,
           -1.0,
           -1.0,
-          0.0,
+          -0.0,
           -1.0,
           -1.0,
           -1.0,
@@ -1437,7 +1437,7 @@
           -1.0,
           -1.0,
           -1.0,
-          0.0,
+          -0.0,
           -1.0,
           -1.0,
           -1.0,

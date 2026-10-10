@@ -1,7 +1,8 @@
 """The XPolicyLab adapter's chunk cycle against a fake runtime (CPU, no weights): the RoboDojo call order of
 ``policy/<POLICY>/deploy.py`` (update_obs -> get_action, then update_obs after every executed action but the last,
 whose observation arrives right before the next get_action), tick counting, the frames a commit encodes, the order
-commit -> generate, the double reset of every RoboDojo episode, and the refusals."""
+commit -> observation encode -> generate (every chunk generated from its own start frame), the double reset of every
+RoboDojo episode, and the refusals."""
 
 from __future__ import annotations
 
@@ -26,20 +27,24 @@ CAMERAS = ("cam_head", "cam_left_wrist", "cam_right_wrist")
 
 
 class FakeSession:
+    WINDOW = 2
+
     def __init__(self, log, instruction):
         self.log, self.instruction, self.chunk_idx = log, instruction, 0
 
-    def commit_observation(self, latent):
-        self.log.append(("commit_observation", float(latent.sum())))
-
-    def read_entry_ids(self):
-        return list(range(self.chunk_idx + 1))
+    def read_chunk_ids(self):
+        return list(range(max(0, self.chunk_idx - self.WINDOW), self.chunk_idx))
 
     def softmax_origin(self):
-        return 0
+        ids = self.read_chunk_ids()
+        return ids[0] if ids else 0
 
-    def generate_chunk(self, *, anchor_state, anchor_state_mask, action_mask, generator, gripper_bounds):
-        self.log.append(("generate", self.chunk_idx, anchor_state.clone(), action_mask.clone()))
+    def reset_memory(self):
+        self.log.append(("reset_memory",))
+        self.chunk_idx = 0
+
+    def generate_chunk(self, observation_latent, *, anchor_state, anchor_state_mask, action_mask, generator, gripper_bounds):
+        self.log.append(("generate", self.chunk_idx, anchor_state.clone(), action_mask.clone(), float(observation_latent.flatten()[0])))
         action = torch.zeros(1, C, 80)
         action[..., 10] = 1.0   # rot6d column 1 = x axis
         action[..., 14] = 1.0   # column 2 = y axis
@@ -54,6 +59,8 @@ class FakeSession:
 
 
 class FakeRuntime:
+    """Latents carry the tick of the frame they encode (the frames are filled with tick % 256)."""
+
     def __init__(self, log):
         self.log = log
         self.device = torch.device("cpu")
@@ -64,12 +71,15 @@ class FakeRuntime:
         return FakeSession(self.log, instruction)
 
     def encode_observation(self, frames):
-        return torch.full((1, 4, 1, 3, 4), float(frames[0][0, 0, 0]))
+        tick = int(frames[0][0, 0, 0])
+        self.log.append(("encode_obs", tick))
+        return torch.full((1, 4, 1, 3, 4), float(tick))
 
     def encode_executed_chunk(self, frames_per_view):
         ticks = [int(frames[0][0, 0, 0]) for frames in frames_per_view]
         self.log.append(("encode_chunk", ticks))
-        return torch.full((1, 4, 1, 3, 4), float(sum(ticks)))
+        # the anchor latent of the clip = the single-frame encode of its first frame (the causal VAE)
+        return torch.full((1, 4, 1, 3, 4), float(sum(ticks))), torch.full((1, 4, 1, 3, 4), float(ticks[0]))
 
 
 def _obs(tick: int, instruction: str = "stack the bowls") -> dict:
@@ -88,10 +98,10 @@ def _obs(tick: int, instruction: str = "stack the bowls") -> dict:
 
 @pytest.fixture()
 def model():
-    with open(os.path.join(_paths.FIXTURES, "config_causal_vanilla52k_m48n24_derived.yaml")) as handle:
+    with open(os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_derived.yaml")) as handle:
         view = bidirectional_view(yaml.safe_load(handle))
     normalization = load_checked_normalization(
-        "/nonexistent", view, os.path.join(_paths.FIXTURES, "normalization_vanilla52k_f33.json")
+        "/nonexistent", view, os.path.join(_paths.FIXTURES, "normalization_causal_f33_1fe3b7e7.json")
     )
     log: list = []
     m = adapter.Model.__new__(adapter.Model)
@@ -106,6 +116,7 @@ def model():
     m.eef_pose_check = False
     m.commit_actions = "executed"
     m.memory_mode = "full"
+    m.memory_content = "video_and_action"
     m.max_chunks_per_episode = None
     m.log_world_model_error = True
     m.diffusion_seed_base, m.eval_seed = 1, 0
@@ -129,24 +140,29 @@ def test_the_robodojo_cycle(model):
     assert m._episode_index == 1
     actions = m.get_action()
     assert len(actions) == C and set(actions[0]) == {"left_ee_pose", "left_ee_joint_state", "right_ee_pose", "right_ee_joint_state"}
-    assert [entry[0] for entry in m.log] == ["new_session", "commit_observation", "generate"]
+    assert [entry[0] for entry in m.log] == ["new_session", "encode_obs", "generate"]
     _run_chunk(m, 0)
     m.get_action()
     names = [entry[0] for entry in m.log]
-    assert names == ["new_session", "commit_observation", "generate", "encode_chunk", "commit_chunk", "generate"]
+    assert names == ["new_session", "encode_obs", "generate", "encode_chunk", "commit_chunk", "encode_obs", "generate"]
     encode = m.log[3]
     assert encode[1] == list(range(0, C + 1, S))  # ticks 0, 4, .., 32 of chunk 0
     commit = m.log[4]
     first_generate = m.log[2]
     assert torch.equal(commit[4], first_generate[2])   # the chunk-start anchor of chunk 0, not the latest state
-    second_generate = m.log[5]
+    second_generate = m.log[6]
     assert not torch.equal(second_generate[2], first_generate[2])  # chunk 1 anchors on the tick-32 observation
+    # every chunk is generated from its own start frame: tick 0 for chunk 0, tick 32 for chunk 1
+    assert (m.log[1][1], first_generate[4]) == (0, 0.0) and (m.log[5][1], second_generate[4]) == (C, float(C))
+    assert (first_generate[1], second_generate[1]) == (0, 1)
     committed = commit[3][0]
     mask = first_generate[3][0]
     assert torch.count_nonzero(committed[~mask]) == 0
     _run_chunk(m, C)
     m.get_action()
-    assert m.log[-3][1] == list(range(C, 2 * C + 1, S))  # chunk 1's frames: ticks 32, 36, .., 64
+    assert [entry[0] for entry in m.log[-4:]] == ["encode_chunk", "commit_chunk", "encode_obs", "generate"]
+    assert m.log[-4][1] == list(range(C, 2 * C + 1, S))  # chunk 1's frames: ticks 32, 36, .., 64
+    assert m.log[-2][1] == 2 * C and m.log[-1][4] == float(2 * C)
 
 
 def test_the_episode_counter_advances_once_per_episode(model):
@@ -212,9 +228,10 @@ def test_reset_drops_the_memory(model):
     m.get_action()
     names = [entry[0] for entry in m.log]
     assert names.count("commit_chunk") == 0 and names.count("new_session") == 2
+    assert m.log[-1][0] == "generate" and m.log[-1][1] == 0 and m.log[-1][4] == 100.0
 
 
-def test_memory_mode_none_cold_starts_every_chunk_on_its_start_frame(model, monkeypatch):
+def test_memory_mode_none_generates_every_chunk_on_an_empty_memory(model, monkeypatch):
     m = model
     m.memory_mode = "none"
     seeds = []
@@ -228,12 +245,11 @@ def test_memory_mode_none_cold_starts_every_chunk_on_its_start_frame(model, monk
         _run_chunk(m, (chunk - 1) * C)
         m.get_action()
     names = [entry[0] for entry in m.log]
-    # every chunk: a fresh memory holding the chunk's start frame, generated as that memory's chunk 0; nothing committed
-    assert names == ["new_session", "commit_observation", "generate",
-                     "encode_chunk", "new_session", "commit_observation", "generate",
-                     "encode_chunk", "new_session", "commit_observation", "generate"]
-    observations = [entry[1] for entry in m.log if entry[0] == "commit_observation"]
-    assert observations == [0.0, 48.0 * C, 48.0 * 2 * C]          # the frames of ticks 0, 32, 64 (fake latent = 48 x tick)
+    # every chunk: the memory forgotten, the chunk generated from its own start frame as a first chunk; nothing committed
+    assert names == ["new_session", "encode_obs", "generate",
+                     "encode_chunk", "reset_memory", "encode_obs", "generate",
+                     "encode_chunk", "reset_memory", "encode_obs", "generate"]
+    assert [entry[4] for entry in m.log if entry[0] == "generate"] == [0.0, float(C), float(2 * C)]  # ticks 0, 32, 64
     assert [entry[1] for entry in m.log if entry[0] == "generate"] == [0, 0, 0]
     assert [entry[1] for entry in m.log if entry[0] == "encode_chunk"] == [list(range(0, C + 1, S)), list(range(C, 2 * C + 1, S))]
     assert seeds == [0, 1, 2]                                       # the noise of the episode's chunk index, as in full
@@ -250,7 +266,7 @@ def test_memory_mode_none_without_the_world_model_error_encodes_nothing(model):
     m.get_action()
     names = [entry[0] for entry in m.log]
     assert "encode_chunk" not in names and "commit_chunk" not in names
-    assert names.count("new_session") == 2
+    assert names.count("new_session") == 1 and names.count("reset_memory") == 1
 
 
 def test_memory_mode_none_still_refuses_a_partial_chunk(model):
@@ -287,7 +303,7 @@ def test_commit_reached_commits_the_poses_measured_after_each_action(model):
 
 
 @pytest.mark.parametrize("memory_mode", ["full", "none"])
-def test_command_vs_reached_is_logged_for_every_executed_chunk(model, capsys, memory_mode):
+def test_command_vs_reached_and_the_anchor_gap_are_logged_for_every_executed_chunk(model, capsys, memory_mode):
     m = model
     m.memory_mode = memory_mode
     m.update_obs(_obs(0))
@@ -297,6 +313,20 @@ def test_command_vs_reached_is_logged_for_every_executed_chunk(model, capsys, me
     out = capsys.readouterr().out
     line = next(l for l in out.splitlines() if "ep 1 chunk 1:" in l)
     assert "cmd_vs_reached(chunk 0): L pos " in line and " | R pos " in line and " deg grip " in line
+    assert "obs_anchor_gap(chunk 0)=0.00e+00" in line and "world_model_rel_rmse(chunk 0)=" in line
+    expected_read = "read_chunks=[0] origin=0" if memory_mode == "full" else "read_chunks=[] origin=0"
+    assert expected_read in line and "obs_encode_s=" in line
+
+
+def test_commit_actions_other_than_executed_need_a_video_and_action_memory():
+    adapter.check_commit_actions("executed", "video_only")
+    for value in ("executed", "predicted", "reached"):
+        adapter.check_commit_actions(value, "video_and_action")
+    for value in ("predicted", "reached"):
+        with pytest.raises(ValueError, match="needs memory_content video_and_action"):
+            adapter.check_commit_actions(value, "video_only")
+    with pytest.raises(ValueError, match="commit_actions must be one of"):
+        adapter.check_commit_actions("sent", "video_and_action")
 
 
 def test_command_vs_reached_measures_position_rotation_and_gripper():

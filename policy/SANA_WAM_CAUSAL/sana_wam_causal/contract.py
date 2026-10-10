@@ -2,14 +2,17 @@
 
 A causal recipe is its parent SFT recipe plus the causal blocks (Sana ``posttrain_causal_handoff/04_configs.md``
 section 5): ``model.model`` names the causal class, ``model.extra.chunk_causal_policy`` sets the chunk size, the
-softmax sliding window and the observation layout, ``data.type`` is the causal chunk-window dataset and the window
+softmax sliding window and what a memory chunk carries, ``data.type`` is the causal chunk-window dataset and the window
 ladder replaces the SFT tier. Everything else (multiview front-end, RoPE mode, action / target modes, normalization
 pin, noise schedule) keeps its SFT meaning, so the shared ``sana_wam_min`` resolvers read it from a *bidirectional
 view* of the yaml: the same dict with the SFT policy class and the one-chunk tier put back.
 
-This adapter serves the contract the RoboDojo causal line trains (the m48n24 recipes): one-view canvas
-(``sana_pixel``), ``rope: aligned``, ``obs_in_first_chunk: true``, no AttnRes time conditioning, unmasked canvas pad.
-Anything else is refused at start-up with the reason, before the weights are read.
+This adapter serves the per-chunk observation protocol (Sana ``61aad2d58`` / ``3a6b2bf07``, the pantheon14k m48n24
+recipes): every noisy chunk carries its own observation latent, a memory chunk holds its target latents (plus its
+anchor state and actions under ``memory_content: video_and_action``, the value of a config without the key), on the
+one-view canvas (``sana_pixel``), ``rope: aligned``, no AttnRes time conditioning, unmasked canvas pad. A config that
+still names ``obs_in_first_chunk`` belongs to a retired layout (the chunk-0-only observation of the vanilla52k line) and
+is refused like anything else outside the contract, at start-up with the reason, before the weights are read.
 """
 
 from __future__ import annotations
@@ -40,6 +43,11 @@ ACTION_TEMPORAL_COMPRESSION = 8
 # Sana ``ChunkGDNLinearAttention`` defaults for recurrence parameters a checkpoint does not carry (an SFT donor)
 DEFAULT_DT_BIAS_INIT = -5.0
 DEFAULT_A_LOG_INIT = 0.0
+# ``model.extra.chunk_causal_policy.memory_content`` (Sana ``causal_rwm_train.MEMORY_CONTENTS``): what a memory chunk
+# carries besides its target latents; an absent key reads as video_and_action (Sana ``resolve_memory_content``)
+MEMORY_VIDEO_AND_ACTION = "video_and_action"
+MEMORY_VIDEO_ONLY = "video_only"
+MEMORY_CONTENTS = (MEMORY_VIDEO_AND_ACTION, MEMORY_VIDEO_ONLY)
 
 
 @dataclass(frozen=True)
@@ -49,8 +57,8 @@ class CausalContract:
     actions_per_chunk: int           # C: action rows per chunk (32 for the 33-row tier)
     video_frame_stride: int          # s: source rows between consecutive video frames (4 at video_fps 8 on 33 rows)
     latent_frames_per_chunk: int     # f_c = C / (8 s): target latent frames of one chunk
-    sliding_window_chunks: Optional[int]  # N: softmax context entries a chunk reads (None = every committed entry)
-    obs_in_first_chunk: bool
+    sliding_window_chunks: Optional[int]  # W: committed chunks a chunk's softmax layers read (None = all of them)
+    memory_content: str              # video_and_action | video_only: what a committed chunk keeps besides its targets
     model_fps: float
     tier_num_frames: int             # C + 1: the one-chunk window of the parent SFT recipe
     multiview: str
@@ -63,9 +71,10 @@ class CausalContract:
     def describe(self) -> str:
         window = "all" if self.sliding_window_chunks is None else str(self.sliding_window_chunks)
         return (
-            f"actions_per_chunk={self.actions_per_chunk} video_frame_stride={self.video_frame_stride} "
-            f"latent_frames_per_chunk={self.latent_frames_per_chunk} sliding_window_chunks={window} "
-            f"obs_in_first_chunk={self.obs_in_first_chunk} multiview={self.multiview} rope={self.rope}"
+            f"protocol=per_chunk_obs actions_per_chunk={self.actions_per_chunk} "
+            f"video_frame_stride={self.video_frame_stride} latent_frames_per_chunk={self.latent_frames_per_chunk} "
+            f"sliding_window_chunks={window} memory_content={self.memory_content} multiview={self.multiview} "
+            f"rope={self.rope}"
         )
 
 
@@ -99,6 +108,18 @@ def resolve_actions_per_chunk(spec: Any, fps: float, vae_stride: int = ACTION_TE
     if chunk <= 0 or chunk % vae_stride != 0:
         raise ValueError(f"actions_per_chunk={chunk} must be a positive multiple of the VAE temporal stride {vae_stride}")
     return chunk
+
+
+def resolve_memory_content(value: Any) -> str:
+    """``memory_content`` as Sana reads it: None (a config older than the key) -> video_and_action."""
+
+    if value is None:
+        return MEMORY_VIDEO_AND_ACTION
+    if value not in MEMORY_CONTENTS:
+        raise ValueError(
+            f"model.extra.chunk_causal_policy.memory_content={value!r}: allowed values are {list(MEMORY_CONTENTS)}"
+        )
+    return str(value)
 
 
 def is_causal_policy_config(cfg: Mapping[str, Any]) -> bool:
@@ -158,12 +179,14 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         )
     f_chunk = chunk // (ACTION_TEMPORAL_COMPRESSION * stride)
 
-    obs_first = bool(options.get("obs_in_first_chunk", False))
-    if not obs_first:
+    if "obs_in_first_chunk" in options:
         raise ValueError(
-            "model.extra.chunk_causal_policy.obs_in_first_chunk must be true: the causal trainer requires it since "
-            "2026-09-26, and the observation-segment layout of noisy chunk 0 is not implemented here"
+            "model.extra.chunk_causal_policy.obs_in_first_chunk="
+            f"{options['obs_in_first_chunk']!r}: this checkpoint trained a retired observation layout (the chunk-0-only "
+            "observation of the vanilla52k line, Sana before 61aad2d58); this adapter serves the per-chunk observation "
+            "protocol only (the earlier protocol is archived in XPolicyLab commit 69cfb8e)"
         )
+    memory_content = resolve_memory_content(options.get("memory_content"))
     window = options.get("sliding_window_chunks")
     window = None if window is None else int(window)
     if window is not None and window < 1:
@@ -194,7 +217,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         video_frame_stride=stride,
         latent_frames_per_chunk=f_chunk,
         sliding_window_chunks=window,
-        obs_in_first_chunk=obs_first,
+        memory_content=memory_content,
         model_fps=fps,
         tier_num_frames=tier,
         multiview=str(multiview),
@@ -211,9 +234,13 @@ __all__ = [
     "CAUSAL_DATASET_TYPES",
     "CAUSAL_POLICY_FACTORY",
     "CausalContract",
+    "MEMORY_CONTENTS",
+    "MEMORY_VIDEO_AND_ACTION",
+    "MEMORY_VIDEO_ONLY",
     "bidirectional_view",
     "chunk_causal_options",
     "is_causal_policy_config",
     "resolve_actions_per_chunk",
     "resolve_causal_contract",
+    "resolve_memory_content",
 ]

@@ -1,6 +1,7 @@
 """Chunk-causal attention shells and block of the causal policy (inference subset).
 
-Ports of Sana rwm/zekai-merge (c391260a4):
+Ports of Sana rwm/zekai-merge (c391260a4; the formulas are unchanged through 9ee9c2d9d, whose per-chunk observation
+protocol only changes which state version and which entries a forward reads -- the session's business):
 
 * ``CausalGDNAttention`` <- ``layers/chunk_causal_gdn.py`` ``CachedChunkCausalPolicyGDNAttention`` with one chunk
   segment per forward (every deploy window is one segment): the donor's ``GatedDeltaNet`` projections plus the
@@ -19,7 +20,7 @@ Ports of Sana rwm/zekai-merge (c391260a4):
 * ``CausalPolicyBlock`` <- ``layers/chunk_causal_block.py`` ``ChunkWiseCausalPolicyBlock``: the bidirectional
   block's AdaLN / cross-attention / SwiGLU with the two shells above.
 
-A forward receives an optional ``LayerCache``: absent = the cache-free chunk-0 window (zero GDN state, the softmax
+A forward receives an optional ``LayerCache``: absent = a window that reads nothing (chunk 0: zero GDN state, the softmax
 reads only the window); present = a cached window that reads ``cache.gdn_state`` / ``cache.softmax_context`` and,
 when ``cache.commit`` is set, leaves the next GDN state and this window's K/V in ``cache.gdn_next`` /
 ``cache.softmax_new`` for the session to keep.

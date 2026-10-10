@@ -1,10 +1,12 @@
 """Real-weight first light of the causal adapter on one GPU, without the simulator.
 
 Loads the runtime exactly as ``model.py`` does (causal yaml -> contract -> normalization -> bf16 causal model ->
-VAE -> Gemma), then drives the chunk cycle on synthetic frames: commit the observation, generate chunk 0, then for
-every later chunk commit the previous one (its 9 frames encoded as one clip) and generate the next. Prints the load
-report, per-chunk latencies, peak GPU memory, the read entries and finiteness checks, and checks determinism
-(the same seeds replay the same chunk 0).
+VAE -> Gemma), then drives the per-chunk observation cycle on synthetic frames (one random image per episode, rolled by
+the tick): for every chunk but the first commit the previous one (its 9 frames encoded as one clip), then encode the
+chunk's start frame as its observation and generate it. Prints the load report, per-chunk latencies, the chunks read,
+obs_anchor_gap (the observation vs the anchor latent of the same frame inside the next commit's clip: the causal-VAE
+equality the protocol relies on), peak GPU memory and finiteness checks, and checks determinism (the same seeds
+replay the same chunk 0).
 
 Usage (from policy/SANA_WAM_CAUSAL, PYTHONPATH=<XPolicyLab parent>):
   python tools/first_light.py --checkpoint-dir DIR --text-encoder-path P --vae-path P [--allow-donor-checkpoint]
@@ -30,9 +32,15 @@ from sana_wam_causal.runtime import CausalRuntime, timed  # noqa: E402
 from sana_wam_min.robot80 import normalize_state, normalized_gripper_bounds  # noqa: E402
 
 
-def synthetic_frames(rng: np.random.Generator, tick: int) -> list[np.ndarray]:
-    base = rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
+def frames_at(base: np.ndarray, tick: int) -> list[np.ndarray]:
+    """The three camera frames of one tick: the episode's base image rolled by the tick (per camera speed)."""
+
     return [np.roll(base, shift=tick * (i + 1), axis=1).copy() for i in range(3)]
+
+
+def relative_rmse(estimate: torch.Tensor, reference: torch.Tensor) -> float:
+    estimate, reference = estimate.float(), reference.float()
+    return float(((estimate - reference) ** 2).mean().sqrt() / (reference**2).mean().sqrt().clamp_min(1e-8))
 
 
 def main() -> int:
@@ -44,7 +52,6 @@ def main() -> int:
     parser.add_argument("--chunks", type=int, default=4)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--window-override", type=int, default=None)
-    parser.add_argument("--softmax-window", default="training", help="training | sink")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -52,14 +59,13 @@ def main() -> int:
     runtime = CausalRuntime.from_paths(
         args.checkpoint_dir, text_encoder_path=args.text_encoder_path, vae_path=args.vae_path, device=args.device,
         steps=args.steps, cfg_scale=6.0, action_cfg_scale=1.0, allow_donor_checkpoint=args.allow_donor_checkpoint,
-        window_rule=args.softmax_window,
     )
     print(f"[first-light] load {time.perf_counter() - start:.1f}s report={json.dumps({k: v for k, v in runtime.load_report.items() if k != 'stripped'}, default=str)}")
     contract = runtime.contract
     if args.window_override is not None:
         contract = type(contract)(**{**contract.__dict__, "sliding_window_chunks": args.window_override})
         runtime.contract = contract
-    print(f"[first-light] contract {contract.describe()} | softmax_window {runtime.window_rule} | steps {runtime.frontend.steps} "
+    print(f"[first-light] contract {contract.describe()} | steps {runtime.frontend.steps} "
           f"cfg {runtime.frontend.video_cfg_scale}/{runtime.frontend.action_cfg_scale} "
           f"shift {runtime.frontend.flow_shift}/{runtime.frontend.action_flow_shift}")
     device = runtime.device
@@ -75,37 +81,34 @@ def main() -> int:
     state_raw[[16, 45]] = 0.2
     anchor = normalize_state(state_raw, mask.numpy(), normalization).to(device)
 
+    chunk, stride = contract.actions_per_chunk, contract.video_frame_stride
+
     def episode(seed: int, chunks: int):
-        rng = np.random.default_rng(seed)
+        base = np.random.default_rng(seed).integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
         session = runtime.new_session("put the bottles into the dustbin")
-        frames0 = synthetic_frames(rng, 0)
-        obs_latent, t_enc = timed(runtime.encode_observation, frames0)
-        _, t_commit = timed(session.commit_observation, obs_latent)
         out = []
-        tick = 0
         for c in range(chunks):
             timings = {}
+            gap = None
             if c:
-                clip = [synthetic_frames(rng, tick - contract.actions_per_chunk + j * contract.video_frame_stride)
-                        for j in range(1 + contract.actions_per_chunk // contract.video_frame_stride)]
-                latent, timings["encode"] = timed(runtime.encode_executed_chunk, clip)
+                clip = [frames_at(base, (c - 1) * chunk + j * stride) for j in range(1 + chunk // stride)]
+                (latent, anchor_latent), timings["encode"] = timed(runtime.encode_executed_chunk, clip)
+                gap = relative_rmse(anchor_latent, out[-1][2])
                 _, timings["commit"] = timed(session.commit_chunk, latent, out[-1][0], anchor_state=anchor,
                                              anchor_state_mask=mask.to(device), action_mask=action_mask)
-            else:
-                timings["encode"], timings["commit"] = t_enc, t_commit
-            read = session.read_entry_ids() if c else []
-            origin = session.softmax_origin() if c else 0
+            observation, timings["obs_encode"] = timed(runtime.encode_observation, frames_at(base, c * chunk))
+            read, origin = session.read_chunk_ids(), session.softmax_origin()
             generator = torch.Generator(device=device).manual_seed(1000 + c)
             (action, video), timings["generate"] = timed(
-                session.generate_chunk, anchor_state=anchor, anchor_state_mask=mask.to(device), action_mask=action_mask,
-                generator=generator, gripper_bounds=normalized_gripper_bounds(normalization),
+                session.generate_chunk, observation, anchor_state=anchor, anchor_state_mask=mask.to(device),
+                action_mask=action_mask, generator=generator, gripper_bounds=normalized_gripper_bounds(normalization),
             )
             finite = bool(torch.isfinite(action).all()) and bool(torch.isfinite(video).all())
             print(f"[first-light] chunk {c}: read={read}" + (f" origin={origin}" if origin else "") + " "
                   + " ".join(f"{k}={v:.3f}s" for k, v in timings.items())
+                  + ("" if gap is None else f" obs_anchor_gap(chunk {c - 1})={gap:.2e}")
                   + f" finite={finite} |a|max={float(action.abs().max()):.3f} video_rms={float(video.float().pow(2).mean().sqrt()):.3f}")
-            out.append((action, video))
-            tick += contract.actions_per_chunk
+            out.append((action, video, observation))
         return out
 
     if torch.cuda.is_available():
@@ -117,7 +120,7 @@ def main() -> int:
     again = episode(7, 1)
     same = torch.equal(first[0][0], again[0][0]) and torch.equal(first[0][1], again[0][1])
     print(f"[first-light] chunk-0 replay deterministic: {same}")
-    print("[first-light] PASS" if same and all(bool(torch.isfinite(a).all()) for a, _ in first) else "[first-light] FAIL")
+    print("[first-light] PASS" if same and all(bool(torch.isfinite(a).all()) for a, _, _ in first) else "[first-light] FAIL")
     return 0
 
 
