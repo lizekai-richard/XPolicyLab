@@ -1,0 +1,63 @@
+policy_name: SANA_WAM_HM
+protocol: ws
+host: localhost
+port: null
+bench_name: null
+task_name: null
+ckpt_name: null
+env_cfg_type: null
+seed: null
+action_type: ee
+gpu_id: null
+eval_batch: false
+
+# One get_action = (decision c >= 1) the executed chunk's dense latent (8-frame stream encode + one commit per text
+# stream) + the observation encode + the sparse memory (17-frame encode + one commit per text stream) + sampling_steps
+# x 2 forwards of the noisy chunk; the first call of an episode encodes the prompt and the first frame instead. The
+# RoboDojo client times every RPC out after 120 s whatever this says.
+request_timeout_s: 600.0
+
+# --- SANA_WAM_HM keys (see README "Configuration") ---
+# HF-style checkpoint dir of a HIERARCHICAL-MEMORY run (Sana rwm/sparse-memory, e.g. the pantheon14k hm_dense_sparse /
+# hm_sparse_sparse videoonly recipes): config.yaml (model.model ...MultiViewCausal_5B_P1_D36 with
+# model.extra.chunk_causal_policy.hierarchical_memory {gdn, softmax, sparse_frames} and memory_content video_only) +
+# model/pytorch_model_fsdp.bin [+ normalization/*.json]. null -> XPolicyLab resolution of ckpt_name.
+checkpoint_dir: null
+# An SFT (bidirectional) checkpoint has no GDN recurrence parameters; true serves it as the policy's step-0 model
+# (recurrence initialized as the causal trainer does on its first load). Pipeline checks only, never an evaluation.
+allow_donor_checkpoint: false
+# null -> <checkpoint_dir>/normalization/<f33 name>, else the packaged copy (refused by the yaml pin of an EEF line)
+normalization_path: null
+normalization_sha256: null
+text_encoder_path: null
+vae_path: null
+# Sampling: the RoboDojo defaults of every SANA evaluation (10 Euler steps, video CFG 6, action CFG 1; the flow shifts
+# from the checkpoint's scheduler.inference_flow_shift / inference_action_flow_shift when null).
+sampling_steps: 10
+cfg_scale: 6.0
+video_cfg_scale: null
+action_cfg_scale: 1.0
+flow_shift: null
+action_flow_shift: null
+# How a decision is evaluated: streaming = every memory latent committed ONCE through the blocks that read its memory
+# (a dense latent when it is produced, the sparse memory once per decision), then every denoising step runs the noisy
+# chunk alone against the committed GDN states / softmax K/V (every memory choice; exact up to round-off); full = every
+# denoising step runs the TRAINING forward of the decision's sample (the reference; its cost grows with the decision
+# index when a dense memory is read). null = streaming.
+deploy_form: null
+# Refuse an episode longer than this many decisions (null = no limit; training covers K <= 47 history chunks)
+max_chunks_per_episode: null
+# Per-decision log of the relative RMSE between the predicted target latent and the latent training regresses it to:
+# the dense stream's next latent (dense recipes), else the target encoded after the decision's sparse rows (one extra
+# 8-frame stream encode per decision)
+log_world_model_error: true
+# null = stretch (the only SFT view resize of the line's donors); a contradicting value is refused
+view_resize: null
+diffusion_seed_base: 20261012
+eef_pose_check: true
+urdf_path: null
+robot_root_poses: null
+device: cuda
+weight_dtype: bfloat16
+strict_image_size: false
+default_instruction: follow the instruction

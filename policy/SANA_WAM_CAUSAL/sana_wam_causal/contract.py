@@ -158,6 +158,12 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
     if data_type not in CAUSAL_DATASET_TYPES:
         raise ValueError(f"data.type {data_type!r} is not a causal chunk-window dataset {CAUSAL_DATASET_TYPES}")
     options = chunk_causal_options(cfg)
+    if "hierarchical_memory" in options:
+        raise ValueError(
+            "model.extra.chunk_causal_policy.hierarchical_memory: this is a hierarchical-memory checkpoint (Sana "
+            "rwm/sparse-memory, a dense / sparse memory read per block kind), which this adapter would mis-serve as the "
+            "per-chunk observation protocol; serve it with SANA_WAM_HM"
+        )
     view = bidirectional_view(cfg)
 
     fps = float(ROBODOJO_MODEL_FPS_HZ)
