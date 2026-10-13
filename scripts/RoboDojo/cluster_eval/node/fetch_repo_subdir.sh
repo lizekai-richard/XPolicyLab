@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # fetch_repo_subdir.sh -- download every file under ONE sub-directory of an HF repo into a directory on the shared home,
 # WITHOUT touching anything else (staging area for artifacts uploaded after a snapshot was assembled, e.g. normalization/).
-# Runs on ONE MIT node. Env: CKPT_REPO (HF repo id), REPO_SUBDIR (e.g. normalization), DEST (absolute dir on the shared home).
+# Runs on ONE node. Env: CKPT_REPO (HF repo id), REPO_SUBDIR (e.g. normalization), DEST (absolute dir on the shared home).
 # Prints size + sha256 per file; terminal line "FETCH DONE <n files>" or "FATAL ...". Re-runnable (overwrites DEST files).
 set -Eeuo pipefail
-ROOT=${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}
+_CE_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+[[ -f $_CE_HERE/site.env ]] && source "$_CE_HERE/site.env"   # the site configuration deploy.sh copies next to the node scripts
+ROOT=${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to this script (deploy.sh) and no ROBODOJO_ROOT}}
 : "${CKPT_REPO:?CKPT_REPO required}"; : "${REPO_SUBDIR:?REPO_SUBDIR required}"; : "${DEST:?DEST required}"
-mkdir -p "$DEST" "$HOME/robodojo_install/logs"
-exec > >(tee -a "$HOME/robodojo_install/logs/fetch_repo_subdir.log") 2>&1
+mkdir -p "$DEST" "$_CE_HERE/logs"
+exec > >(tee -a "$_CE_HERE/logs/fetch_repo_subdir.log") 2>&1
 log() { printf '[%s] [%s] %s\n' "$(date '+%F %T')" "$(hostname -s)" "$*"; }
 [[ -f $ROOT/activate_sana_wam.sh ]] || { log "FATAL: $ROOT/activate_sana_wam.sh missing"; exit 1; }
 # shellcheck disable=SC1091

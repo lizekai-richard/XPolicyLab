@@ -4,11 +4,15 @@ progress against a finished baseline run: for every unit of the A/B run (running
 is rsync-pulled from the node's workspace like progress_xpl.py does; done units: the mirrored copy) the episodes it has
 finished are paired BY LAYOUT ID with the baseline unit of the same task (`<task>__s<seed>__<label>`; sharded A/B
 units all map to the one unsharded baseline unit) and stage-1 hits (score > 0), score sums and successes are compared
-on exactly those layouts. Prints one row per task plus a total; nothing else is written."""
+on exactly those layouts. Prints one row per task plus a total; nothing else is written.
+Env: XPL_POLICY (default SANA_WAM), XPL_WS (default CE_NODE_XPL_WS)."""
 import collections, json, os, re, subprocess, sys, tempfile
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import ce_site  # noqa: E402  (the CE_* site configuration)
 ab_dir, base_dir, label = sys.argv[1:4]
 keep_dir = sys.argv[4] if len(sys.argv) > 4 else None     # optional: keep the pulled in-progress _result.json files here (<unit_id>.json)
-ws = os.environ.get("XPL_WS", "/dataset2/jiamingt/robodojo/xpl_zekai_ws")
+ws = os.environ.get("XPL_WS") or ce_site.get("CE_NODE_XPL_WS")
+policy = os.environ.get("XPL_POLICY", "SANA_WAM")
 ab = json.load(open(os.path.join(ab_dir, "state.json"))); base = json.load(open(os.path.join(base_dir, "state.json")))
 ab_label = os.path.basename(ab["checkpoint_root"].rstrip("/"))
 ab_action_type = ab.get("xpl_action_type", "joint")
@@ -37,7 +41,7 @@ for u in ab["units"]:
         m = re.search(r"run_id=(\S+)", open(stt).read()) if os.path.exists(stt) else None
         if not m: continue
         node = u["slot"].split(":")[0]
-        src = f"jiamingt@{node}.mit.edu:{ws}/eval_result/RoboDojo/{u['task']}/SANA_WAM/arx_x5/{u['eval_seed']}_ckpt_name={ab_label},action_type={ab_action_type}/{m.group(1)}/_result.json"
+        src = f"{ce_site.host(node)}:{ws}/eval_result/RoboDojo/{u['task']}/{policy}/arx_x5/{u['eval_seed']}_ckpt_name={ab_label},action_type={ab_action_type}/{m.group(1)}/_result.json"
         dst = os.path.join(tmp, u["unit_id"] + ".json")
         p = subprocess.run(["rsync", "-az", "-e", "ssh -o BatchMode=yes -o ConnectTimeout=15", src, dst], capture_output=True, text=True, timeout=120)
         if p.returncode == 0 and os.path.exists(dst):

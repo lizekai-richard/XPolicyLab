@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Kill ONLY orphaned Isaac clients (src/eval_client/main.py of user jiamingt whose parent is init, i.e. PPID 1)
+# Kill ONLY orphaned Isaac clients (src/eval_client/main.py of user CE_SSH_USER whose parent is init, i.e. PPID 1)
 # on each host, even while evaluation workers are running there: a live client's parent is the worker's
-# `timeout`/`bash`, never init. Run on x5. Report: ~/robodojo_install/logs/<host>.cleanup_orphans_only.txt
+# `timeout`/`bash`, never init. Run on the control host. Report: <CE_REMOTE_INSTALL>/logs/<host>.cleanup_orphans_only.txt
 set -u
-HOSTS=${HOSTS:-"l7"}
+# shellcheck source=../lib/site.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/site.sh" || exit 2
+HOSTS=${HOSTS:-$CE_NODES}
 for h in $HOSTS; do
-  ssh -n -o BatchMode=yes -o ConnectTimeout=15 "jiamingt@$h.mit.edu" 'me=$(id -un); out=~/robodojo_install/logs/$(hostname -s).cleanup_orphans_only.txt; {
+  ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$(ce_host "$h")" 'me=$(id -un); out='"$CE_REMOTE_INSTALL"'/logs/$(hostname -s).cleanup_orphans_only.txt; {
     echo "== $(hostname -s) $(date -u +%FT%TZ)"
     own="^($$|$PPID)$"
     pids=""

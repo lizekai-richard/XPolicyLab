@@ -2,11 +2,13 @@
 # Read-only: which physical board CUDA_VISIBLE_DEVICES=g selects on a node with "[GPU requires reset]" boards
 # (the sana-wam torch, one process per g; prints the selected device's UUID next to nvidia-smi's board list).
 set -u
-HOSTS=${HOSTS:-"l2 l4 l6"}
+# shellcheck source=../lib/site.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/site.sh" || exit 2
+HOSTS=${HOSTS:-$CE_NODES}
 for h in $HOSTS; do
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "jiamingt@$h.mit.edu" '
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$(ce_host "$h")" '
     echo "== $(hostname -s)"; nvidia-smi --query-gpu=index,uuid,pstate --format=csv,noheader | sed "s/^/   smi /"
-    PY=/dataset2/jiamingt/robodojo/envs/sana-wam/bin/python
+    PY='"$CE_NODE_ROOT"'/envs/sana-wam/bin/python
     for g in 0 1 2 3 4 5 6 7; do
       r=$(CUDA_VISIBLE_DEVICES=$g timeout 90 "$PY" -c "
 import torch

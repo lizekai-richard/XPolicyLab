@@ -11,7 +11,7 @@
 #   * the evidence dir may be any fresh absolute path containing "robodojo";
 #     default $HOME/robodojo_evidence/robodojo_server_<ts>_<pid>, i.e. on the
 #     shared home so every lN node sees the client handoff bundle
-#   * defaults point at the MIT layout (~/Sana, /dataset2/jiamingt/robodojo) and
+#   * defaults point at the site layout (~/Sana, CE_NODE_ROOT from site.env) and
 #     the DEFAULT CHECKPOINT IS A DIFFERENT MODEL than the sbatch's: the 320px
 #     epoch4/step25000 snapshot fetched by download_weights.sh (its normalization
 #     file carries the same name robodojo_arx_x5_model_fps_25_f25_normalization.json);
@@ -61,6 +61,9 @@
 #     verbatim.  Two server jobs, one per task set, cover the benchmark.
 
 set -euo pipefail
+_CE_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+[[ -f $_CE_HERE/site.env ]] && source "$_CE_HERE/site.env"   # the site configuration deploy.sh copies next to the node scripts
 umask 077
 LAUNCHER_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 
@@ -99,11 +102,11 @@ for timeout_name in \
 done
 
 SANA_REPO=${SANA_REPO:-${HOME}/Sana}
-SANA_PY=${SANA_PY:-${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}/envs/sana-wam/bin/python}
-ROBODOJO_CHECKOUT=${ROBODOJO_CHECKOUT:-${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}/RoboDojo-official-clone-20260823}
+SANA_PY=${SANA_PY:-${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to this script (deploy.sh) and no ROBODOJO_ROOT}}/envs/sana-wam/bin/python}
+ROBODOJO_CHECKOUT=${ROBODOJO_CHECKOUT:-${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to this script (deploy.sh) and no ROBODOJO_ROOT}}/RoboDojo-official-clone-20260823}
 ROBODOJO_EXPECTED_COMMIT=${ROBODOJO_EXPECTED_COMMIT:-2184bf8844ea9d205382c4aefa3a694311418251}
 ROBODOJO_XPOLICYLAB_EXPECTED_COMMIT=${ROBODOJO_XPOLICYLAB_EXPECTED_COMMIT:-432f82b1758c5b1202e42a3dfe014546dbc50871}
-CKPT_ROOT=${SANA_POLICY_CHECKPOINT_ROOT:-${HOME}/checkpoints/huggingface/logits/sana_rwm_policy_from_pretrained_robodojo_320px_epoch4_step25000}
+CKPT_ROOT=${SANA_POLICY_CHECKPOINT_ROOT:-${CE_CKPT_ROOT:-${HOME}/checkpoints/huggingface/logits}/sana_rwm_policy_from_pretrained_robodojo_320px_epoch4_step25000}
 CONFIG=${SANA_POLICY_CONFIG:-${CKPT_ROOT}/config.yaml}
 TRAINING_LOG=${SANA_POLICY_TRAINING_LOG:-${CKPT_ROOT}/README.md}
 NORMALIZATION=${SANA_POLICY_NORMALIZATION:-${CKPT_ROOT}/normalization/robodojo_arx_x5_model_fps_25_f25_normalization.json}

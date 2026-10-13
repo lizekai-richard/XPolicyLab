@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Fast-forward the node-local RoboDojo checkout (the one that simulates) to EXACTLY 726e9aa, as done on l3/l5/l7/l8/l25/l26
 # on 2026-09-23. Refuses a dirty tree or a HEAD that is not an ancestor of 726e9aa; superproject only (no submodule
-# update, same as the six nodes). HOSTS="l2 l4 l6" bash node_pin_726e9aa.sh
+# update, same as the six nodes). [HOSTS="<node> ...", default CE_NODES] bash node_pin_726e9aa.sh
 set -u
-HOSTS=${HOSTS:-"l2 l4 l6"}
+# shellcheck source=../lib/site.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/site.sh" || exit 2
+HOSTS=${HOSTS:-$CE_NODES}
 for h in $HOSTS; do
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "jiamingt@$h.mit.edu" '
-    set -u; C=/dataset2/jiamingt/robodojo/RoboDojo-official-clone-20260823; PIN=726e9aa
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$(ce_host "$h")" '
+    set -u; C='"$CE_NODE_ROOT"'/RoboDojo-official-clone-20260823; PIN=726e9aa
     cd "$C" || { echo "$(hostname -s): no checkout at $C"; exit 1; }
     before=$(git rev-parse --short HEAD)
     if [ -n "$(git status --porcelain --untracked-files=no)" ]; then echo "$(hostname -s): REFUSE, tracked changes:"; git status --porcelain --untracked-files=no | head; exit 1; fi

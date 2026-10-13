@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Kill OUR leaked Isaac client processes (src/eval_client/main.py, user jiamingt) on nodes where no evaluation
-# worker is running any more. Run on x5. Refuses to touch a node that still has a run_unit*.sh worker alive.
-# Report: ~/robodojo_install/logs/<host>.cleanup.txt
+# Kill OUR leaked Isaac client processes (src/eval_client/main.py, user CE_SSH_USER) on nodes where no evaluation
+# worker is running any more. Run on the control host. Refuses to touch a node that still has a run_unit*.sh worker alive.
+# Report: <CE_REMOTE_INSTALL>/logs/<host>.cleanup.txt
 set -u
-HOSTS=${HOSTS:-"l5 l7 l8 l25"}
+# shellcheck source=../lib/site.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/site.sh" || exit 2
+HOSTS=${HOSTS:-$CE_NODES}
 for h in $HOSTS; do
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "jiamingt@$h.mit.edu" 'out=~/robodojo_install/logs/$(hostname -s).cleanup.txt; {
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$(ce_host "$h")" 'out='"$CE_REMOTE_INSTALL"'/logs/$(hostname -s).cleanup.txt; {
     echo "== $(hostname -s) $(date -u +%FT%TZ)"
     me=$(id -un)
     if pgrep -u "$me" -f "run_unit(_xpl)?\.sh " >/dev/null; then echo "REFUSED: a worker is still running here"; exit 0; fi

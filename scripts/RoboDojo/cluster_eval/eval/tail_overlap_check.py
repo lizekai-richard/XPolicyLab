@@ -1,12 +1,14 @@
 """tail_overlap_check.py RUN -- for every tail shard (units/*__sub*) of a run: node:gpu, start/end (status.txt on NFS), server bind errors; report overlaps."""
 import json, os, re, subprocess, sys, datetime as dt
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import ce_site  # noqa: E402  (the CE_* site configuration)
 RUN = sys.argv[1]
-RR = f"/homes/jiamingt/robodojo_eval/{RUN}"
-M = os.path.expanduser(f"~/robodojo_master/{RUN}")
-OUT = os.path.join(os.path.expanduser("~/robodojo_master"), RUN, "tail_shards", "overlap_check")
+RR = f"{ce_site.get('CE_EVAL_ROOT')}/{RUN}"
+M = os.path.join(ce_site.get("CE_MASTER_ROOT"), RUN)
+OUT = os.path.join(M, "tail_shards", "overlap_check")
 os.makedirs(OUT, exist_ok=True)
 subprocess.run(["rsync", "-a", "--delete", "-e", "ssh -o BatchMode=yes -o ConnectTimeout=15", "--include=*/", "--include=status.txt",
-                "--include=server.stderr.log", "--include=result.json", "--exclude=*", f"jiamingt@{os.environ.get('NFS_GATEWAY', 'l7')}.mit.edu:{RR}/units/", OUT + "/"],
+                "--include=server.stderr.log", "--include=result.json", "--exclude=*", f"{ce_site.gateway()}:{RR}/units/", OUT + "/"],
                check=False, timeout=600)
 rows = []
 for uid in sorted(os.listdir(OUT)):

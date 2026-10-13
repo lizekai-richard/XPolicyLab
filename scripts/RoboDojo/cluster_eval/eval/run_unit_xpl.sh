@@ -16,13 +16,14 @@
 #   SANA_EVAL_XPL_POLICY         the adapter under policy/: SANA_WAM (default) | SANA_MOT | OpenWAM. SANA_WAM and SANA_MOT
 #                                share the sana-wam env and the Sana snapshot layout + text encoder / VAE keys below
 #   SANA_EVAL_CHECKPOINT_ROOT    HF-style snapshot (config.yaml + model/pytorch_model_fsdp.bin [+ normalization/])
-#   SANA_EVAL_XPL_ROOT           the XPolicyLab checkout carrying policy/<POLICY> (default ~/xpl_zekai/XPolicyLab)
+#   SANA_EVAL_XPL_ROOT           the XPolicyLab checkout carrying policy/<POLICY> (default CE_REMOTE_XPL)
 #   SANA_EVAL_XPL_WS             node-local RoboDojo workspace built from symlinks to the pinned checkout with
-#                                XPolicyLab -> SANA_EVAL_XPL_ROOT (default $ROBODOJO_ROOT/xpl_zekai_ws)
+#                                XPolicyLab -> SANA_EVAL_XPL_ROOT (default CE_NODE_XPL_WS)
 #   SANA_EVAL_XPL_PYDEPS         directory with the websocket/msgpack/h5py wheels the sana-wam env lacks (default
-#                                ~/xpl_zekai/pydeps for SANA_WAM and SANA_MOT, none otherwise), prepended to PYTHONPATH of
+#                                CE_REMOTE_PYDEPS for the SANA adapters, none otherwise), prepended to PYTHONPATH of
 #                                the policy server only
-#   SANA_WAM_TEXT_ENCODER_PATH / SANA_WAM_VAE_PATH   default: the Sana pretrained copies on the shared home
+#   SANA_WAM_TEXT_ENCODER_PATH / SANA_WAM_VAE_PATH   default CE_TEXT_ENCODER_PATH / CE_VAE_PATH, else the Sana layout
+#                                $SANA_REPO/output/pretrained_models/{text_encoder/gemma-2-2b-it,LTX-2.3-Diffusers}
 #   SANA_EVAL_XPL_EXTRA_OVERRIDES  extra space-separated key=value deploy.yml overrides for the policy server
 #                                  (the token @ATTEMPT_DIR@ becomes this attempt's NFS dir, e.g.
 #                                  prediction_latent_dir=@ATTEMPT_DIR@/pred_latents)
@@ -33,15 +34,21 @@
 #                                unit evaluates (EPS of them) out of LAYOUT_TOTAL. The official client's resume
 #                                manifest is pre-seeded with every other layout marked 'abandoned', so it runs
 #                                exactly these ids; _result.json then holds only these layouts.
-#   ROBODOJO_ROOT (/dataset2/jiamingt/robodojo), INSTALL_DIR (~/robodojo_install), SERVER_STARTUP_TIMEOUT (3000)
+#   ROBODOJO_ROOT (default CE_NODE_ROOT), INSTALL_DIR (default this script's parent dir), SERVER_STARTUP_TIMEOUT (3000)
+# Site values: <INSTALL_DIR>/site.env (deploy.sh copies the active site configuration there; CE_SITE_NODE overrides).
+# Node runtime contract: $ROBODOJO_ROOT/activate.sh exports SANA_SIM_PY (the Isaac/RoboDojo python) and ROBODOJO_CHECKOUT
+# (the pinned RoboDojo clone); $ROBODOJO_ROOT/activate_sana_wam.sh exports SANA_PY (the policy-server python).
 # Budget: 1800 + EPS * max(EPISODE_SECONDS, step_lim * SEC_PER_STEP + RESET_SECONDS); SEC_PER_STEP defaults to 4
 # here (SDPA policy + a render per step is slower than the fused-kernel-free lazy-render lane's 0.85 s/step).
 # =============================================================================
 set -Eeuo pipefail
 (( $# == 9 || $# == 10 )) || { echo "usage: run_unit_xpl.sh RUN_ROOT UNIT_ID TASK SEED EPS SERVER_GPU CLIENT_GPU RPC_PORT WS_PORT [ATTEMPT]" >&2; exit 64; }
 RUN_ROOT=$1; UNIT_ID=$2; TASK=$3; SEED=$4; EPS=$5; SERVER_GPU=$6; CLIENT_GPU=$7; RPC_PORT=$8; WS_PORT=$9; ATTEMPT=${10:-1}
-ROOT=${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}
-INSTALL_DIR=${INSTALL_DIR:-$HOME/robodojo_install}
+SITE_ENV=${CE_SITE_NODE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/site.env}
+# shellcheck disable=SC1090
+if [[ -f $SITE_ENV ]]; then source "$SITE_ENV"; fi
+ROOT=${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to the worker (run deploy.sh) and no ROBODOJO_ROOT}}
+INSTALL_DIR=${INSTALL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 SERVER_STARTUP_TIMEOUT=${SERVER_STARTUP_TIMEOUT:-3000}
 EPISODE_SECONDS=${EPISODE_SECONDS:-600}
 SEC_PER_STEP=${SEC_PER_STEP:-4}
@@ -51,8 +58,8 @@ STALL_CRASH_SECONDS=${STALL_CRASH_SECONDS:-600}
 STALL_CONFIRM=${STALL_CONFIRM:-300}
 STALL_POLL=${STALL_POLL:-60}
 DRY=${EVAL_DRY_RUN:-0}
-XPL_ROOT=${SANA_EVAL_XPL_ROOT:-$HOME/xpl_zekai/XPolicyLab}
-XPL_WS=${SANA_EVAL_XPL_WS:-$ROOT/xpl_zekai_ws}
+XPL_ROOT=${SANA_EVAL_XPL_ROOT:-${CE_REMOTE_XPL:?no CE_REMOTE_XPL in site.env and no SANA_EVAL_XPL_ROOT}}
+XPL_WS=${SANA_EVAL_XPL_WS:-${CE_NODE_XPL_WS:-$ROOT/xpl_ws}}
 XPL_EXTRA_OVERRIDES=${SANA_EVAL_XPL_EXTRA_OVERRIDES:-}
 XPL_ACTION_TYPE=${SANA_EVAL_XPL_ACTION_TYPE:-joint}     # joint | ee: the adapter's action_type (ee needs a robot_base_eef checkpoint)
 case $XPL_ACTION_TYPE in joint|ee) ;; *) echo "SANA_EVAL_XPL_ACTION_TYPE must be joint or ee, got '$XPL_ACTION_TYPE'" >&2; exit 64;; esac
@@ -64,7 +71,7 @@ POLICY_NAME=${SANA_EVAL_XPL_POLICY:-SANA_WAM}          # SANA_WAM (default) | SA
 # server's PYTHONPATH -- for a policy whose own env already ships them it would shadow the correct versions.
 # Hence: the two policies served from the sana-wam env (SANA_WAM, SANA_MOT) get the historical default, any other none.
 case $POLICY_NAME in
-  SANA_WAM|SANA_MOT|SANA_WAM_CAUSAL) XPL_PYDEPS=${SANA_EVAL_XPL_PYDEPS:-$HOME/xpl_zekai/pydeps} ;;
+  SANA_WAM|SANA_MOT|SANA_WAM_CAUSAL) XPL_PYDEPS=${SANA_EVAL_XPL_PYDEPS:-${CE_REMOTE_PYDEPS:-}} ;;
   *)                 XPL_PYDEPS=${SANA_EVAL_XPL_PYDEPS:-} ;;
 esac
 ENV_CFG_TYPE=arx_x5
@@ -108,11 +115,16 @@ trap 'rc=$?; write_result prologue_fail 0 0 0 "prologue failed at line $LINENO (
 
 # ---- runtime env -------------------------------------------------------------------
 if [[ $DRY != 1 ]]; then
+  # a failed `source` of a missing file exits bash WITHOUT running the ERR trap (the heartbeat loop would outlive the worker
+  # and keep the unit looking alive), so check the node runtime first
+  for f in "$ROOT/activate.sh" "$ROOT/activate_sana_wam.sh"; do
+    [[ -f $f ]] || { trap - ERR; write_result prologue_fail 0 0 0 "node runtime missing: $f (RUNBOOK section 1.3)"; stop_heartbeat; exit 78; }
+  done
   # shellcheck disable=SC1091
   source "$ROOT/activate.sh"
   # shellcheck disable=SC1091
   source "$ROOT/activate_sana_wam.sh"
-  : "${SANA_PY:?}" "${SANA_REPO:?}" "${SANA_SIM_PY:?}" "${ROBODOJO_CHECKOUT:?}"
+  : "${SANA_PY:?}" "${SANA_SIM_PY:?}" "${ROBODOJO_CHECKOUT:?}"
   PYBIN=$SANA_PY
   # The SIMULATOR always runs in $SANA_SIM_PY; only the POLICY SERVER's interpreter varies, because a
   # second policy may need a conflicting dependency set (OpenWAM wants timm>=1.0.20 / transformers>=5.5,
@@ -121,7 +133,7 @@ if [[ $DRY != 1 ]]; then
   [[ -x $SERVER_PY ]] || { trap - ERR; write_result prologue_fail 0 0 0 "policy-server python not executable: $SERVER_PY"; stop_heartbeat; exit 78; }
   # ---- policy checkpoint (same rules as run_unit.sh) ----------------------------------------------
   if [[ -n ${SANA_EVAL_CHECKPOINT_ROOT:-} ]]; then export SANA_POLICY_CHECKPOINT_ROOT=$SANA_EVAL_CHECKPOINT_ROOT; fi
-  CKPT=${SANA_POLICY_CHECKPOINT_ROOT:-$HOME/checkpoints/huggingface/logits/sana_rwm_policy_from_pretrained_robodojo_320px_epoch4_step25000}
+  CKPT=${SANA_POLICY_CHECKPOINT_ROOT:?no checkpoint: the master passes SANA_EVAL_CHECKPOINT_ROOT}
   missing=()
   if [[ $POLICY_NAME == OpenWAM ]]; then
     [[ -f $CKPT/config.yaml ]] || missing+=("config.yaml")
@@ -158,8 +170,8 @@ if [[ $DRY != 1 ]]; then
       POLICY_OVERRIDE_ARGS+=("prediction_latent_dir=$LATENT_DIR")
     fi
   else
-    TE_PATH=${SANA_WAM_TEXT_ENCODER_PATH:-$SANA_REPO/output/pretrained_models/text_encoder/gemma-2-2b-it}
-    VAE_PATH=${SANA_WAM_VAE_PATH:-$SANA_REPO/output/pretrained_models/LTX-2.3-Diffusers}
+    TE_PATH=${SANA_WAM_TEXT_ENCODER_PATH:-${CE_TEXT_ENCODER_PATH:-${SANA_REPO:-/nonexistent}/output/pretrained_models/text_encoder/gemma-2-2b-it}}
+    VAE_PATH=${SANA_WAM_VAE_PATH:-${CE_VAE_PATH:-${SANA_REPO:-/nonexistent}/output/pretrained_models/LTX-2.3-Diffusers}}
     [[ -f $TE_PATH/config.json ]] || { trap - ERR; write_result prologue_fail 0 0 0 "text encoder not found at $TE_PATH"; stop_heartbeat; exit 78; }
     [[ -f $VAE_PATH/vae/config.json ]] || { trap - ERR; write_result prologue_fail 0 0 0 "VAE not found at $VAE_PATH/vae"; stop_heartbeat; exit 78; }
     POLICY_OVERRIDE_ARGS+=("checkpoint_dir=$CKPT" "text_encoder_path=$TE_PATH" "vae_path=$VAE_PATH")

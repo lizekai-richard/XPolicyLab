@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """progress_xpl.py STATE_DIR -- intermediate results of an XPL-lane run: pulls the in-progress _result.json of every
 running unit from its node's workspace (the official client rewrites it after every episode) and prints, per unit,
-episodes done / successes / score_sum / stage distribution, plus the done units and a running total."""
+episodes done / successes / score_sum / stage distribution, plus the done units and a running total.
+Env: XPL_POLICY (the adapter dir of the eval_result layout, default SANA_WAM), XPL_WS (default CE_NODE_XPL_WS)."""
 import collections, json, re, subprocess, sys, os, tempfile
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import ce_site  # noqa: E402  (the CE_* site configuration)
 state_dir = sys.argv[1]
 st = json.load(open(os.path.join(state_dir, "state.json")))
 label = os.path.basename(st["checkpoint_root"].rstrip("/"))
 action_type = st.get("xpl_action_type", "joint")
-ws = os.environ.get("XPL_WS", "/dataset2/jiamingt/robodojo/xpl_zekai_ws")
+ws = os.environ.get("XPL_WS") or ce_site.get("CE_NODE_XPL_WS")
+policy = os.environ.get("XPL_POLICY", "SANA_WAM")
 tmp = tempfile.mkdtemp(prefix="xplprog_")
 rows = []
 def dist(d): return dict(sorted(collections.Counter(round(v["score"], 3) for v in d.values()).items()))
@@ -22,7 +26,7 @@ for u in st["units"]:
         m = re.search(r"run_id=(\S+)", open(stt).read())
     if not m: rows.append((u["task"], "starting", 0, u["episodes_per_task"], 0, 0.0, None)); continue
     run_id = m.group(1)
-    src = f"jiamingt@{node}.mit.edu:{ws}/eval_result/RoboDojo/{u['task']}/SANA_WAM/arx_x5/{u['eval_seed']}_ckpt_name={label},action_type={action_type}/{run_id}/_result.json"
+    src = f"{ce_site.host(node)}:{ws}/eval_result/RoboDojo/{u['task']}/{policy}/arx_x5/{u['eval_seed']}_ckpt_name={label},action_type={action_type}/{run_id}/_result.json"
     dst = os.path.join(tmp, u["unit_id"] + ".json")
     p = subprocess.run(["rsync", "-az", "-e", "ssh -o BatchMode=yes -o ConnectTimeout=15", src, dst], capture_output=True, text=True, timeout=120)
     if p.returncode != 0 or not os.path.exists(dst): rows.append((u["task"], "running", 0, u["episodes_per_task"], 0, 0.0, None)); continue

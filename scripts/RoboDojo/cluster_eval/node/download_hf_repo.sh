@@ -3,17 +3,20 @@
 # download_hf_repo.sh -- fetch a WHOLE HF model repo into the shared NFS home, as-is.
 # For checkpoints whose layout is NOT the SANA work_dir one (download_partial_ckpt.sh handles that):
 # e.g. OpenWAM bundles = config.yaml + checkpoint_step_*.safetensors + normalization_stats.npy + tokenizer/.
-# Runs on ONE MIT node (shared home). Env:
+# Runs on ONE node (shared home). Env:
 #   REPO        HF repo id, e.g. logits/openwam_robodojo
-#   LABEL       destination name: ~/checkpoints/huggingface/logits/<LABEL>   (default: basename of REPO)
+#   LABEL       destination name: <CE_CKPT_ROOT>/<LABEL>   (default: basename of REPO)
 #   ALLOW       optional space-separated allow_patterns (default: everything)
 # Verifies every file against the repo's SHA256SUMS when it ships one. Re-runnable (skips complete files).
 # =============================================================================
 set -Eeuo pipefail
-ROOT=${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}
+_CE_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+[[ -f $_CE_HERE/site.env ]] && source "$_CE_HERE/site.env"   # the site configuration deploy.sh copies next to the node scripts
+ROOT=${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to this script (deploy.sh) and no ROBODOJO_ROOT}}
 : "${REPO:?REPO required}"; LABEL=${LABEL:-$(basename "$REPO")}
-DEST=${DEST:-$HOME/checkpoints/huggingface/logits/$LABEL}
-LOGS=$HOME/robodojo_install/logs; mkdir -p "$LOGS" "$DEST"
+DEST=${DEST:-${CE_CKPT_ROOT:-$HOME/checkpoints/huggingface/logits}/$LABEL}
+LOGS=$_CE_HERE/logs; mkdir -p "$LOGS" "$DEST"
 exec > >(tee -a "$LOGS/download_hf_repo.log") 2>&1
 log() { printf '[%s] [%s] %s\n' "$(date '+%F %T')" "$(hostname -s)" "$*"; }
 [[ -f $ROOT/activate_sana_wam.sh ]] || { log "FATAL: $ROOT/activate_sana_wam.sh missing"; exit 1; }

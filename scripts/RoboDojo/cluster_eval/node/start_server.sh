@@ -2,16 +2,19 @@
 # start_server.sh -- start the RoboDojo SANA policy server on THIS node in the
 # background (no Slurm) and print where to watch it.
 #
-#   bash ~/robodojo_install/start_server.sh                 # single-task lane, insert_key
-#   SANA_TASK_SET=A SANA_EPISODES_PER_TASK=25 bash ~/robodojo_install/start_server.sh
-#   SANA_TASK_LIST_FILE=~/tasks.txt SANA_EPISODES_PER_TASK=10 bash ~/robodojo_install/start_server.sh
-#   SANA_SERVER_GPU=3 SANA_RPC_PORT=41000 bash ~/robodojo_install/start_server.sh
+#   bash <CE_REMOTE_INSTALL>/start_server.sh                # single-task lane, insert_key
+#   SANA_TASK_SET=A SANA_EPISODES_PER_TASK=25 bash <CE_REMOTE_INSTALL>/start_server.sh
+#   SANA_TASK_LIST_FILE=~/tasks.txt SANA_EPISODES_PER_TASK=10 bash <CE_REMOTE_INSTALL>/start_server.sh
+#   SANA_SERVER_GPU=3 SANA_RPC_PORT=41000 bash <CE_REMOTE_INSTALL>/start_server.sh
 #
 # Knobs are the sbatch's (SANA_EVAL_TASK / SANA_EVAL_INSTRUCTION / SANA_EVAL_SEED /
 # SANA_TASK_SET / SANA_TASK_LIST_FILE / SANA_EPISODES_PER_TASK / SANA_RPC_PORT ...)
 # plus SANA_SERVER_GPU (default 0) and SANA_EVIDENCE_ROOT (default ~/robodojo_evidence).
 set -euo pipefail
-ROOT=${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}
+_CE_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+[[ -f $_CE_HERE/site.env ]] && source "$_CE_HERE/site.env"   # the site configuration deploy.sh copies next to the node scripts
+ROOT=${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to this script (deploy.sh) and no ROBODOJO_ROOT}}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 source "${ROOT}/activate_sana_wam.sh"

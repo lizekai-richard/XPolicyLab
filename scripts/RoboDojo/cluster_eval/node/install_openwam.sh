@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # install_openwam.sh -- build the node-local `openwam` conda env (OpenWAM policy runtime)
-# on ONE MIT node. Mirrors install_sana_wam.sh's conventions: node-local prefix under
+# on ONE node. Mirrors install_sana_wam.sh's conventions: node-local prefix under
 # $ROOT/envs, caches under $ROOT/.cache, logs under $ROOT/logs + a mirror in the shared home.
 #
 # DELIBERATE CHOICE -- dependencies only, the `openwam` package itself is NOT pip-installed:
@@ -13,18 +13,21 @@
 #   Result: each node gets the deps, every node imports the one shared openwam source.
 #
 # Usage:  bash install_openwam.sh
-# Env:    ROBODOJO_ROOT (default /dataset2/jiamingt/robodojo)  CONDA_BIN  OPENWAM_PREFIX
-#         OPENWAM_ROOT (default /homes/jiamingt/xpl_zekai/XPolicyLab/policy/OpenWAM/OpenWAM)
-#         XPL_ROOT     (default /homes/jiamingt/xpl_zekai/XPolicyLab)
-# Logs:   $ROOT/logs/openwam/install.log, mirror ~/robodojo_install/logs/<host>.openwam.{log,status}
+# Env:    ROBODOJO_ROOT (default CE_NODE_ROOT from site.env)  CONDA_BIN  OPENWAM_PREFIX
+#         OPENWAM_ROOT (default $XPL_ROOT/policy/OpenWAM/OpenWAM)
+#         XPL_ROOT     (default CE_REMOTE_XPL from site.env)
+# Logs:   $ROOT/logs/openwam/install.log, mirror <this dir>/logs/<host>.openwam.{log,status}
 # Final line on success: "OPENWAM ENV READY".
 # =============================================================================
 set -Eeuo pipefail
+_CE_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+[[ -f $_CE_HERE/site.env ]] && source "$_CE_HERE/site.env"   # the site configuration deploy.sh copies next to the node scripts
 SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-ROOT=${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}
+ROOT=${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to this script (deploy.sh) and no ROBODOJO_ROOT}}
 CONDA_BIN=${CONDA_BIN:-$HOME/miniconda3/bin/conda}
 ENV_PREFIX=${OPENWAM_PREFIX:-$ROOT/envs/openwam}
-XPL_ROOT=${XPL_ROOT:-/homes/jiamingt/xpl_zekai/XPolicyLab}
+XPL_ROOT=${XPL_ROOT:-${CE_REMOTE_XPL:?no site.env next to this script (deploy.sh) and no XPL_ROOT}}
 OPENWAM_ROOT=${OPENWAM_ROOT:-$XPL_ROOT/policy/OpenWAM/OpenWAM}
 BENCH_ROOT=$(dirname "$XPL_ROOT")
 CACHE=$ROOT/.cache

@@ -1,4 +1,12 @@
-# RoboDojo official evaluation, parallelised into two-GPU jobs
+# RoboDojo official evaluation: pipeline internals
+
+> How to run a campaign: [../RUNBOOK.md](../RUNBOOK.md) (site setup, `run.sh` / `campaign.sh`, incidents); file formats:
+> [../RESULTS_FORMAT.md](../RESULTS_FORMAT.md). This document describes the master / worker machinery underneath and its
+> history. Its examples use the reference site's names (`l5`, `/homes/jiamingt/...`, `~/robodojo_master`); with a site
+> configuration they are `CE_NODES`, `CE_SHARED_HOME`, `CE_MASTER_ROOT`, and the drivers pass them for you. The early
+> limits it mentions (dynamic-instruction and support-arm tasks excluded, two-GPU slots) were lifted later: every run
+> since 2026-09-24 covers all 42 tasks on single-GPU slots.
+
 
 Protocol (paper arXiv:2607.04434 §3.1.3; pinned checkout `_task.yml`,
 `scripts/internal/summarize_result.py`): 42 canonical tasks in 5 dimensions
@@ -109,7 +117,7 @@ bash start_master.sh official_seed0_ep5s32845 --wait-for-checkpoint 21600 \
 tail -f ~/robodojo_master/official_seed0_dyn/master.log ; cat ~/robodojo_master/official_seed0_dyn/STATUS.md
 ```
 
-## Pieces (static plan mode)
+## Pieces (static plan mode; scripts in `legacy/`)
 
 | file | runs on | role |
 |---|---|---|

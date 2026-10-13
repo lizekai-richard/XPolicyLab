@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install_node.sh -- RoboDojo simulator stack, per-node installer for the MIT
-# lN.mit.edu RTX A6000 nodes (user jiamingt).
+# install_node.sh -- RoboDojo simulator stack, per-node installer for the GPU
+# nodes of the site in site.env (written for the MIT lN RTX A6000 nodes).
 #
-# Everything lands on NODE-LOCAL disk (default /dataset2/jiamingt/robodojo) so
+# Everything lands on NODE-LOCAL disk (default CE_NODE_ROOT from site.env) so
 # the four nodes never contend on the shared NFS home. Only this script
 # directory and a small per-host mirror of the log/status live in ~/.
 #
@@ -17,7 +17,7 @@
 #   bash install_node.sh --from STEP     clear markers from STEP onward, then run
 #   bash install_node.sh --only STEP     run exactly one step (marker ignored)
 #   bash install_node.sh --list          list steps in order
-# Env overrides: ROBODOJO_ROOT (default /dataset2/jiamingt/robodojo), CONDA_BIN
+# Env overrides: ROBODOJO_ROOT (default CE_NODE_ROOT from site.env), CONDA_BIN
 #
 # Re-running is safe: each step writes a marker in $ROOT/state when it
 # finishes and is skipped next time. Logs: $ROOT/logs/<step>.log plus
@@ -25,10 +25,13 @@
 # kept in <this dir>/logs/<host>.log and <host>.status on NFS.
 # =============================================================================
 set -Eeuo pipefail
+_CE_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+[[ -f $_CE_HERE/site.env ]] && source "$_CE_HERE/site.env"   # the site configuration deploy.sh copies next to the node scripts
 
 SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
-ROOT=${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}
+ROOT=${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to this script (deploy.sh) and no ROBODOJO_ROOT}}
 CONDA_BIN=${CONDA_BIN:-$HOME/miniconda3/bin/conda}
 
 CHECKOUT=$ROOT/RoboDojo-official-clone-20260823

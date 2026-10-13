@@ -13,15 +13,18 @@
 #     NFS flock because the repo lives in the shared home
 #
 # Usage:  bash install_sana_wam.sh [--from STEP | --only STEP | --list]
-# Env:    ROBODOJO_ROOT (default /dataset2/jiamingt/robodojo)  CONDA_BIN
+# Env:    ROBODOJO_ROOT (default CE_NODE_ROOT from site.env)  CONDA_BIN
 #         SANA_REPO (default $HOME/Sana)  SANA_WAM_PREFIX (default $ROOT/envs/sana-wam)
 # Logs:   $ROOT/logs/sana_wam/<step>.log, mirror <this dir>/logs/<host>.sana_wam.{log,status}
 # =============================================================================
 set -Eeuo pipefail
+_CE_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+[[ -f $_CE_HERE/site.env ]] && source "$_CE_HERE/site.env"   # the site configuration deploy.sh copies next to the node scripts
 
 SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
-ROOT=${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}
+ROOT=${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to this script (deploy.sh) and no ROBODOJO_ROOT}}
 CONDA_BIN=${CONDA_BIN:-$HOME/miniconda3/bin/conda}
 SANA_REPO=${SANA_REPO:-$HOME/Sana}
 ENV_NAME=sana-wam
@@ -191,7 +194,7 @@ export HF_TOKEN_PATH=\$HOME/.hf_token
 # served checkpoint + VAE defaults (names = run_learned_server_only.sbatch env contract); the eval master
 # overrides the checkpoint per run (SANA_EVAL_CHECKPOINT_ROOT) and run_unit.sh points the input-cache dir
 # at <checkpoint>/json_cache when the snapshot ships one
-export SANA_POLICY_CHECKPOINT_ROOT=\$HOME/checkpoints/huggingface/logits/sana_rwm_policy_from_pretrained_robodojo_320px_epoch4_step25000
+export SANA_POLICY_CHECKPOINT_ROOT=${CE_CKPT_ROOT:-\$HOME/checkpoints/huggingface/logits}/sana_rwm_policy_from_pretrained_robodojo_320px_epoch4_step25000
 export SANA_POLICY_VAE_PRETRAINED=$SANA_REPO/output/pretrained_models/LTX-2.3-Diffusers
 export SANA_NORMALIZATION_INPUT_CACHE_DIR=\$SANA_POLICY_CHECKPOINT_ROOT/json_cache
 EOF

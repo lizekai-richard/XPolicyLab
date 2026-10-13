@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Read-only status of all nodes via ONE ssh to l5: the installer mirrors its
-# status stream and master log into the shared home, so l5 sees every node.
+# Read-only status of all nodes via ONE ssh to VIA (default CE_GATEWAY): the installer mirrors its
+# status stream and master log into the shared home, so that node sees every node.
 set -u
-VIA=${VIA:-l5}
-ssh -o BatchMode=yes -o ConnectTimeout=10 "jiamingt@$VIA.mit.edu" '
-cd ~/robodojo_install/logs 2>/dev/null || { echo "no logs yet"; exit 0; }
+# shellcheck source=../lib/site.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/site.sh" || exit 2
+VIA=${VIA:-$CE_GATEWAY}
+ssh -o BatchMode=yes -o ConnectTimeout=10 "$(ce_host "$VIA")" '
+cd '"$CE_REMOTE_INSTALL"'/logs 2>/dev/null || { echo "no logs yet"; exit 0; }
 for s in *.status; do
   [ -e "$s" ] || continue
   h=${s%.status}

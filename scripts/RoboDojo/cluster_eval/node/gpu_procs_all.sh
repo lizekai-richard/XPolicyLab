@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Read-only: who holds GPU memory on each node (pid -> user, elapsed, command). Results: ~/robodojo_install/logs/<host>.gpuprocs.txt
+# Read-only: who holds GPU memory on each node (pid -> user, elapsed, command). Results: <CE_REMOTE_INSTALL>/logs/<host>.gpuprocs.txt
 set -u
-HOSTS=${HOSTS:-"l5 l7 l8 l25"}
+# shellcheck source=../lib/site.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/site.sh" || exit 2
+HOSTS=${HOSTS:-$CE_NODES}
 for h in $HOSTS; do
-  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "jiamingt@$h.mit.edu" 'out=~/robodojo_install/logs/$(hostname -s).gpuprocs.txt; {
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$(ce_host "$h")" 'out='"$CE_REMOTE_INSTALL"'/logs/$(hostname -s).gpuprocs.txt; {
     echo "== $(hostname -s) $(date -u +%FT%TZ)"
     nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader
     echo "-- processes on GPUs"

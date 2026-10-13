@@ -3,7 +3,7 @@
 # download_weights.sh -- fetch everything the RoboDojo SANA policy server loads
 # at start-up into the SHARED home (run on ONE node, e.g. l5; all four see it):
 #   1. policy checkpoint root   <- private HF repo $CKPT_REPO (needs ~/.hf_token)
-#        -> ~/checkpoints/huggingface/<repo>   (mirrors the cluster layout)
+#        -> <CE_CKPT_ROOT>/<repo name>   (mirrors the cluster layout)
 #   2. LTX-2.3 video VAE        <- Efficient-Large-Model/LTX-2.3-Diffusers, vae/ only
 #        -> $SANA_REPO/output/pretrained_models/LTX-2.3-Diffusers  (launcher default)
 #   3. gemma-2-2b-it text enc.  <- Efficient-Large-Model/gemma-2-2b-it
@@ -18,16 +18,19 @@
 # normalization gate would refuse to start.
 # =============================================================================
 set -Eeuo pipefail
-ROOT=${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}
+_CE_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+[[ -f $_CE_HERE/site.env ]] && source "$_CE_HERE/site.env"   # the site configuration deploy.sh copies next to the node scripts
+ROOT=${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to this script (deploy.sh) and no ROBODOJO_ROOT}}
 SANA_REPO=${SANA_REPO:-$HOME/Sana}
 CKPT_REPO=${CKPT_REPO:-logits/sana_rwm_policy_from_pretrained_robodojo_320px_epoch4_step25000}
-CKPT_ROOT=${CKPT_ROOT:-$HOME/checkpoints/huggingface/$CKPT_REPO}
+CKPT_ROOT=${CKPT_ROOT:-${CE_CKPT_ROOT:-$HOME/checkpoints/huggingface/logits}/$(basename "$CKPT_REPO")}
 SKIP_SHARED=${SKIP_SHARED:-auto}   # 1 = policy checkpoint only; auto = skip VAE/text encoder when both are already complete
 VAE_REPO=Efficient-Large-Model/LTX-2.3-Diffusers
 VAE_DIR=$SANA_REPO/output/pretrained_models/LTX-2.3-Diffusers
 TE_REPO=Efficient-Large-Model/gemma-2-2b-it
 TE_DIR=$SANA_REPO/output/pretrained_models/text_encoder/gemma-2-2b-it
-MIRROR=$HOME/robodojo_install/logs
+MIRROR=$_CE_HERE/logs
 mkdir -p "$MIRROR" "$(dirname "$CKPT_ROOT")" "$(dirname "$VAE_DIR")" "$(dirname "$TE_DIR")"
 exec > >(tee -a "$MIRROR/download_weights.log") 2>&1
 log() { printf '[%s] [%s] %s\n' "$(date '+%F %T')" "$(hostname -s)" "$*"; }

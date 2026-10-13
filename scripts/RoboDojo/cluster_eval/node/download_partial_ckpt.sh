@@ -2,22 +2,25 @@
 # =============================================================================
 # download_partial_ckpt.sh -- assemble an evaluation checkpoint dir from ONE sub-directory of a training-run HF repo
 # (work_dir dumps hold many checkpoints: work_dir/checkpoints/<epoch_step>/model/pytorch_model_fsdp.bin).
-# Runs on ONE MIT node (shared home). Env:
+# Runs on ONE node (shared home). Env:
 #   CKPT_REPO   HF repo id, e.g. logits/sana_rwm_policy_from_pretrained_robodojo_320px_1e-4_cosine_clip1_2node
 #   CKPT_SUBDIR path inside the repo holding model/pytorch_model_fsdp.bin, e.g. work_dir/checkpoints/epoch_8_step_50000;
 #               'auto' (or empty) = the repo root when it holds model/pytorch_model_fsdp.bin, else checkpoints/LATEST of a
 #               live resume bundle, else the single */model/pytorch_model_fsdp.bin directory in the repo
-#   CKPT_LABEL  name of the assembled snapshot: ~/checkpoints/huggingface/logits/<CKPT_LABEL>
+#   CKPT_LABEL  name of the assembled snapshot: <CE_CKPT_ROOT>/<CKPT_LABEL>
 # Result layout (what run_unit*.sh / master.py expect): config.yaml, README.md, model/pytorch_model_fsdp.bin,
 # normalization/*.json (+ json_cache/ input cache). config/README/normalization are taken from the repo when present
 # (nearest to CKPT_SUBDIR first), otherwise normalization + json_cache are copied from a sibling snapshot whose
 # config.yaml uses the SAME training data_dir (recorded in README.md). Re-runnable.
 # =============================================================================
 set -Eeuo pipefail
-ROOT=${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}
+_CE_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+[[ -f $_CE_HERE/site.env ]] && source "$_CE_HERE/site.env"   # the site configuration deploy.sh copies next to the node scripts
+ROOT=${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to this script (deploy.sh) and no ROBODOJO_ROOT}}
 : "${CKPT_REPO:?CKPT_REPO required}"; CKPT_SUBDIR=${CKPT_SUBDIR:-auto}; : "${CKPT_LABEL:?CKPT_LABEL required}"
-CKPT_ROOT=${CKPT_ROOT:-$HOME/checkpoints/huggingface/logits/$CKPT_LABEL}
-MIRROR=$HOME/robodojo_install/logs; mkdir -p "$MIRROR" "$CKPT_ROOT"
+CKPT_ROOT=${CKPT_ROOT:-${CE_CKPT_ROOT:-$HOME/checkpoints/huggingface/logits}/$CKPT_LABEL}
+MIRROR=$_CE_HERE/logs; mkdir -p "$MIRROR" "$CKPT_ROOT"
 exec > >(tee -a "$MIRROR/download_partial_ckpt.log") 2>&1
 log() { printf '[%s] [%s] %s\n' "$(date '+%F %T')" "$(hostname -s)" "$*"; }
 [[ -f $ROOT/activate_sana_wam.sh ]] || { log "FATAL: $ROOT/activate_sana_wam.sh missing"; exit 1; }

@@ -14,7 +14,7 @@
 #                                    result.json    written once at the end: complete|incomplete|
 #                                                   server_fail|server_timeout|port_busy|ckpt_missing|aborted|prologue_fail
 #                                    server/ client/ unit.log
-# Env: ROBODOJO_ROOT (/dataset2/jiamingt/robodojo), INSTALL_DIR (~/robodojo_install),
+# Env: ROBODOJO_ROOT (default CE_NODE_ROOT of <INSTALL_DIR>/site.env), INSTALL_DIR (default this script's parent dir),
 #      SERVER_STARTUP_TIMEOUT (3000), EVAL_DRY_RUN=1 (no GPU),
 #      SANA_EVAL_CHECKPOINT_ROOT (master-selected policy checkpoint snapshot; overrides the node's
 #      activate default SANA_POLICY_CHECKPOINT_ROOT; validated here before any GPU work)
@@ -25,8 +25,11 @@
 set -Eeuo pipefail
 (( $# == 9 || $# == 10 )) || { echo "usage: run_unit.sh RUN_ROOT UNIT_ID TASK SEED EPS SERVER_GPU CLIENT_GPU RPC_PORT WS_PORT [ATTEMPT]" >&2; exit 64; }
 RUN_ROOT=$1; UNIT_ID=$2; TASK=$3; SEED=$4; EPS=$5; SERVER_GPU=$6; CLIENT_GPU=$7; RPC_PORT=$8; WS_PORT=$9; ATTEMPT=${10:-1}
-ROOT=${ROBODOJO_ROOT:-/dataset2/jiamingt/robodojo}
-INSTALL_DIR=${INSTALL_DIR:-$HOME/robodojo_install}
+SITE_ENV=${CE_SITE_NODE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/site.env}
+# shellcheck disable=SC1090
+if [[ -f $SITE_ENV ]]; then source "$SITE_ENV"; fi
+ROOT=${ROBODOJO_ROOT:-${CE_NODE_ROOT:?no site.env next to the worker (run deploy.sh) and no ROBODOJO_ROOT}}
+INSTALL_DIR=${INSTALL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 SERVER_STARTUP_TIMEOUT=${SERVER_STARTUP_TIMEOUT:-3000}
 HANDOFF_TIMEOUT=${HANDOFF_TIMEOUT:-$((SERVER_STARTUP_TIMEOUT + 1200))}
 EPISODE_SECONDS=${EPISODE_SECONDS:-600}      # floor per episode

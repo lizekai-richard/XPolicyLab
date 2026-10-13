@@ -8,7 +8,7 @@ Then runs one `predict` on synthetic RGB frames and reports the chunk it produce
 
 Env / args:
   --ckpt        checkpoint snapshot dir (required)
-  --xpl-root    XPolicyLab checkout holding policy/SANA_MOT and policy/SANA_WAM (default ~/xpl_zekai/XPolicyLab)
+  --xpl-root    XPolicyLab checkout holding policy/SANA_MOT and policy/SANA_WAM (default $CE_REMOTE_XPL, else ~/xpl_zekai/XPolicyLab)
   --text-encoder / --vae   encoder paths (default: $SANA_REPO/output/pretrained_models/...)
   --device cuda|cpu        default cuda when available
   --steps N                Euler steps for the probe (default 10, the evaluated setting)
@@ -29,7 +29,7 @@ import numpy as np
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ckpt", required=True)
-    parser.add_argument("--xpl-root", default=os.path.expanduser("~/xpl_zekai/XPolicyLab"))
+    parser.add_argument("--xpl-root", default=os.environ.get("CE_REMOTE_XPL", os.path.expanduser("~/xpl_zekai/XPolicyLab")))
     parser.add_argument("--text-encoder", default=None)
     parser.add_argument("--vae", default=None)
     parser.add_argument("--device", default=None)

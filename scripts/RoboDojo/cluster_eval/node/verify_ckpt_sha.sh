@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Run on x5: LABEL=<snapshot> WEIGHTS_SHA=<hex> [CONFIG_SHA=<hex>] [NORM_SHA=<hex>] [HOST=l5] bash verify_ckpt_sha.sh
+# Run on the control host: LABEL=<snapshot> WEIGHTS_SHA=<hex> [CONFIG_SHA=<hex>] [NORM_SHA=<hex>] [HOST=<node>, default CE_GATEWAY] bash verify_ckpt_sha.sh
 # sha256-verifies an assembled checkpoint snapshot on the shared NFS home against the digests the upstream repo
 # published (download_partial_ckpt.sh checks presence and the normalization input cache, not the weight file itself).
 set -u
+# shellcheck source=../lib/site.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/site.sh" || exit 2
 : "${LABEL:?LABEL=<snapshot dir name> required}"; : "${WEIGHTS_SHA:?WEIGHTS_SHA=<hex> required}"
-HOST=${HOST:-l5}; CONFIG_SHA=${CONFIG_SHA:-}; NORM_SHA=${NORM_SHA:-}
-ssh -n -o BatchMode=yes -o ConnectTimeout=20 "jiamingt@$HOST.mit.edu" "
+HOST=${HOST:-$CE_GATEWAY}; CONFIG_SHA=${CONFIG_SHA:-}; NORM_SHA=${NORM_SHA:-}
+ssh -n -o BatchMode=yes -o ConnectTimeout=20 "$(ce_host "$HOST")" "
   set -u
-  CK=/homes/jiamingt/checkpoints/huggingface/logits/$LABEL
+  CK=$CE_CKPT_ROOT/$LABEL
   echo \"== \$CK ==\"; ls -la \"\$CK\" \"\$CK/model\" \"\$CK/normalization\" 2>&1 | sed 's/^/   /'
   check() {  # <file> <expected sha or empty>
     [ -f \"\$1\" ] || { echo \"MISSING \$1\"; return 1; }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""compare_runs.py RUN1 RUN2 ... [--results-root ~/zekail/robodojo_results] -- per-task comparison table across runs.
+"""compare_runs.py RUN1 RUN2 ... [--results-root CE_RESULTS_ROOT] -- per-task comparison table across runs.
 
 Reads runs/<run>/per_unit/<unit>/a<N>/_result.json (latest complete attempt per unit; generalization standard+random
 merged into one 50-episode row), prints markdown with success % / avg score % per task per run, dimension means, a
@@ -7,7 +7,7 @@ leaderboard view (runs as rows, dimensions as columns, generalization split into
 way the official leaderboard shows it) and the official 'mean of dimension means' overall, and marks tasks whose
 reward has no partial-credit stages (binary).
 """
-import argparse, glob, json, os, collections
+import argparse, glob, json, os, sys, collections
 BINARY = {"align_blocks","general_pickup","make_kong","match_and_pick_from_conveyor","pick_from_conveyor_by_image","play_Xylophone","plug_in_charger",
           "pour_balls_into_vase","pour_liquid_into_cup","press_by_number","push_T","solve_equation","sort_nesting_dolls_by_size","swap_blocks","swap_T","sweep_blocks"}
 GEN = "Generalization"
@@ -17,10 +17,14 @@ DIMS = {GEN: ["stack_bowls","push_T","pack_objects_into_box","fold_clothes","han
         "Memory": ["cover_blocks","match_and_pick_from_conveyor","swap_blocks","swap_T","press_by_number","imitate_sorting_sequence"],
         "Open": ["align_blocks","general_pickup","stack_blocks_by_language","solve_equation","classify_objects_by_language","pick_from_conveyor_by_image","store_tools_in_toolbox","pour_by_language"]}
 ap = argparse.ArgumentParser(); ap.add_argument("runs", nargs="+", help="RUN, RUN@setting_label, RUN_A+RUN_B (merge), all composable")
-ap.add_argument("--results-root", default=os.path.expanduser("~/zekail/robodojo_results"))
-ap.add_argument("--runs-subdir", default="runs", help="'runs' for the consolidated tree, '.' to read master state dirs (~/robodojo_master) directly")
+ap.add_argument("--results-root", default=None, help="default CE_RESULTS_ROOT (lib/site.sh)")
+ap.add_argument("--runs-subdir", default="runs", help="'runs' for the consolidated tree, '.' to read master state dirs (CE_MASTER_ROOT) directly")
 ap.add_argument("--out", default=None)
 a = ap.parse_args()
+if a.results_root is None:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+    import ce_site  # noqa: E402  (the CE_* site configuration)
+    a.results_root = ce_site.get("CE_RESULTS_ROOT")
 
 def agg(items):
     """episodes/successes/SR%/score% over a list of (success, score); None when the half was not run."""

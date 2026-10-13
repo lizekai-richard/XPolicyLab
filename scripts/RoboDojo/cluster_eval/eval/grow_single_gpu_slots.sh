@@ -7,11 +7,13 @@
 # Each addition goes to the run with fewer slots that still has more queued units than idle slots. Never kills anything.
 # Exits when both masters have ended.
 set -u
-PY=$HOME/miniforge3/envs/sana-wam/bin/python
+# shellcheck source=../lib/site.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/site.sh" || exit 2
+PY=$CE_PY
 # usage: RUNS="<run> <run> ..." [PORT_RPC=63250 PORT_WS=65250 (the runs' base + 50)] bash grow_single_gpu_slots.sh
-read -r -a RUNS <<<"${RUNS:?RUNS=\"run1 run2\" (dirs under ~/robodojo_master)}"
+read -r -a RUNS <<<"${RUNS:?RUNS=\"run1 run2\" (dirs under CE_MASTER_ROOT)}"
 PORT_RPC=${PORT_RPC:-63250}; PORT_WS=${PORT_WS:-65250}
-NODES=${NODES:-"l1 l2 l3 l5 l6 l7 l8 l9 l25 l26 l27 l30"}
+NODES=${NODES:-$CE_NODES}
 INTERVAL=${INTERVAL:-120}
 MIN_FREE=${MIN_FREE:-600}
 declare -A free_since
@@ -19,7 +21,7 @@ log(){ echo "[$(date -u +%FT%TZ)] $*"; }
 
 scan(){ # prints 'node g usedMiB listeners' for every healthy CUDA device of every node
   for h in $NODES; do
-    ssh -n -o BatchMode=yes -o ConnectTimeout=10 "jiamingt@$h.mit.edu" '
+    ssh -n $CE_SSH_OPTS "$(ce_host "$h")" '
       healthy=($(nvidia-smi --query-gpu=index,pstate --format=csv,noheader | awk -F", " "\$2 !~ /reset/ {print \$1}"))
       for g in $(seq 0 $((${#healthy[@]} - 1))); do
         used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i ${healthy[$g]} | tr -d " ")
@@ -29,7 +31,7 @@ scan(){ # prints 'node g usedMiB listeners' for every healthy CUDA device of eve
   done
 }
 held(){ # node:gpu of every slot of every live master
-  "$PY" - "$HOME/robodojo_master" <<'PYEOF'
+  "$PY" - "$CE_MASTER_ROOT" <<'PYEOF'
 import json, os, pathlib, sys
 out = set()
 for pidf in pathlib.Path(sys.argv[1]).glob("*/master.pid"):
@@ -44,7 +46,7 @@ PYEOF
 }
 need(){ # per run: 'run slots queued idle alive'
   for r in "${RUNS[@]}"; do
-    "$PY" - "$HOME/robodojo_master/$r" <<'PYEOF'
+    "$PY" - "$CE_MASTER_ROOT/$r" <<'PYEOF'
 import json, os, pathlib, sys
 d = pathlib.Path(sys.argv[1]); alive = 0
 try: os.kill(int((d / "master.pid").read_text().strip()), 0); alive = 1
@@ -87,7 +89,7 @@ while :; do
     for r in "${RUNS[@]}"; do
       [[ -n ${add[$r]} ]] || continue
       spec=$(echo "${add[$r]}" | tr ' ' '\n' | sed '/^$/d' | awk -F: '{a[$1]=a[$1] (a[$1] ? "," : "") $2} END {for (n in a) printf "%s:%s;", n, a[n]}' | sed 's/;$//')
-      d=$HOME/robodojo_master/$r/control; mkdir -p "$d"
+      d=$CE_MASTER_ROOT/$r/control; mkdir -p "$d"
       if [[ -n ${DRY:-} ]]; then log "[dry] would add_slots $spec to $r"; continue; fi
       printf '%s\n' "$spec" >"$d/add_slots.tmp" && mv -f "$d/add_slots.tmp" "$d/add_slots"
       log "add_slots $(echo "$r" | sed 's/official_seed0_//; s/_xpl.*//') '$spec' (slots now ${slots[$r]})"

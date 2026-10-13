@@ -21,8 +21,8 @@ so `--resume` continues after a master restart; workers never depend on the
 master being alive.
 
 usage (on x5):
-  master.py --run-root /homes/jiamingt/robodojo_eval/<run> --checkout <RoboDojo clone>
-            [--nodes l5,l7,l8,l25] [--slots-per-node 4] [--seeds 0] [--tasks a,b]
+  master.py --run-root <CE_EVAL_ROOT>/<run> --checkout <RoboDojo clone>   (start it with start_master.sh, which fills these in)
+            [--nodes n1,n2] [--slots-per-node 4] [--seeds 0] [--tasks a,b]
             [--episodes-per-task N] [--no-random] [--max-attempts 3] [--poll 60]
             [--heartbeat-timeout 900] [--resume] [--dry-run]
   (with --resume the slots come from the saved state; nodes new to the run, and pairs named explicitly in
@@ -50,8 +50,9 @@ sys.path.insert(0, str(HERE))
 from plan_eval import load_tasks  # noqa: E402  (same enumeration rules as the static planner)
 
 SLOT_LEVEL = ("server_fail", "server_timeout", "port_busy", "stale", "aborted", "prologue_fail", "dispatch", "ckpt_missing")
-# the policy checkpoint every unit of a run serves (node-side path on the shared home); the run keeps it in state.json
-DEFAULT_CHECKPOINT_ROOT = "/homes/jiamingt/checkpoints/huggingface/logits/sana_rwm_policy_from_pretrained_robodojo_320px_epoch4_step25000"
+# site configuration (cluster_eval/lib/ce_site.py: the CE_* values of site.env)
+sys.path.insert(0, str(HERE.parent / "lib"))
+import ce_site  # noqa: E402
 # a checkpoint snapshot is usable once these exist (plus one normalization/*.json) and no HF download is in flight
 CHECKPOINT_REQUIRED = ("config.yaml", "README.md", "model/pytorch_model_fsdp.bin")
 # A non-SANA policy ships a different bundle. Keyed by the SANA_EVAL_XPL_POLICY value passed through
@@ -564,7 +565,7 @@ class Master:
                       + f"RWM_EVAL_POLICY_ACCELERATION={shlex.quote(self.a.policy_acceleration)} "
                       f"SANA_PREDICTION_VIDEOS={1 if self.a.prediction_videos == 'on' else 0} "
                       f"SANA_ROBODOJO_LAZY_RENDER={1 if self.a.lazy_render == 'on' else 0} "
-                      f"nohup setsid bash ~/robodojo_install/eval/{self.a.worker} {argv} > {shlex.quote(udir_a)}/nohup.log 2>&1 < /dev/null & "
+                      f"nohup setsid bash {self.a.remote_install}/eval/{self.a.worker} {argv} > {shlex.quote(udir_a)}/nohup.log 2>&1 < /dev/null & "
                       f"sleep 2; kill -0 $! 2>/dev/null && echo dispatched $! || echo died")
             r = self.ssh(slot["node"], remote, timeout=90)
             if r is not None and r.returncode == 0 and "dispatched" in r.stdout:
@@ -774,7 +775,7 @@ class Master:
                 if not self.dry_root:
                     udir = f"{self.run_root}/units/{d['unit']}"
                     self.ssh(slot["node"], f"p=$(cat {shlex.quote(udir)}/unit.pid 2>/dev/null); [ -n \"$p\" ] && pkill -KILL -P \"$p\"; "
-                                          f"kill -KILL \"$p\" 2>/dev/null; for s in {shlex.quote(udir)}/a*/server; do bash ~/robodojo_install/stop_server.sh \"$s\" >/dev/null 2>&1; done; echo ok", timeout=120)
+                                          f"kill -KILL \"$p\" 2>/dev/null; for s in {shlex.quote(udir)}/a*/server; do bash {self.a.remote_install}/stop_server.sh \"$s\" >/dev/null 2>&1; done; echo ok", timeout=120)
                 slot["draining"] = None
                 self.free_slot_ports(slot, "after SIGKILL")
 
@@ -961,7 +962,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-root", required=True, help="node-side path on the shared home, must contain 'robodojo'")
     ap.add_argument("--checkout", required=True, help="RoboDojo clone on THIS machine (for task enumeration)")
-    ap.add_argument("--nodes", default="l5,l7,l8,l25")
+    ap.add_argument("--nodes", default=None, help="comma list of nodes, also the pull order (default CE_NODES)")
     ap.add_argument("--slots-per-node", type=int, default=4)
     ap.add_argument("--slot-offset", type=int, default=0, help="first GPU pair index to use on each node (0 = GPUs 0/1); lets several masters share a node")
     ap.add_argument("--node-pairs", default=None,
@@ -1024,14 +1025,14 @@ def main() -> int:
                     help="server-side RWM_EVAL_POLICY_ACCELERATION preset (rwm/zekai-merge): fused/fused_fp8 need SM90 (H100); "
                          "fused_portable is the Triton/torch subset for the A6000s; success rates are not comparable across presets")
     ap.add_argument("--checkpoint-root", default=None,
-                    help=f"node-side absolute path of the policy checkpoint snapshot every unit serves (default {DEFAULT_CHECKPOINT_ROOT}); "
+                    help="node-side absolute path of the policy checkpoint snapshot every unit serves (required for a new run; "
                          "recorded in state.json -- a resumed run keeps its own checkpoint")
     ap.add_argument("--worker", default="run_unit.sh", choices=("run_unit.sh", "run_unit_xpl.sh"),
-                    help="node-side worker script under ~/robodojo_install/eval/: run_unit.sh = the SANA RPC server lane; "
+                    help="node-side worker script under <--remote-install>/eval/: run_unit.sh = the SANA RPC server lane; "
                          "run_unit_xpl.sh = the official XPolicyLab websocket lane (an in-process adapter: policy/SANA_WAM by "
                          "default, --worker-env SANA_EVAL_XPL_POLICY=SANA_MOT|OpenWAM for the others)")
     ap.add_argument("--xpl-root", default=None,
-                    help="node-side path of the XPolicyLab checkout for run_unit_xpl.sh (default the worker's own: ~/xpl_zekai/XPolicyLab)")
+                    help="node-side path of the XPolicyLab checkout for run_unit_xpl.sh (default the worker's own: CE_REMOTE_XPL)")
     ap.add_argument("--worker-env", default=None,
                     help="extra space-separated KEY=VALUE pairs exported into every worker's environment "
                          "(reach the server and client processes), e.g. 'DISABLE_XFORMERS=1'")
@@ -1051,23 +1052,30 @@ def main() -> int:
     # Runs started with other bases keep them across --resume (slots live in state.json).
     ap.add_argument("--rpc-port-base", type=int, default=61000)
     ap.add_argument("--ws-port-base", type=int, default=62000)
-    ap.add_argument("--ssh-user", default="jiamingt")
-    ap.add_argument("--ssh-domain", default=".mit.edu")
-    ap.add_argument("--state-dir", default=None, help="default ~/robodojo_master/<run name>")
+    ap.add_argument("--ssh-user", default=None, help="default CE_SSH_USER")
+    ap.add_argument("--ssh-domain", default=None, help="default CE_SSH_DOMAIN")
+    ap.add_argument("--remote-install", default=None,
+                    help="node-side directory holding eval/<worker> and stop_server.sh (default CE_REMOTE_INSTALL; deploy.sh fills it)")
+    ap.add_argument("--state-dir", default=None, help="default CE_MASTER_ROOT/<run name>")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="no ssh: units run locally via run_unit.sh EVAL_DRY_RUN=1")
     ap.add_argument("--dry-sleep", type=float, default=2.0)
     a = ap.parse_args()
     if "robodojo" not in a.run_root:
         sys.exit("--run-root must contain 'robodojo'")
-    a.nodes = [n.strip() for n in a.nodes.split(",") if n.strip()]
+    a.nodes = [n.strip() for n in (a.nodes or ",".join(ce_site.get("CE_NODES").split())).split(",") if n.strip()]
     a.checkpoint_root_explicit = a.checkpoint_root is not None
-    a.checkpoint_root = (a.checkpoint_root or DEFAULT_CHECKPOINT_ROOT).rstrip("/")
+    if a.checkpoint_root is None and not a.resume and not a.dry_run:
+        sys.exit("--checkpoint-root is required for a new run (<CE_CKPT_ROOT>/<label>)")
+    a.checkpoint_root = (a.checkpoint_root or "/resumed-run-keeps-its-own-checkpoint").rstrip("/")
     if not a.checkpoint_root.startswith("/"):
         sys.exit("--checkpoint-root must be an absolute node-side path (no ~)")
     if a.wait_for_checkpoint < 0:
         sys.exit("--wait-for-checkpoint must be >= 0")
-    a.state_dir = a.state_dir or f"~/robodojo_master/{Path(a.run_root).name}"
+    a.ssh_user = a.ssh_user or ce_site.get("CE_SSH_USER")
+    a.ssh_domain = a.ssh_domain if a.ssh_domain is not None else ce_site.get("CE_SSH_DOMAIN")
+    a.remote_install = (a.remote_install or ce_site.get("CE_REMOTE_INSTALL")).rstrip("/")
+    a.state_dir = a.state_dir or str(Path(ce_site.get("CE_MASTER_ROOT")) / Path(a.run_root).name)
     return Master(a).run()
 
 

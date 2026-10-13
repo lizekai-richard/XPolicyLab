@@ -32,8 +32,8 @@ become the run's tail (4-8 h). Once the queue is empty and GPUs sit idle, this t
 The cut is fixed when the shards are launched (the layout after the one in progress), so no result decides which copy
 of a layout counts: the sequential unit's layouts at or above the cut are discarded even if it finished them.
 
-usage: tail_shards.py --run RUN --driver campaigns/<driver>.sh --task TASK [--task TASK2] <plan|launch|status|more-substitutes|invalidate|fill|fill-status|assemble>
-State per task: ~/robodojo_master/<RUN>/tail_shards/<task>.json.
+usage: tail_shards.py --run RUN --driver eval/run.sh [--policy POLICY] --task TASK [--task TASK2] <plan|launch|status|more-substitutes|invalidate|fill|fill-status|assemble>
+State per task: <CE_MASTER_ROOT>/<RUN>/tail_shards/<task>.json.
 """
 
 from __future__ import annotations
@@ -51,8 +51,10 @@ import time
 
 HOME = os.path.expanduser("~")
 EVAL = os.path.dirname(os.path.abspath(__file__))
-NFS_HOST = f"jiamingt@{os.environ.get('NFS_GATEWAY', 'l7')}.mit.edu"   # l5 degraded 2026-10-12 (load ~700, NFS D-state)
-NODE_WS = os.environ.get("SANA_EVAL_XPL_WS", "/dataset2/jiamingt/robodojo/xpl_zekai_ws")  # run_unit_xpl.sh XPL_WS (node-local); a driver serving another adapter copy exports its own workspace
+sys.path.insert(0, os.path.join(os.path.dirname(EVAL), "lib"))
+import ce_site  # noqa: E402  (the CE_* site configuration)
+NFS_HOST = ce_site.gateway()                                  # the gateway into the shared home (CE_GATEWAY)
+NODE_WS = os.environ.get("SANA_EVAL_XPL_WS", ce_site.get("CE_NODE_XPL_WS"))  # run_unit_xpl.sh XPL_WS (node-local); a driver serving another adapter copy exports its own workspace
 PORT_BASE_RPC, PORT_BASE_WS = 62700, 64700                    # tail shards: 62700 + g / 64700 + g on a node (no campaign uses it)
 SSH = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
 
@@ -69,14 +71,15 @@ def sh(cmd: list[str], timeout: int = 300, check: bool = False) -> subprocess.Co
 
 
 def ssh(node: str, script: str, timeout: int = 300) -> subprocess.CompletedProcess:
-    return sh(SSH + [f"jiamingt@{node}.mit.edu", script], timeout=timeout)
+    return sh(SSH + [ce_site.host(node), script], timeout=timeout)
 
 
 class Run:
-    def __init__(self, run: str, driver: str, seed: int | None = None):
+    def __init__(self, run: str, driver: str, seed: int | None = None, policy: str | None = None):
         self.run = run
-        self.state_dir = os.path.join(HOME, "robodojo_master", run)
-        self.run_root = f"/homes/jiamingt/robodojo_eval/{run}"
+        self.policy_name = policy
+        self.state_dir = os.path.join(ce_site.get("CE_MASTER_ROOT"), run)
+        self.run_root = f"{ce_site.get('CE_EVAL_ROOT')}/{run}"
         self.driver = os.path.abspath(driver)
         self.tail_dir = os.path.join(self.state_dir, "tail_shards")
         os.makedirs(self.tail_dir, exist_ok=True)
@@ -104,7 +107,9 @@ class Run:
             return False
 
     def policy(self) -> str:
-        m = re.search(r"^POLICY=(\w+)", open(self.driver).read(), re.M)       # the driver's adapter dir segment
+        if self.policy_name:                                                  # --policy (eval/run.sh passes its adapter)
+            return self.policy_name
+        m = re.search(r"^POLICY=(\w+)", open(self.driver).read(), re.M)       # a historical per-recipe driver's adapter dir segment
         return m.group(1) if m else "SANA_WAM"
 
     def unit(self, uid: str) -> dict:
@@ -148,7 +153,7 @@ def seq_progress(r: Run, task: str) -> dict:
     base = f"{NODE_WS}/eval_result/RoboDojo/{task}/{r.policy()}/arx_x5"
     local = os.path.join(r.scratch, f"seq_{task}")
     os.makedirs(local, exist_ok=True)
-    got = sh(["rsync", "-a", f"jiamingt@{node}.mit.edu:{base}/{r.seed}_*/{rid}/_result.json", f"jiamingt@{node}.mit.edu:{base}/{r.seed}_*/_resume_{rid}.json",
+    got = sh(["rsync", "-a", f"{ce_site.host(node)}:{base}/{r.seed}_*/{rid}/_result.json", f"{ce_site.host(node)}:{base}/{r.seed}_*/_resume_{rid}.json",
               local + "/"], timeout=300)
     res = os.path.join(local, "_result.json")
     details = json.load(open(res)).get("details", {}) if os.path.exists(res) else {}
@@ -441,7 +446,7 @@ def cmd_invalidate(r: Run, task: str, a) -> None:
         src, dst = f"{r.run_root}/units/{uid}", f"{r.run_root}/invalid_tail_shards/{uid}.{tag}_{ts}"
         if a.dry_run:
             print(f"[dry-run] layout {lay}: mv {src} {dst}; drop plan entry {plan['shards'].get(str(lay))}"); continue
-        p = ssh(NFS_HOST.split("@")[1].split(".")[0],
+        p = ssh(ce_site.get("CE_GATEWAY"),
                 f"set -e; [ -d {src} ] || {{ echo missing; exit 0; }}; flock -n {src}/.lock -c true || {{ echo RUNNER_ALIVE; exit 3; }}; "
                 f"mkdir -p {r.run_root}/invalid_tail_shards; mv {src} {dst}; echo moved", timeout=120)
         if p.returncode != 0 or "RUNNER_ALIVE" in p.stdout:
@@ -719,7 +724,7 @@ def cmd_assemble(r: Run, tasks: list[str], a) -> None:
     res_md = os.path.join(r.state_dir, "RESULTS.md")
     if os.path.exists(res_md) and not os.path.exists(res_md + ".orig_before_tail_assembly"):
         shutil.copy2(res_md, res_md + ".orig_before_tail_assembly")
-    py = os.environ.get("MASTER_PY", os.path.join(HOME, "miniforge3/envs/sana-wam/bin/python"))
+    py = ce_site.get("CE_PY")
     p = sh([py, os.path.join(EVAL, "summarize_eval.py"), os.path.join(r.state_dir, "mirror"), "--out", res_md, "--run-id", r.run,
             "--note", "tail units finished by tail_shards.py: " + " | ".join(notes)], timeout=900)
     print(f"RESULTS.md rewritten (summarize_eval rc {p.returncode}); next: bash {r.driver} official-summary")
@@ -731,6 +736,7 @@ def main() -> None:
     ap.add_argument("cmd", choices=("plan", "launch", "status", "more-substitutes", "invalidate", "fill", "fill-status", "assemble"))
     ap.add_argument("--run", required=True)
     ap.add_argument("--driver", required=True, help="the campaign driver whose smoke-gpu starts the shards (it must honour RUN / SMOKE_* env)")
+    ap.add_argument("--policy", default=None, help="the adapter dir segment of the eval_result layout (default: the driver's POLICY= line, else SANA_WAM)")
     ap.add_argument("--task", action="append", required=True)
     ap.add_argument("--cut", type=int, default=None, help="first shard layout (default: the layout after the one in progress)")
     ap.add_argument("--spare", type=int, default=1, help="extra substitute ids beyond the abandoned count at launch")
@@ -745,7 +751,7 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
-    r = Run(a.run, a.driver, a.seed)
+    r = Run(a.run, a.driver, a.seed, a.policy)
     if a.cmd == "assemble":
         cmd_assemble(r, a.task, a); return
     ok = True
