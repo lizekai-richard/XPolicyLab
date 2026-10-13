@@ -8,8 +8,8 @@
   bound, a non-orthonormal rot6d commits the rotation the evaluator received.
 
 The normalization artifact is the one the causal recipes pin (sha 1fe3b7e7, shipped with the causal checkpoints; the
-sana_pixel donors' 9f8b98ed copy holds the same statistics); the training yaml is the derived pantheon14k causal
-fixture. Live parts need ``SANA_CAUSAL_REPO``.
+sana_pixel donors' 9f8b98ed copy holds the same statistics); the training yaml is the real config.yaml of the
+pantheon14k video_and_action checkpoint at step 5000. Live parts need ``SANA_CAUSAL_REPO``.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from sana_wam_min.robot80 import normalize_action, normalize_state
 from sana_wam_min.session import load_checked_normalization
 
 ARTIFACT = os.path.join(_paths.FIXTURES, "normalization_causal_f33_1fe3b7e7.json")
-CONFIG = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_derived.yaml")
+CONFIG = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
 SANA_CAUSAL_REPO = os.path.expanduser(os.environ.get("SANA_CAUSAL_REPO", "~/zekail/Sana"))
 FP32 = {"rtol": 2e-6, "atol": 2e-6}
 

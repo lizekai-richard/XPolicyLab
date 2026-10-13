@@ -45,6 +45,7 @@ if str(POLICY_DIR) not in sys.path:
     sys.path.insert(0, str(POLICY_DIR))
 
 from sana_wam_causal import shared  # noqa: E402,F401  (puts policy/SANA_WAM on sys.path)
+from sana_wam_causal.attention_probe import AttentionProbe  # noqa: E402
 from sana_wam_causal.contract import MEMORY_VIDEO_AND_ACTION  # noqa: E402
 from sana_wam_causal.runtime import CausalRuntime, timed  # noqa: E402
 
@@ -248,6 +249,7 @@ class Model(ModelTemplate):
             )
         self.max_chunks_per_episode = _optional_int(cfg.get("max_chunks_per_episode"))
         self.log_world_model_error = _is_true(cfg.get("log_world_model_error", True))
+        self.attention_dump_dir = str(cfg.get("attention_dump_dir") or "").strip() or None
         self.allow_donor_checkpoint = _is_true(cfg.get("allow_donor_checkpoint", False))
         self.kinematics = ArxX5Kinematics(cfg.get("urdf_path") or None)
         self.world_from_base = root_transforms(cfg.get("robot_root_poses") or None)
@@ -289,6 +291,8 @@ class Model(ModelTemplate):
         self.memory_content = str(contract.memory_content)
         check_commit_actions(self.commit_actions, self.memory_content)
 
+        # diagnostics: per-chunk memory-read aggregates of every generation forward (attention_probe.py)
+        self._probe = AttentionProbe(self.runtime.model) if self.attention_dump_dir else None
         self._session = None
         self._episode_open = False
         self._episode_index = 0
@@ -306,7 +310,7 @@ class Model(ModelTemplate):
             f"steps={frontend.steps} video_cfg_scale={frontend.video_cfg_scale} action_cfg_scale={frontend.action_cfg_scale} "
             f"flow_shift={frontend.flow_shift} action_flow_shift={frontend.action_flow_shift} "
             f"view_resize={frontend.view_resize} ({frontend.view_resize_source}) commit_actions={self.commit_actions} "
-            f"memory_mode={self.memory_mode} "
+            f"memory_mode={self.memory_mode} attention_dump_dir={self.attention_dump_dir} "
             f"gdn_recurrence={report.get('gdn_recurrence')} normalization_sha256={self.normalization.sha256} "
             f"device={self.device} action_type={self.action_type}",
             flush=True,
@@ -453,6 +457,7 @@ class Model(ModelTemplate):
         wm_error, gap, anchor_gap = None, None, None
         if self._session is None:
             self._session = self.runtime.new_session(instruction)
+            self._session.probe = self._probe
             self._instruction = instruction
             print(f"{TAG} episode {self._episode_index} instruction: {instruction!r}", flush=True)
         else:
@@ -489,6 +494,12 @@ class Model(ModelTemplate):
             generator=generator,
             gripper_bounds=self.gripper_bounds,
         )
+        if self._probe is not None:
+            self._probe.write(
+                self.attention_dump_dir, self._episode_index,
+                {"instruction": instruction, "memory_mode": self.memory_mode, "memory_content": self.memory_content,
+                 "diffusion_seed": int(seed), "checkpoint": str(self.ckpt_dir)},
+            )
         mask_cpu = action_mask[0].detach().cpu()
         action_raw = model_action_to_absolute(
             action_norm[0].detach().to(device="cpu", dtype=torch.float32), mask_cpu, self.normalization, anchor_raw, anchor_mask

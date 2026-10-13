@@ -98,7 +98,7 @@ def _obs(tick: int, instruction: str = "stack the bowls") -> dict:
 
 @pytest.fixture()
 def model():
-    with open(os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_derived.yaml")) as handle:
+    with open(os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")) as handle:
         view = bidirectional_view(yaml.safe_load(handle))
     normalization = load_checked_normalization(
         "/nonexistent", view, os.path.join(_paths.FIXTURES, "normalization_causal_f33_1fe3b7e7.json")
@@ -119,6 +119,7 @@ def model():
     m.memory_content = "video_and_action"
     m.max_chunks_per_episode = None
     m.log_world_model_error = True
+    m.attention_dump_dir, m._probe = None, None
     m.diffusion_seed_base, m.eval_seed = 1, 0
     m._episode_index = 0
     m._size_warned = True

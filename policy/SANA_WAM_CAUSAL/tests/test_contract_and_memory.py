@@ -25,8 +25,8 @@ from sana_wam_causal.session import Caption, CausalMemory, CausalPolicySession
 from sana_wam_min.config import THREE_VIEW_POLICY_FACTORY, policy_config_from_train_config
 from sana_wam_min.policy_model.config import PolicyConfig
 
-FIXTURE = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_derived.yaml")
-FIXTURE_VIDEOONLY = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoonly_derived.yaml")
+FIXTURE = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
+FIXTURE_VIDEOONLY = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoonly_s5000.yaml")
 FIXTURE_RETIRED = os.path.join(_paths.FIXTURES, "config_causal_vanilla52k_m48n24_s7646.yaml")
 
 

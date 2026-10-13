@@ -183,6 +183,7 @@ class CausalPolicySession:
         self.chunk_idx = 0
         self._grid: Optional[tuple[int, int]] = None   # (H, W) of the canvas latent, fixed by the first window
         self._rope_tables: dict = {}                   # softmax rotary table per chunk slot of a read
+        self.probe = None                              # optional attention_probe.AttentionProbe (generation only)
         self.reset_memory()
 
     def reset_memory(self) -> None:
@@ -282,46 +283,62 @@ class CausalPolicySession:
         soft_frame, soft_step = self._softmax_offsets(frame_offset, step_offset)
         state = anchor_state.reshape(1, -1)
         state_mask = anchor_state_mask.reshape(1, -1).to(torch.bool)
-        with self._autocast(device):
-            for step_index, timestep in enumerate(video_scheduler.timesteps):
-                action_timestep = action_scheduler.timesteps[step_index]
-                video_t = timestep.reshape(1, 1).expand(1, self.f_chunk).to(torch.float32)
-                action_t = action_timestep.reshape(1, 1).expand(1, chunk).to(torch.float32)
-                latent = torch.cat((observation, video), dim=2)
-                window_t = torch.cat((video_t.new_zeros(1, 1), video_t), dim=1)
-                robot = {
-                    "state80": state,
-                    "state_mask80": state_mask,
-                    "action80": action,
-                    "action_mask80": action_mask,
-                    "action_timesteps": action_t,
-                }
-                outputs = []
-                for caption, caches in zip(self.captions, caches_by_stream):
-                    outputs.append(
-                        self.model.forward_window(
-                            latent, window_t, caption.y, caption.mask,
-                            model_fps=self.model_fps, frame_offset=frame_offset, step_offset=step_offset,
-                            robot=robot, caches=caches, softmax_frame_offset=soft_frame, softmax_step_offset=soft_step,
+        probe = self.probe
+        if probe is not None:
+            read_ids, origin = self.memories[0].read_plan()
+            patch = self.model.patch_size
+            probe.begin_chunk(
+                chunk=self.chunk_idx, read_ids=read_ids, origin=origin,
+                tokens_per_frame=(like.shape[-2] // patch[1]) * (like.shape[-1] // patch[2]),
+                latent_frames_per_chunk=self.f_chunk, chunk_actions=chunk, robot_memory=self.robot_memory,
+                steps=self.steps, streams=len(self.captions),
+            )
+        try:
+            with self._autocast(device):
+                for step_index, timestep in enumerate(video_scheduler.timesteps):
+                    action_timestep = action_scheduler.timesteps[step_index]
+                    video_t = timestep.reshape(1, 1).expand(1, self.f_chunk).to(torch.float32)
+                    action_t = action_timestep.reshape(1, 1).expand(1, chunk).to(torch.float32)
+                    latent = torch.cat((observation, video), dim=2)
+                    window_t = torch.cat((video_t.new_zeros(1, 1), video_t), dim=1)
+                    robot = {
+                        "state80": state,
+                        "state_mask80": state_mask,
+                        "action80": action,
+                        "action_mask80": action_mask,
+                        "action_timesteps": action_t,
+                    }
+                    outputs = []
+                    for stream_index, (caption, caches) in enumerate(zip(self.captions, caches_by_stream)):
+                        if probe is not None:
+                            probe.set_forward(step_index, stream_index, float(timestep), float(action_timestep))
+                        outputs.append(
+                            self.model.forward_window(
+                                latent, window_t, caption.y, caption.mask,
+                                model_fps=self.model_fps, frame_offset=frame_offset, step_offset=step_offset,
+                                robot=robot, caches=caches, softmax_frame_offset=soft_frame, softmax_step_offset=soft_step,
+                            )
                         )
-                    )
-                cond = outputs[0]
-                uncond = outputs[1] if self.guided else None
-                targets = slice(1, None)
-                video_prediction = cond["x"][:, :, targets]
-                if uncond is not None and self.video_cfg_scale > 1:
-                    video_prediction = uncond["x"][:, :, targets] + self.video_cfg_scale * (
-                        video_prediction - uncond["x"][:, :, targets]
-                    )
-                action_prediction = cond["action_pred"]
-                if uncond is not None and self.action_cfg_scale > 1:
-                    action_prediction = uncond["action_pred"] + self.action_cfg_scale * (
-                        action_prediction - uncond["action_pred"]
-                    )
-                video = _video_step(video_scheduler, video_prediction.to(video.dtype), timestep, video, video_t)
-                action = _action_step(
-                    action_scheduler, action_prediction.to(action.dtype), action_timestep, action, action_t
-                ).masked_fill(~action_mask, 0)
+                    cond = outputs[0]
+                    uncond = outputs[1] if self.guided else None
+                    targets = slice(1, None)
+                    video_prediction = cond["x"][:, :, targets]
+                    if uncond is not None and self.video_cfg_scale > 1:
+                        video_prediction = uncond["x"][:, :, targets] + self.video_cfg_scale * (
+                            video_prediction - uncond["x"][:, :, targets]
+                        )
+                    action_prediction = cond["action_pred"]
+                    if uncond is not None and self.action_cfg_scale > 1:
+                        action_prediction = uncond["action_pred"] + self.action_cfg_scale * (
+                            action_prediction - uncond["action_pred"]
+                        )
+                    video = _video_step(video_scheduler, video_prediction.to(video.dtype), timestep, video, video_t)
+                    action = _action_step(
+                        action_scheduler, action_prediction.to(action.dtype), action_timestep, action, action_t
+                    ).masked_fill(~action_mask, 0)
+        finally:
+            if probe is not None:
+                probe.pause()
         if gripper_bounds is not None:
             for slot, (low, high) in zip((LEFT_GRIPPER, RIGHT_GRIPPER), gripper_bounds):
                 action[..., slot] = action[..., slot].clamp(float(low), float(high))

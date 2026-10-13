@@ -57,6 +57,9 @@ max_chunks_per_episode: null
 # Per-chunk log of the relative RMSE between the predicted and the observed target latent of the executed chunk (and,
 # whenever the chunk is encoded, obs_anchor_gap: its single-frame observation vs the anchor latent of its clip encode)
 log_world_model_error: true
+# Diagnostics: a directory -> one ep{E}_chunk{C}.npz per chunk with how much every generation forward reads the
+# memory (softmax attention mass per committed chunk / segment, GDN past-vs-window readout); null = off
+attention_dump_dir: null
 # null = stretch (the only SFT view resize of the causal line's donors); a contradicting value is refused
 view_resize: null
 diffusion_seed_base: 20261003

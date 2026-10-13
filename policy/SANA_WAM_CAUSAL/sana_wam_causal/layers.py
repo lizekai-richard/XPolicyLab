@@ -76,6 +76,9 @@ def rope_bhnd_complex64(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 class CausalGDNAttention(GatedDeltaNet):
     """GDN with a chunk-granular delta-rule state; every forward is ONE chunk segment (the deploy windows)."""
 
+    probe = None          # an active ``attention_probe.AttentionProbe`` reads the readout's past / window parts
+    probe_layer = -1
+
     def __init__(
         self,
         in_dim: int,
@@ -165,6 +168,8 @@ class CausalGDNAttention(GatedDeltaNet):
         intra_z = torch.einsum("bhld,bhl->bhd", k_den_c, beta_c)
         den = torch.einsum("bhld,bhd->bhl", q_den_c, decayed_z + intra_z) + self.eps
         out = (num / den[..., None]).to(v.dtype)
+        if self.probe is not None and self.probe.active:
+            self.probe.gdn(self.probe_layer, q_c, decayed_state, intra_read, q_den_c, decayed_z, intra_z, self.eps)
 
         if cache is not None and cache.commit:
             v_pred = torch.einsum("bhld,bhdv->bhlv", k_c, decayed_state)
@@ -184,6 +189,9 @@ class CausalGDNAttention(GatedDeltaNet):
 
 class CausalSoftmaxAttention(GatedSoftmaxAttention):
     """Gated softmax attention over ``[context entries | this window]``."""
+
+    probe = None          # an active ``attention_probe.AttentionProbe`` reads the kernel's q / k / v
+    probe_layer = -1
 
     def forward(  # type: ignore[override]
         self,
@@ -209,6 +217,8 @@ class CausalSoftmaxAttention(GatedSoftmaxAttention):
             v = torch.cat((context_v.to(v.dtype), v), dim=1)
         if self.fp32_attention:
             q, k, v = q.float(), k.float(), v.float()
+        if self.probe is not None and self.probe.active:
+            self.probe.softmax(self.probe_layer, q, k, v)
         out = self._run_attention(q, k, v)
         out = out.reshape(batch, tokens, channels).to(output_dtype)
         out = out * torch.sigmoid(self.output_gate(x))
