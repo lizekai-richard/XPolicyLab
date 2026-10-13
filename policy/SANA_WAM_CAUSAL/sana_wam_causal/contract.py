@@ -2,17 +2,25 @@
 
 A causal recipe is its parent SFT recipe plus the causal blocks (Sana ``posttrain_causal_handoff/04_configs.md``
 section 5): ``model.model`` names the causal class, ``model.extra.chunk_causal_policy`` sets the chunk size, the
-softmax sliding window and what a memory chunk carries, ``data.type`` is the causal chunk-window dataset and the window
-ladder replaces the SFT tier. Everything else (multiview front-end, RoPE mode, action / target modes, normalization
-pin, noise schedule) keeps its SFT meaning, so the shared ``sana_wam_min`` resolvers read it from a *bidirectional
-view* of the yaml: the same dict with the SFT policy class and the one-chunk tier put back.
+softmax sliding window, what a memory chunk carries and whether a noisy chunk carries its own observation,
+``data.type`` is the causal chunk-window dataset and the window ladder replaces the SFT tier. Everything else
+(multiview front-end, RoPE mode, action / target modes, normalization pin, noise schedule) keeps its SFT meaning, so the
+shared ``sana_wam_min`` resolvers read it from a *bidirectional view* of the yaml: the same dict with the SFT policy
+class and the one-chunk tier put back.
 
-This adapter serves the per-chunk observation protocol (Sana ``61aad2d58`` / ``3a6b2bf07``, the pantheon14k m48n24
-recipes): every noisy chunk carries its own observation latent, a memory chunk holds its target latents (plus its
-anchor state and actions under ``memory_content: video_and_action``, the value of a config without the key), on the
-one-view canvas (``sana_pixel``), ``rope: aligned``, no AttnRes time conditioning, unmasked canvas pad. A config that
-still names ``obs_in_first_chunk`` belongs to a retired layout (the chunk-0-only observation of the vanilla52k line) and
-is refused like anything else outside the contract, at start-up with the reason, before the weights are read.
+This adapter serves the episode protocol (Sana ``d37817788`` / ``fcccb4c88`` / ``3cbe3d85e``, deploy ``4bd1b674c``;
+inference handoff 03, first status note): every training window is a whole episode from its first frame, the memory
+opens with the first-observation sink and a frozen first chunk, every noisy chunk carries its own observation latent
+unless ``chunk_observation`` is false, and a memory chunk holds its target latents (plus its anchor state and actions
+under ``memory_content: video_and_action``, the value of a config without the key). Front-ends: the three-view
+``sana_latent`` strip and the one-view ``sana_pixel`` canvas, ``rope: aligned``, no AttnRes time conditioning, unmasked
+canvas pad.
+
+The sink-less per-chunk observation protocol (Sana ``61aad2d58`` .. ``3cbe3d85e``'s deploy, the pantheon14k m48n24
+checkpoints) is retired here as in Sana; its configs carry ``data.extra.window_repeats``, which no episode recipe does
+(the episode launcher refuses it), and are refused with the reason, at start-up, before the weights are read. So are a
+config that still names ``obs_in_first_chunk`` (the chunk-0-only observation of the vanilla52k line) and anything else
+outside the contract.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from sana_wam_min.config import (  # noqa: E402
     ROPE_ALIGNED,
     THREE_VIEW_POLICY_FACTORY,
     VISUAL_LAYOUT_SANA_PIXEL_CANVAS,
+    VISUAL_LAYOUT_THREE_VIEW_STRIP,
     declared_multiview,
     resolve_rope_contract,
     resolve_visual_layout,
@@ -48,6 +57,9 @@ DEFAULT_A_LOG_INIT = 0.0
 MEMORY_VIDEO_AND_ACTION = "video_and_action"
 MEMORY_VIDEO_ONLY = "video_only"
 MEMORY_CONTENTS = (MEMORY_VIDEO_AND_ACTION, MEMORY_VIDEO_ONLY)
+# the front-ends this adapter serves: the three-view strip (multiview sana_latent) and the one-view sana_pixel canvas
+SERVED_VISUAL_LAYOUTS = (VISUAL_LAYOUT_THREE_VIEW_STRIP, VISUAL_LAYOUT_SANA_PIXEL_CANVAS)
+PROTOCOL_EPISODE = "episode"
 
 
 @dataclass(frozen=True)
@@ -59,6 +71,7 @@ class CausalContract:
     latent_frames_per_chunk: int     # f_c = C / (8 s): target latent frames of one chunk
     sliding_window_chunks: Optional[int]  # W: committed chunks a chunk's softmax layers read (None = all of them)
     memory_content: str              # video_and_action | video_only: what a committed chunk keeps besides its targets
+    chunk_observation: bool          # a noisy chunk opens with its own observation latent (False: its targets alone)
     model_fps: float
     tier_num_frames: int             # C + 1: the one-chunk window of the parent SFT recipe
     multiview: str
@@ -71,9 +84,10 @@ class CausalContract:
     def describe(self) -> str:
         window = "all" if self.sliding_window_chunks is None else str(self.sliding_window_chunks)
         return (
-            f"protocol=per_chunk_obs actions_per_chunk={self.actions_per_chunk} "
+            f"protocol={PROTOCOL_EPISODE} actions_per_chunk={self.actions_per_chunk} "
             f"video_frame_stride={self.video_frame_stride} latent_frames_per_chunk={self.latent_frames_per_chunk} "
-            f"sliding_window_chunks={window} memory_content={self.memory_content} multiview={self.multiview} "
+            f"sliding_window_chunks={window} memory_content={self.memory_content} "
+            f"chunk_observation={self.chunk_observation} multiview={self.multiview} visual_layout={self.visual_layout} "
             f"rope={self.rope}"
         )
 
@@ -122,6 +136,17 @@ def resolve_memory_content(value: Any) -> str:
     return str(value)
 
 
+def resolve_chunk_observation(value: Any) -> bool:
+    """``chunk_observation`` as Sana reads it (``causal_rwm_train.resolve_chunk_observation``): None (a config older
+    than the key) -> True; otherwise a bool."""
+
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        raise ValueError(f"model.extra.chunk_causal_policy.chunk_observation={value!r}: must be true or false")
+    return value
+
+
 def is_causal_policy_config(cfg: Mapping[str, Any]) -> bool:
     return str((cfg.get("model") or {}).get("model")) == CAUSAL_POLICY_FACTORY
 
@@ -164,6 +189,14 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
             "rwm/sparse-memory, a dense / sparse memory read per block kind), which this adapter would mis-serve as the "
             "per-chunk observation protocol; serve it with SANA_WAM_HM"
         )
+    if "window_repeats" in _extra(cfg.get("data")):
+        raise ValueError(
+            "data.extra.window_repeats: this checkpoint trained the sink-less per-chunk observation protocol (the "
+            "pantheon14k m48n24 recipes; Sana before d37817788), which this adapter no longer serves (the episode "
+            "protocol: the first-observation sink, the frozen first chunk, one causal VAE stream per view). Serve it "
+            "from the archived adapter (XPolicyLab snapshot SANA_WAM_CAUSAL_per_chunk_obs_pre_episode_20261013); an "
+            "episode recipe never sets window_repeats (its launcher refuses it)"
+        )
     view = bidirectional_view(cfg)
 
     fps = float(ROBODOJO_MODEL_FPS_HZ)
@@ -193,6 +226,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
             "protocol only (the earlier protocol is archived in XPolicyLab commit 69cfb8e)"
         )
     memory_content = resolve_memory_content(options.get("memory_content"))
+    chunk_observation = resolve_chunk_observation(options.get("chunk_observation"))
     window = options.get("sliding_window_chunks")
     window = None if window is None else int(window)
     if window is not None and window < 1:
@@ -200,12 +234,12 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
 
     multiview = declared_multiview(view)
     layout = resolve_visual_layout(view)
-    if layout != VISUAL_LAYOUT_SANA_PIXEL_CANVAS:
+    if layout not in SERVED_VISUAL_LAYOUTS:
         raise NotImplementedError(
-            f"the causal adapter serves the one-view sana_pixel canvas; this checkpoint's front-end is {layout} "
-            f"(multiview {multiview!r})"
+            f"the causal adapter serves the three-view sana_latent strip and the one-view sana_pixel canvas; this "
+            f"checkpoint's front-end is {layout} (multiview {multiview!r})"
         )
-    pad = sana_pixel_pad_from_train_config(view)
+    pad = sana_pixel_pad_from_train_config(view) if layout == VISUAL_LAYOUT_SANA_PIXEL_CANVAS else "unmasked"
     if pad != "unmasked":
         raise NotImplementedError(f"model.extra.sana_pixel_pad {pad!r} is not implemented by the causal adapter")
     rope, _origin, _label = resolve_rope_contract(view, None)
@@ -224,6 +258,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         latent_frames_per_chunk=f_chunk,
         sliding_window_chunks=window,
         memory_content=memory_content,
+        chunk_observation=chunk_observation,
         model_fps=fps,
         tier_num_frames=tier,
         multiview=str(multiview),
@@ -243,10 +278,13 @@ __all__ = [
     "MEMORY_CONTENTS",
     "MEMORY_VIDEO_AND_ACTION",
     "MEMORY_VIDEO_ONLY",
+    "PROTOCOL_EPISODE",
+    "SERVED_VISUAL_LAYOUTS",
     "bidirectional_view",
     "chunk_causal_options",
     "is_causal_policy_config",
     "resolve_actions_per_chunk",
     "resolve_causal_contract",
+    "resolve_chunk_observation",
     "resolve_memory_content",
 ]

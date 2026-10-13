@@ -20,8 +20,9 @@ protocol only changes which state version and which entries a forward reads -- t
 * ``CausalPolicyBlock`` <- ``layers/chunk_causal_block.py`` ``ChunkWiseCausalPolicyBlock``: the bidirectional
   block's AdaLN / cross-attention / SwiGLU with the two shells above.
 
-A forward receives an optional ``LayerCache``: absent = a window that reads nothing (chunk 0: zero GDN state, the softmax
-reads only the window); present = a cached window that reads ``cache.gdn_state`` / ``cache.softmax_context`` and,
+A forward receives an optional ``LayerCache``: absent = a window that reads and writes nothing (zero GDN state, the
+softmax reads only the window); present = a cached window that reads ``cache.gdn_state`` (None = the zero state, the
+sink's write) / ``cache.softmax_context`` (the sink and the committed chunks of the read, already rotated) and,
 when ``cache.commit`` is set, leaves the next GDN state and this window's K/V in ``cache.gdn_next`` /
 ``cache.softmax_new`` for the session to keep.
 """

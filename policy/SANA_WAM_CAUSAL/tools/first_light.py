@@ -1,12 +1,13 @@
 """Real-weight first light of the causal adapter on one GPU, without the simulator.
 
 Loads the runtime exactly as ``model.py`` does (causal yaml -> contract -> normalization -> bf16 causal model ->
-VAE -> Gemma), then drives the per-chunk observation cycle on synthetic frames (one random image per episode, rolled by
-the tick): for every chunk but the first commit the previous one (its 9 frames encoded as one clip), then encode the
-chunk's start frame as its observation and generate it. Prints the load report, per-chunk latencies, the chunks read,
-obs_anchor_gap (the observation vs the anchor latent of the same frame inside the next commit's clip: the causal-VAE
-equality the protocol relies on), peak GPU memory and finiteness checks, and checks determinism (the same seeds
-replay the same chunk 0).
+VAE -> Gemma), then drives the episode protocol on synthetic frames (one random image per episode, rolled by the tick):
+the per-view streams opened at the first frame, the sink and the frozen first chunk committed, chunk 1 generated from
+the first frame; then for every later chunk the previous one streamed on (its C / s frames) and committed, the chunk's
+start frame encoded as its observation (none without chunk observations) and the chunk generated. Prints the load
+report, per-chunk latencies, the chunks read, obs_sink_gap (the first frame encoded alone vs the sink: the causal-VAE
+equality chunk 1 relies on, expected 0), the world-model error of every committed chunk, peak GPU memory and
+finiteness checks, and checks determinism (the same seeds replay the same chunk 1).
 
 Usage (from policy/SANA_WAM_CAUSAL, PYTHONPATH=<XPolicyLab parent>):
   python tools/first_light.py --checkpoint-dir DIR --text-encoder-path P --vae-path P [--allow-donor-checkpoint]
@@ -29,7 +30,7 @@ sys.path.insert(0, str(POLICY_DIR))
 
 from sana_wam_causal import shared  # noqa: E402,F401
 from sana_wam_causal.runtime import CausalRuntime, timed  # noqa: E402
-from sana_wam_min.robot80 import normalize_state, normalized_gripper_bounds  # noqa: E402
+from sana_wam_min.robot80 import normalize_action, normalize_state, normalized_gripper_bounds  # noqa: E402
 
 
 def frames_at(base: np.ndarray, tick: int) -> list[np.ndarray]:
@@ -82,21 +83,45 @@ def main() -> int:
     anchor = normalize_state(state_raw, mask.numpy(), normalization).to(device)
 
     chunk, stride = contract.actions_per_chunk, contract.video_frame_stride
+    hold = normalize_action(
+        torch.from_numpy(np.repeat(state_raw[None], chunk, axis=0)), mask, normalization
+    ).masked_fill(~mask, 0).unsqueeze(0).to(device)
+
+    def views_at(base, tick):
+        return runtime.view_frames(frames_at(base, tick))
 
     def episode(seed: int, chunks: int):
         base = np.random.default_rng(seed).integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
         session = runtime.new_session("put the bottles into the dustbin")
+        streams = runtime.new_streams()
+        timings = {}
+        (sink, frozen), timings["open_stream"] = timed(streams.start, views_at(base, 0))
+        session.view_shapes = streams.view_shapes if runtime.strip else None
+
+        def opening():
+            session.commit_sink(sink)
+            session.commit_chunk(frozen, hold, anchor_state=anchor, anchor_state_mask=mask.to(device), action_mask=action_mask)
+
+        _, timings["open_commit"] = timed(opening)
+        first_obs, _ = runtime.encode_observation(views_at(base, 0))
+        print(f"[first-light] opening {' '.join(f'{k}={v:.3f}s' for k, v in timings.items())} "
+              f"obs_sink_gap={relative_rmse(first_obs, sink):.2e} view_shapes={streams.view_shapes}")
         out = []
-        for c in range(chunks):
-            timings = {}
-            gap = None
-            if c:
-                clip = [frames_at(base, (c - 1) * chunk + j * stride) for j in range(1 + chunk // stride)]
-                (latent, anchor_latent), timings["encode"] = timed(runtime.encode_executed_chunk, clip)
-                gap = relative_rmse(anchor_latent, out[-1][2])
+        for c in range(1, chunks + 1):
+            timings, wm = {}, None
+            if c > 1:
+                frames = [views_at(base, (c - 2) * chunk + t) for t in range(stride, chunk + 1, stride)]
+                per_view = [[views[v] for views in frames] for v in range(len(frames[0]))]
+                latent, timings["stream"] = timed(streams.encode_chunk, per_view)
+                wm = relative_rmse(out[-1][1], latent)
                 _, timings["commit"] = timed(session.commit_chunk, latent, out[-1][0], anchor_state=anchor,
                                              anchor_state_mask=mask.to(device), action_mask=action_mask)
-            observation, timings["obs_encode"] = timed(runtime.encode_observation, frames_at(base, c * chunk))
+            observation = None
+            if contract.chunk_observation:
+                if c == 1:
+                    observation = sink
+                else:
+                    (observation, _), timings["obs_encode"] = timed(runtime.encode_observation, views_at(base, (c - 1) * chunk))
             read, origin = session.read_chunk_ids(), session.softmax_origin()
             generator = torch.Generator(device=device).manual_seed(1000 + c)
             (action, video), timings["generate"] = timed(
@@ -106,9 +131,9 @@ def main() -> int:
             finite = bool(torch.isfinite(action).all()) and bool(torch.isfinite(video).all())
             print(f"[first-light] chunk {c}: read={read}" + (f" origin={origin}" if origin else "") + " "
                   + " ".join(f"{k}={v:.3f}s" for k, v in timings.items())
-                  + ("" if gap is None else f" obs_anchor_gap(chunk {c - 1})={gap:.2e}")
+                  + ("" if wm is None else f" world_model_rel_rmse(chunk {c - 1})={wm:.3f}")
                   + f" finite={finite} |a|max={float(action.abs().max()):.3f} video_rms={float(video.float().pow(2).mean().sqrt()):.3f}")
-            out.append((action, video, observation))
+            out.append((action, video))
         return out
 
     if torch.cuda.is_available():
@@ -119,8 +144,8 @@ def main() -> int:
               f"(reserved {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB)")
     again = episode(7, 1)
     same = torch.equal(first[0][0], again[0][0]) and torch.equal(first[0][1], again[0][1])
-    print(f"[first-light] chunk-0 replay deterministic: {same}")
-    print("[first-light] PASS" if same and all(bool(torch.isfinite(a).all()) for a, _, _ in first) else "[first-light] FAIL")
+    print(f"[first-light] chunk-1 replay deterministic: {same}")
+    print("[first-light] PASS" if same and all(bool(torch.isfinite(a).all()) for a, _ in first) else "[first-light] FAIL")
     return 0
 
 

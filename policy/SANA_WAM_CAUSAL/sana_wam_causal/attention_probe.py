@@ -6,15 +6,17 @@ computed) and the commit forwards are not watched.
 
 * Softmax layers: the attention weights ``softmax(q k^T / sqrt(D))`` the kernel uses (same q / k after q/k-norm, RoPE
   and the memory concatenation, no mask), summed over the keys of each KEY GROUP and averaged over the queries of each
-  QUERY GROUP. Key groups: every committed chunk read (its target latents, and under video_and_action its state row and
-  its action rows) and the window's own observation / targets / state / actions. Also the norm of the attention output
-  split into the part read from the memory keys and the part read from the window keys.
+  QUERY GROUP. Key groups: the sink (the episode's first observation, ``sink.video``), every committed chunk read (its
+  target latents, and under video_and_action its state row and its action rows) and the window's own observation /
+  targets / state / actions. Also the norm of the attention output split into the part read from the memory keys (the
+  sink included) and the part read from the window keys.
 * GDN layers (no per-key weights): the readout ``(q S + q K^T B V) / (q_den z + q_den K_den^T beta)`` split into the past
   (the decayed state of the committed chunks) and this window: the past's share of the normalizer (the linear-attention
   analogue of the softmax mass on the memory) and the norms of the two parts of the output.
 
-Query groups (the window's tokens): ``obs``, ``target``, ``state``, ``action``. One ``.npz`` per chunk, written by the
-adapter: ``ep{E:03d}_chunk{C:03d}.npz`` with the arrays below plus a JSON ``meta`` string (labels, sizes, read plan).
+Query groups (the window's tokens): ``obs``, ``target``, ``state``, ``action`` (no ``obs`` for a model without chunk
+observations; ``meta["query_groups"]`` names them). One ``.npz`` per chunk, written by the adapter:
+``ep{E:03d}_chunk{C:03d}.npz`` with the arrays below plus a JSON ``meta`` string (labels, sizes, read plan).
 """
 
 from __future__ import annotations
@@ -76,25 +78,33 @@ class AttentionProbe:
         robot_memory: bool,
         steps: int,
         streams: int,
+        sink: bool = True,
+        observation: bool = True,
     ) -> None:
         """Lay out the key / query groups of chunk ``chunk``'s denoising window and allocate its aggregates."""
 
         video_entry = int(latent_frames_per_chunk) * int(tokens_per_frame)
         key_labels, key_sizes = [], []
+        if sink:
+            key_labels.append("sink.video")
+            key_sizes.append(int(tokens_per_frame))
         for chunk_id in read_ids:
             key_labels.append(f"mem{chunk_id}.video")
             key_sizes.append(video_entry)
             if robot_memory:
                 key_labels += [f"mem{chunk_id}.state", f"mem{chunk_id}.action"]
                 key_sizes += [1, int(chunk_actions)]
-        query_sizes = [int(tokens_per_frame), video_entry, 1, int(chunk_actions)]
-        key_labels += [f"cur.{name}" for name in QUERY_GROUPS]
+        query_groups = list(QUERY_GROUPS if observation else QUERY_GROUPS[1:])
+        query_sizes = ([int(tokens_per_frame)] if observation else []) + [video_entry, 1, int(chunk_actions)]
+        key_labels += [f"cur.{name}" for name in query_groups]
         key_sizes += query_sizes
         self._chunk = {
             "chunk": int(chunk),
             "read_ids": [int(i) for i in read_ids],
             "origin": int(origin),
             "robot_memory": bool(robot_memory),
+            "sink": bool(sink),
+            "query_groups": query_groups,
             "key_labels": key_labels,
             "key_sizes": key_sizes,
             "query_sizes": query_sizes,
@@ -145,7 +155,7 @@ class AttentionProbe:
         heads = q.shape[2]
         if info["softmax_mass"] is None:
             info["softmax_heads"] = heads
-            shape = (info["steps"], info["streams"], len(self.softmax_layers), heads, len(QUERY_GROUPS))
+            shape = (info["steps"], info["streams"], len(self.softmax_layers), heads, len(info["query_groups"]))
             info["softmax_mass"] = np.zeros(shape + (len(info["key_sizes"]),), dtype=np.float32)
             info["softmax_out"] = np.zeros(shape + (len(SOFTMAX_OUT_PARTS),), dtype=np.float32)
         with torch.autocast(device_type=q.device.type, enabled=False):   # the generation runs under bf16 autocast
@@ -190,7 +200,7 @@ class AttentionProbe:
         if info["gdn"] is None:
             info["gdn_heads"] = heads
             info["gdn"] = np.zeros(
-                (info["steps"], info["streams"], len(self.gdn_layers), heads, len(QUERY_GROUPS), len(GDN_PARTS)),
+                (info["steps"], info["streams"], len(self.gdn_layers), heads, len(info["query_groups"]), len(GDN_PARTS)),
                 dtype=np.float32,
             )
         with torch.autocast(device_type=q.device.type, enabled=False):   # the generation runs under bf16 autocast
@@ -229,12 +239,11 @@ class AttentionProbe:
             raise RuntimeError(f"attention probe: forwards seen per (step, stream) {info['seen'].tolist()}, expected 1 each")
         meta = {
             key: info[key]
-            for key in ("chunk", "read_ids", "origin", "robot_memory", "key_labels", "key_sizes", "query_sizes", "memory_keys",
-                        "steps", "streams", "softmax_heads", "gdn_heads")
+            for key in ("chunk", "read_ids", "origin", "robot_memory", "sink", "query_groups", "key_labels", "key_sizes",
+                        "query_sizes", "memory_keys", "steps", "streams", "softmax_heads", "gdn_heads")
         }
         meta.update(
             episode=int(episode),
-            query_groups=list(QUERY_GROUPS),
             softmax_out_parts=list(SOFTMAX_OUT_PARTS),
             gdn_parts=list(GDN_PARTS),
             softmax_layers=self.softmax_layers,

@@ -15,31 +15,34 @@ from sana_wam_causal.attention_probe import GDN_PARTS, QUERY_GROUPS, SOFTMAX_OUT
 from sana_wam_causal.contract import MEMORY_VIDEO_AND_ACTION, MEMORY_VIDEO_ONLY
 from sana_wam_causal.layers import CausalGDNAttention, CausalSoftmaxAttention
 from sana_wam_causal.session import Caption
-from test_contract_and_memory import _session, _tiny_model
+from test_contract_and_memory import _open, _session, _tiny_model
 
 CHUNKS = 4
 WINDOW = 2
 
 
 def _episode(model, probe=None, tmp_path=None):
-    """Four chunks of one deterministic episode; returns the generated (action, video) per chunk and the dump paths."""
+    """The opening (sink, frozen chunk 0) and chunks 1..4 of one deterministic episode; returns the generated (action,
+    video) per chunk and the dump paths."""
 
     g = torch.Generator().manual_seed(7)
     caption = Caption(torch.randn(1, 1, 1, 7, 16, generator=g), torch.ones(1, 1, 7, dtype=torch.int16))
     null = Caption(torch.randn(1, 1, 1, 7, 16, generator=g), torch.ones(1, 1, 7, dtype=torch.int16))
-    observations = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(CHUNKS)]
-    clean = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(CHUNKS)]
+    sink, frozen = torch.randn(1, 4, 1, 3, 4, generator=g), torch.randn(1, 4, 1, 3, 4, generator=g)
+    observations = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(CHUNKS + 1)]
+    clean = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(CHUNKS + 1)]
     mask = torch.zeros(1, 32, 80, dtype=torch.bool)
     mask[..., 7:17] = True
     mask[..., 36:46] = True
     state = torch.randn(1, 80, generator=g)
     session = _session(model, caption, null, window=WINDOW)
     session.probe = probe
+    _open(session, sink, frozen, state, mask)
     outs, paths = [], []
-    for c in range(CHUNKS):
+    for c in range(1, CHUNKS + 1):
         action, video = session.generate_chunk(
-            observations[c], anchor_state=state, anchor_state_mask=mask[0, 0], action_mask=mask,
-            generator=torch.Generator().manual_seed(100 + c),
+            observations[c] if model.chunk_observation else None, anchor_state=state, anchor_state_mask=mask[0, 0],
+            action_mask=mask, generator=torch.Generator().manual_seed(100 + c),
         )
         outs.append((action, video))
         if probe is not None:
@@ -48,9 +51,13 @@ def _episode(model, probe=None, tmp_path=None):
     return outs, paths
 
 
-@pytest.mark.parametrize("memory_content", [MEMORY_VIDEO_AND_ACTION, MEMORY_VIDEO_ONLY])
-def test_the_probe_changes_nothing_and_its_masses_are_distributions(memory_content, tmp_path):
-    model = _tiny_model(window=WINDOW, memory_content=memory_content)
+@pytest.mark.parametrize(
+    "memory_content,observation",
+    [(MEMORY_VIDEO_AND_ACTION, True), (MEMORY_VIDEO_ONLY, True), (MEMORY_VIDEO_ONLY, False)],
+    ids=["video_and_action", "video_only", "video_only-noobs"],
+)
+def test_the_probe_changes_nothing_and_its_masses_are_distributions(memory_content, observation, tmp_path):
+    model = _tiny_model(window=WINDOW, memory_content=memory_content, observation=observation)
     plain, _ = _episode(model)
     probe = AttentionProbe(model)
     probed, paths = _episode(model, probe, tmp_path)
@@ -58,27 +65,26 @@ def test_the_probe_changes_nothing_and_its_masses_are_distributions(memory_conte
         assert torch.equal(a1, a2) and torch.equal(v1, v2)
     assert not probe.active
     robot = memory_content == MEMORY_VIDEO_AND_ACTION
-    for c, path in enumerate(paths):
+    groups = list(QUERY_GROUPS) if observation else list(QUERY_GROUPS[1:])
+    for c, path in enumerate(paths, start=1):
         assert path.endswith(f"ep001_chunk{c:03d}.npz")
         data = np.load(path)
         meta = json.loads(str(data["meta"]))
         read = list(range(max(0, c - WINDOW), c))
-        assert meta["chunk"] == c and meta["read_ids"] == read and meta["note"] == "test"
+        assert meta["chunk"] == c and meta["read_ids"] == read and meta["note"] == "test" and meta["sink"]
         per_chunk = ["video", "state", "action"] if robot else ["video"]
-        assert meta["key_labels"] == [f"mem{i}.{part}" for i in read for part in per_chunk] + [f"cur.{q}" for q in QUERY_GROUPS]
-        assert meta["query_sizes"] == [12, 12, 1, 32]
-        assert meta["memory_keys"] == len(read) * (12 + (33 if robot else 0))
+        assert meta["query_groups"] == groups
+        assert meta["key_labels"] == ["sink.video"] + [f"mem{i}.{part}" for i in read for part in per_chunk] + [f"cur.{q}" for q in groups]
+        assert meta["query_sizes"] == ([12] if observation else []) + [12, 1, 32]
+        assert meta["memory_keys"] == 12 + len(read) * (12 + (33 if robot else 0))
         mass, out, gdn = data["softmax_mass"], data["softmax_out"], data["gdn"]
         steps, streams = 3, 2
-        assert mass.shape == (steps, streams, len(meta["softmax_layers"]), meta["softmax_heads"], 4, len(meta["key_labels"]))
+        assert mass.shape == (steps, streams, len(meta["softmax_layers"]), meta["softmax_heads"], len(groups), len(meta["key_labels"]))
         assert out.shape[-1] == len(SOFTMAX_OUT_PARTS) and gdn.shape[-1] == len(GDN_PARTS)
         np.testing.assert_allclose(mass.sum(-1), 1.0, atol=1e-5)
-        memory_mass = mass[..., : len(meta["key_labels"]) - 4].sum(-1)
-        past_share = gdn[..., 0]
-        if c == 0:
-            assert np.all(memory_mass == 0) and np.all(out[..., 0] == 0) and np.all(past_share == 0)
-        else:
-            assert np.all(memory_mass > 0) and np.all(out[..., 0] > 0)
+        memory_mass = mass[..., : len(meta["key_labels"]) - len(groups)].sum(-1)
+        assert np.all(mass[..., 0] > 0)                               # every chunk reads the sink
+        assert np.all(memory_mass > 0) and np.all(out[..., 0] > 0) and np.all(gdn[..., 0] > 0)
         assert np.all(np.isfinite(gdn)) and np.all(np.isfinite(data["timesteps"]))
 
 
@@ -104,7 +110,7 @@ def test_the_softmax_mass_is_the_kernels_own_read(tmp_path, monkeypatch):
     _, paths = _episode(model, probe, tmp_path)
     checked = 0
     for (position, layer, chunk), expected in reference.items():
-        data = np.load(paths[chunk])
+        data = np.load(paths[chunk - 1])   # the dumps start at chunk 1
         slot = probe.softmax_layers.index(layer)
         got = data["softmax_mass"][position[0], position[1], slot]
         np.testing.assert_allclose(got, expected.numpy(), rtol=1e-5, atol=1e-6)
@@ -135,7 +141,7 @@ def test_the_gdn_parts_add_up_to_the_layers_readout(tmp_path):
             handle.remove()
     assert captured
     for (position, layer, chunk), expected in captured.items():
-        got = np.load(paths[chunk])["gdn"][position[0], position[1], probe.gdn_layers.index(layer)][..., 3]
+        got = np.load(paths[chunk - 1])["gdn"][position[0], position[1], probe.gdn_layers.index(layer)][..., 3]
         np.testing.assert_allclose(got, expected.numpy(), rtol=1e-4, atol=1e-6)
 
 
@@ -164,8 +170,8 @@ def test_the_probe_computes_in_fp32_under_the_generations_bf16_autocast(tmp_path
     probe = AttentionProbe(model)
     g = torch.Generator().manual_seed(3)
     q = torch.randn(1, 57, 2, 32, generator=g)
-    k = torch.randn(1, 57 + 45, 2, 32, generator=g)
-    v = torch.randn(1, 57 + 45, 2, 32, generator=g)
+    k = torch.randn(1, 12 + 45 + 57, 2, 32, generator=g)      # the sink, chunk 0 (video_and_action), the window
+    v = torch.randn(1, 12 + 45 + 57, 2, 32, generator=g)
     gdn = [torch.randn(1, 2, 57, 32, generator=g), torch.randn(1, 2, 32, 32, generator=g), torch.randn(1, 2, 32, 32, generator=g),
            torch.rand(1, 2, 57, 32, generator=g), torch.rand(1, 2, 32, generator=g), torch.rand(1, 2, 32, generator=g)]
     results = []

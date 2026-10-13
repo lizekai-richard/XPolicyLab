@@ -1,23 +1,26 @@
 """Real-weight teacher-forcing parity: Sana's two-stream TRAINING forward vs the adapter's KV-cache inference, on the
-per-chunk observation canvas (Sana 61aad2d58 / 3a6b2bf07; the live tree must be at or after 3a6b2bf07).
+episode canvas (Sana d37817788 / fcccb4c88 / 3cbe3d85e; the live tree must be at or after 4bd1b674c).
 
 The same checkpoint and the same inputs go through two implementations of one prediction:
 
 (A) Sana's chunk-causal policy class, built and loaded exactly as Sana's causal validator does
     (``model_video_init_config`` + ``build_model``, ``pos_embed`` dropped), ONE forward over the training canvas
-    [clean targets 0..L-2 | noisy (obs_c | targets_c) 0..L-1] with ``two_stream_num_chunks = L`` -- the trainer's
-    assembly, softmax sliding window, ``memory_content`` rows and all;
-(B) the adapter's causal inference: per chunk k the denoising window [obs_k | noisy targets_k] against the KV cache (the
-    forward ``generate_chunk`` runs at every sampler step, built with the session's own helpers) followed by
-    ``commit_chunk`` of clean chunk k.
+    [sink | clean targets 0..L-2 | noisy chunks 0..L-1] with ``two_stream_num_chunks = L`` -- the trainer's assembly,
+    the first-observation sink and its StreamingLLM position, the softmax sliding window, ``memory_content`` rows and
+    ``chunk_observation`` all;
+(B) the adapter's causal inference: the sink and the frozen chunk 0 committed, then per chunk k >= 1 the denoising
+    window [obs_k | noisy targets_k] ([noisy targets_k] without chunk observations) against the KV cache (the forward
+    ``generate_chunk`` runs at every sampler step, built with the session's own helpers) followed by ``commit_chunk``
+    of clean chunk k.
 
-Both get the same caption (Gemma), per-chunk observation latents (each chunk's start frame encoded alone), clean chunk
-latents / actions / states and noisy chunks (flow mixtures at fixed per-chunk video and action timesteps). Per noisy
-chunk the video velocity and the action velocity (EEF-only slots) are compared. Runs (A) and (B) in fp32 (TF32 off: the
-implementation check, expect ~1e-5 relative) and in bf16 (the deployment precision), and (A) bf16 against (A) fp32 as
-the bf16 noise floor of the training forward; ``--precisions float64`` (attention and the GDN rotary product in fp64 too)
-separates rounding from logic. As a by-product it reports, per chunk, the gap between the observation
-(single-frame encode) and the anchor latent of the chunk's clip encode: the causal-VAE equality the protocol relies on.
+Both get the same caption (Gemma), the same latents from the adapter's own front-end (the per-view causal VAE streams
+of the episode: the sink, the frozen first chunk and every executed chunk's targets; each chunk's start frame encoded
+alone as its observation, chunk 1's being the sink), clean actions / states and noisy chunks (flow mixtures at fixed
+per-chunk video and action timesteps). Per noisy chunk k >= 1 the video velocity and the action velocity (EEF-only
+slots) are compared. Runs (A) and (B) in fp32 (TF32 off: the implementation check, expect ~1e-5 relative) and in bf16
+(the deployment precision), and (A) bf16 against (A) fp32 as the bf16 noise floor of the training forward;
+``--precisions float64`` (attention and the GDN rotary product in fp64 too) separates rounding from logic. As a
+by-product it reports obs_sink_gap, the first frame encoded alone vs the sink (expected 0).
 
 Inputs are VAE encodes of smooth synthetic camera frames and smooth normalized EEF trajectories (no simulator needed);
 ``--frames-from`` takes recorded RGB frames instead (an .npz with ``frames`` [T, 3, 480, 640, 3] uint8, the three
@@ -190,18 +193,20 @@ def smooth_rows(seed: int, chunks: int, chunk: int) -> torch.Tensor:
 
 # ---- (A) the training forward -------------------------------------------------------------------------------------------------
 
-def two_stream(live, crwm, inp, L, f_c, chunk, memory_content, autocast_dtype):
+def two_stream(live, crwm, inp, L, f_c, chunk, memory_content, observation, autocast_dtype):
     obs, clean, noisy = inp["obs"], inp["clean"], inp["noisy"]
     dev = next(live.parameters()).device
-    H, W = clean[0].shape[-2:]
-    units = [torch.cat([obs[c], noisy[c]], dim=2) for c in range(L)]
-    x = torch.cat(clean[: L - 1] + units, dim=2)
-    strip = x.reshape(*x.shape[:3], 1, H * W)
+    views, slots = inp["view_shapes"], inp["view_slots"]
+    width = sum(h * w for h, w in views)
+    units = [torch.cat(([obs[c]] if observation else []) + [noisy[c]], dim=2) for c in range(L)]
+    x = torch.cat([obs[0]] + clean[: L - 1] + units, dim=2)
+    strip = x.reshape(*x.shape[:3], 1, width)
     frames = x.shape[2]
-    noisy_start = (L - 1) * f_c
+    f_noisy = int(observation) + f_c
+    noisy_start = 1 + (L - 1) * f_c
     t_video = torch.zeros(1, frames, dtype=torch.float32)
     for c in range(L):
-        lo = noisy_start + c * (1 + f_c) + 1
+        lo = noisy_start + c * f_noisy + int(observation)
         t_video[:, lo : lo + f_c] = inp["t_video"][c]
     memory = crwm.memory_row_chunks(L, memory_content)
     rows = torch.cat(inp["a_clean"][:memory] + inp["a_noisy"][:L], dim=1)
@@ -211,10 +216,10 @@ def two_stream(live, crwm, inp, L, f_c, chunk, memory_content, autocast_dtype):
     mask_rows = inp["action_mask"][:, :1].expand(1, grid * chunk, 80)
     info = {
         "model_fps": 25.0,
-        "view_count": torch.tensor([1]),
-        "view_latent_shape": torch.tensor([[[H, W]]]),
+        "view_count": torch.tensor([len(views)]),
+        "view_latent_shape": torch.tensor([[list(v) for v in views]]),
         "video_frame_stride": torch.tensor([inp["stride"]]),
-        "view_slot_ids": torch.tensor([0]),
+        "view_slot_ids": torch.tensor(list(slots)),
         "rwm_task": "policy",
         "action80": crwm.insert_state_slots(rows, grid, chunk),
         "action_mask80": crwm.insert_state_slots(mask_rows, grid, chunk),
@@ -232,9 +237,9 @@ def two_stream(live, crwm, inp, L, f_c, chunk, memory_content, autocast_dtype):
         out = live(strip.to(dev, dtype), t_video.to(dev), inp["y"].to(dev, dtype), mask=inp["mask"].to(dev), data_info=info)
     positions = crwm.action_row_positions(grid, chunk)
     preds = []
-    for c in range(L):
-        lo = noisy_start + c * (1 + f_c) + 1
-        v = out["x"][:, :, lo : lo + f_c].reshape(1, -1, f_c, H, W)
+    for c in range(1, L):
+        lo = noisy_start + c * f_noisy + int(observation)
+        v = out["x"][:, :, lo : lo + f_c].reshape(1, -1, f_c, *clean[0].shape[-2:])
         a = out["action_pred"].index_select(1, positions[(memory + c) * chunk : (memory + c + 1) * chunk].to(dev))
         preds.append((v.float().cpu(), a.float().cpu()))
     return preds
@@ -246,43 +251,48 @@ def kv_chain(mirror, inp, L, window, autocast_dtype):
     dev = next(mirror.parameters()).device
     dtype = next(mirror.parameters()).dtype
     chunk = mirror.chunk_actions
+    strip = len(inp["view_shapes"]) > 1
     session = CausalPolicySession(
         mirror, caption=Caption(inp["y"].to(dev, dtype), inp["mask"].to(dev)), unconditional_caption=None, steps=1,
         flow_shift=5.0, action_flow_shift=1.0, video_cfg_scale=1.0, action_cfg_scale=1.0, model_fps=25.0,
-        window=window, autocast_dtype=autocast_dtype,
+        window=window, view_shapes=inp["view_shapes"] if strip else None, view_slot_ids=inp["view_slots"],
+        autocast_dtype=autocast_dtype,
     )
     caption, memory = session.streams[0]
     amask = inp["action_mask"].to(dev)
     smask = inp["state_mask"][0].to(dev)
     f_c = session.f_chunk
+    observation = bool(mirror.chunk_observation)
+
+    def commit(k):
+        session.commit_chunk(
+            inp["clean"][k].to(dev, dtype), inp["a_clean"][k].to(dev, dtype), anchor_state=inp["states"][k].to(dev, dtype),
+            anchor_state_mask=smask, action_mask=amask,
+        )
+
+    session.commit_sink(inp["obs"][0].to(dev, dtype))
+    commit(0)
     preds, reads = [], []
-    for k in range(L):
+    for k in range(1, L):
         video_t = torch.full((1, f_c), float(inp["t_video"][k]), device=dev)
         action_t = torch.full((1, chunk), float(inp["t_action"][k]), device=dev)
         robot = {
             "state80": inp["states"][k].to(dev, dtype), "state_mask80": smask[None],
             "action80": inp["a_noisy"][k].to(dev, dtype), "action_mask80": amask, "action_timesteps": action_t,
         }
-        observation = inp["obs"][k].to(dev, dtype)
-        session._check_latent(observation, 1, "observation_latent")
         reads.append((session.read_chunk_ids(), session.softmax_origin()))
-        caches = None if memory.committed == 0 else memory.layer_caches(commit=False, rope_of=session._rope_of)
-        latent = torch.cat((observation, inp["noisy"][k].to(dev, dtype)), dim=2)
-        window_t = torch.cat((video_t.new_zeros(1, 1), video_t), dim=1)
-        frame_offset, step_offset = k * f_c, k * chunk
-        soft_frame, soft_step = session._softmax_offsets(frame_offset, step_offset)
+        caches = session._caches(memory, commit=False)
+        parts = ([inp["obs"][k].to(dev, dtype)] if observation else []) + [inp["noisy"][k].to(dev, dtype)]
+        latent = torch.cat(parts, dim=2)
+        window_t = torch.cat((video_t.new_zeros(1, int(observation)), video_t), dim=1)
         with torch.no_grad(), session._autocast(dev):
-            out = mirror.forward_window(
-                latent, window_t, caption.y, caption.mask, model_fps=25.0, frame_offset=frame_offset,
-                step_offset=step_offset, robot=robot, caches=caches, softmax_frame_offset=soft_frame,
-                softmax_step_offset=soft_step,
+            out = session._forward(
+                latent, window_t, caption, memory, frame_offset=k * f_c + (0 if observation else 1),
+                step_offset=k * chunk, robot=robot, caches=caches,
             )
-        preds.append((out["x"][:, :, 1:].float().cpu(), out["action_pred"].float().cpu()))
+        preds.append((out["x"][:, :, int(observation):].float().cpu(), out["action_pred"].float().cpu()))
         if k < L - 1:
-            session.commit_chunk(
-                inp["clean"][k].to(dev, dtype), inp["a_clean"][k].to(dev, dtype), anchor_state=inp["states"][k].to(dev, dtype),
-                anchor_state_mask=smask, action_mask=amask,
-            )
+            commit(k)
     return preds, reads
 
 
@@ -334,7 +344,9 @@ def main() -> int:
     runtime = CausalRuntime.from_paths(args.checkpoint_dir, text_encoder_path=args.text_encoder_path, vae_path=args.vae_path,
                                        device=device, steps=10, cfg_scale=6.0, action_cfg_scale=1.0,
                                        allow_donor_checkpoint=args.allow_donor_checkpoint)
-    ticks = list(range(0, L * chunk + 1, stride))
+    # decision k >= 1 (training chunk k of the phase window whose head is one whole chunk) starts at episode tick
+    # (k - 1) * C; chunk k's targets are the frames after it up to the next decision
+    ticks = list(range(0, (L - 1) * chunk + 1, stride))
     if args.frames_from:
         recorded = np.load(args.frames_from)["frames"]
         if recorded.shape[0] <= ticks[-1]:
@@ -342,14 +354,21 @@ def main() -> int:
         frames = {t: list(recorded[t]) for t in ticks}
     else:
         frames = smooth_frames(args.seed, ticks)
-    obs = [runtime.encode_observation(list(frames[k * chunk])).float().cpu() for k in range(L)]
-    encodes = [runtime.encode_executed_chunk([list(frames[k * chunk + j * stride]) for j in range(chunk // stride + 1)])
-               for k in range(L)]
-    clean = [targets.float().cpu() for targets, _ in encodes]
-    anchor_gaps = [float(((anchor.float().cpu() - o) ** 2).mean().sqrt() / (o**2).mean().sqrt().clamp_min(1e-8))
-                   for (_, anchor), o in zip(encodes, obs)]
-    print(f"[tf-parity] obs_anchor_gap (single-frame observation vs the clip's anchor latent, relative RMSE): "
-          f"max {max(anchor_gaps):.2e} mean {sum(anchor_gaps) / len(anchor_gaps):.2e}", flush=True)
+    views = {t: runtime.view_frames(frames[t]) for t in ticks}
+    streams = runtime.new_streams()
+    sink, frozen = streams.start(views[0])
+    clean = [frozen.float().cpu()]
+    for k in range(1, L):
+        per_tick = [views[(k - 1) * chunk + t] for t in range(stride, chunk + 1, stride)]
+        clean.append(streams.encode_chunk([[v[i] for v in per_tick] for i in range(len(per_tick[0]))]).float().cpu())
+    obs = [sink.float().cpu(), sink.float().cpu()] + [
+        runtime.encode_observation(views[(k - 1) * chunk])[0].float().cpu() for k in range(2, L)
+    ]
+    first_obs, _ = runtime.encode_observation(views[0])
+    sink_gap = float(((first_obs.float().cpu() - obs[0]) ** 2).mean().sqrt() / (obs[0] ** 2).mean().sqrt().clamp_min(1e-8))
+    print(f"[tf-parity] obs_sink_gap (the first frame encoded alone vs the sink, relative RMSE): {sink_gap:.2e}", flush=True)
+    view_shapes = streams.view_shapes if runtime.strip else ((int(clean[0].shape[-2]), int(clean[0].shape[-1])),)
+    view_slots = runtime.view_slot_ids
     y, mask, _, _ = runtime.frontend.encode_instruction(args.instruction)
     y, mask = y.float().cpu(), mask.cpu()
     del runtime
@@ -365,6 +384,7 @@ def main() -> int:
     state_mask[:, EEF_SLOTS] = True
     inp = {
         "obs": obs, "clean": clean, "y": y, "mask": mask, "stride": stride, "action_mask": action_mask, "state_mask": state_mask,
+        "view_shapes": view_shapes, "view_slots": view_slots,
         "states": [rows[k * chunk][None] for k in range(L)],
         "a_clean": [rows[k * chunk + 1 : (k + 1) * chunk + 1][None] for k in range(L)],
         "t_video": [1000.0 * s for s in sig_v], "t_action": [1000.0 * s for s in sig_a],
@@ -372,7 +392,8 @@ def main() -> int:
     inp["noisy"] = [(1 - s) * x0 + s * torch.randn(x0.shape, generator=g) for s, x0 in zip(sig_v, clean)]
     inp["a_noisy"] = [((1 - s) * a0 + s * torch.randn(a0.shape, generator=g)).masked_fill(~action_mask, 0)
                       for s, a0 in zip(sig_a, inp["a_clean"])]
-    print(f"[tf-parity] inputs ready ({time.perf_counter() - t0:.0f}s): obs {tuple(obs[0].shape)} per chunk, {L} chunks", flush=True)
+    print(f"[tf-parity] inputs ready ({time.perf_counter() - t0:.0f}s): latents {tuple(obs[0].shape)} per frame, {L} chunks "
+          f"(chunk 0 the frozen opening), views {view_shapes}", flush=True)
 
     # 2. (A) and (B) per precision, one model on the GPU at a time
     crwm = import_live_tree(args.sana_repo)
@@ -387,7 +408,7 @@ def main() -> int:
         if dtype == torch.float64:
             attention_in_working_precision(live)
         t1 = time.perf_counter()
-        a_preds = two_stream(live, crwm, inp, L, f_c, chunk, contract.memory_content, autocast)
+        a_preds = two_stream(live, crwm, inp, L, f_c, chunk, contract.memory_content, contract.chunk_observation, autocast)
         print(f"[tf-parity] {prec} (A) two-stream forward {time.perf_counter() - t1:.1f}s; live missing keys {len(missing)}: {missing[:6]}", flush=True)
         del live
         gc.collect(); torch.cuda.empty_cache()
@@ -414,19 +435,19 @@ def main() -> int:
     print("\n[tf-parity] per noisy chunk (relative L2 error = ||X - A|| / ||A||; video velocity | action velocity on the 20 EEF slots)")
     keys = list(report)
     print("chunk  read(origin)      " + "  ".join(f"{k:>26s}" for k in keys))
-    for c in range(L):
-        ids, origin = reads[c]
+    for c in range(1, L):
+        ids, origin = reads[c - 1]
         rd = f"[{ids[0]}..{ids[-1]}]({origin})" if ids else "empty"
-        print(f"{c:5d}  {rd:16s} " + "  ".join(f"{report[k][c]['video_rel']:12.2e} | {report[k][c]['action_rel']:10.2e}" for k in keys))
+        print(f"{c:5d}  {rd:16s} " + "  ".join(f"{report[k][c - 1]['video_rel']:12.2e} | {report[k][c - 1]['action_rel']:10.2e}" for k in keys))
     print("\n[tf-parity] summary: max relative error over chunks before / after the window boundary (chunk > window)")
     for k in keys:
-        pre = [x for c, x in enumerate(report[k]) if window is None or c <= window]
-        post = [x for c, x in enumerate(report[k]) if window is not None and c > window]
+        pre = [x for c, x in enumerate(report[k], start=1) if window is None or c <= window]
+        post = [x for c, x in enumerate(report[k], start=1) if window is not None and c > window]
         fmt = lambda xs, f: f"{max(x[f] for x in xs):.2e}" if xs else "-"
         print(f"  {k:22s} video {fmt(pre, 'video_rel')} / {fmt(post, 'video_rel')}   action {fmt(pre, 'action_rel')} / {fmt(post, 'action_rel')}")
     if args.out:
         os.makedirs(args.out, exist_ok=True)
-        json.dump({"args": vars(args), "reads": reads, "report": report, "obs_anchor_gap": anchor_gaps},
+        json.dump({"args": vars(args), "reads": reads, "report": report, "obs_sink_gap": sink_gap},
                   open(os.path.join(args.out, "tf_parity.json"), "w"), indent=1)
         torch.save({k: v for k, v in inp.items()}, os.path.join(args.out, "tf_parity_inputs.pt"))
         print(f"[tf-parity] wrote {args.out}")

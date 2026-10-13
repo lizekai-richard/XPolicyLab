@@ -7,9 +7,9 @@
   orthonormal rot6d and in-range grippers round-trip to the model output (fp32), clipped grippers commit at the
   bound, a non-orthonormal rot6d commits the rotation the evaluator received.
 
-The normalization artifact is the one the causal recipes pin (sha 1fe3b7e7, shipped with the causal checkpoints; the
-sana_pixel donors' 9f8b98ed copy holds the same statistics); the training yaml is the real config.yaml of the
-pantheon14k video_and_action checkpoint at step 5000. Live parts need ``SANA_CAUSAL_REPO``.
+The normalization artifact is the one the episode recipes pin (sha 9f8b98ed, the pantheon33k sana_latent donor's; the
+earlier causal recipes' 1fe3b7e7 copy holds the same statistics); the training yaml is the pantheon33k episode recipe
+with ``memory_content: video_and_action``. Live parts need ``SANA_CAUSAL_REPO``.
 """
 
 from __future__ import annotations
@@ -38,9 +38,9 @@ from sana_wam_min.robodojo_io import ROBOT80_JOINT_SLOTS_12, state80_from_obs
 from sana_wam_min.robot80 import normalize_action, normalize_state
 from sana_wam_min.session import load_checked_normalization
 
-ARTIFACT = os.path.join(_paths.FIXTURES, "normalization_causal_f33_1fe3b7e7.json")
-CONFIG = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
-SANA_CAUSAL_REPO = os.path.expanduser(os.environ.get("SANA_CAUSAL_REPO", "~/zekail/Sana"))
+ARTIFACT = os.path.join(_paths.FIXTURES, "normalization_causal_f33_9f8b98ed.json")
+CONFIG = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoandaction_0081aa702.yaml")
+SANA_CAUSAL_REPO = os.path.expanduser(os.environ.get("SANA_CAUSAL_REPO", "~/zekail/Sana_episode_0081aa702"))
 FP32 = {"rtol": 2e-6, "atol": 2e-6}
 
 from XPolicyLab.policy.SANA_WAM_CAUSAL.model import executed_rows  # noqa: E402  (the adapter's helper)

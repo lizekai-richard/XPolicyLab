@@ -1,4 +1,5 @@
-"""Contract resolution from a causal training yaml and the session memory's softmax read rule (CPU, no Sana)."""
+"""Contract resolution from a causal training yaml and the session memory's softmax read rule, episode protocol (CPU,
+no Sana)."""
 
 from __future__ import annotations
 
@@ -20,14 +21,18 @@ from sana_wam_causal.contract import (
     bidirectional_view,
     resolve_causal_contract,
 )
+from sana_wam_causal.layers import LayerCache
 from sana_wam_causal.model import CausalPolicyModel
 from sana_wam_causal.session import Caption, CausalMemory, CausalPolicySession
 from sana_wam_min.config import THREE_VIEW_POLICY_FACTORY, policy_config_from_train_config
 from sana_wam_min.policy_model.config import PolicyConfig
 
-FIXTURE = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
-FIXTURE_VIDEOONLY = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoonly_s5000.yaml")
-FIXTURE_RETIRED = os.path.join(_paths.FIXTURES, "config_causal_vanilla52k_m48n24_s7646.yaml")
+EPISODE_VA = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoandaction_0081aa702.yaml")
+EPISODE_VO = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoonly_0081aa702.yaml")
+EPISODE_NOOBS = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoonly_noobs_0081aa702.yaml")
+SINKLESS_VA = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
+SINKLESS_VO = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoonly_s5000.yaml")
+RETIRED_CHUNK0 = os.path.join(_paths.FIXTURES, "config_causal_vanilla52k_m48n24_s7646.yaml")
 
 
 def _load(path):
@@ -37,38 +42,66 @@ def _load(path):
 
 @pytest.fixture(scope="module")
 def causal_cfg():
-    return _load(FIXTURE)
+    return _load(EPISODE_VO)
+
+
+def _pixel_episode_cfg():
+    """A sana_pixel canvas config on the episode protocol: the pantheon14k m48n24 recipe without its window repeats."""
+
+    cfg = _load(SINKLESS_VO)
+    del cfg["data"]["extra"]["window_repeats"]
+    return cfg
 
 
 @pytest.mark.parametrize(
-    "path,memory_content",
-    [(FIXTURE, MEMORY_VIDEO_AND_ACTION), (FIXTURE_VIDEOONLY, MEMORY_VIDEO_ONLY)],
-    ids=["no-key-video_and_action", "video_only"],
+    "path,memory_content,observation",
+    [(EPISODE_VA, MEMORY_VIDEO_AND_ACTION, True), (EPISODE_VO, MEMORY_VIDEO_ONLY, True),
+     (EPISODE_NOOBS, MEMORY_VIDEO_ONLY, False)],
+    ids=["video_and_action", "video_only", "video_only-noobs"],
 )
-def test_the_pantheon14k_recipes_resolve(path, memory_content):
+def test_the_pantheon33k_episode_recipes_resolve(path, memory_content, observation):
     contract = resolve_causal_contract(_load(path))
     assert (contract.actions_per_chunk, contract.video_frame_stride, contract.latent_frames_per_chunk) == (32, 4, 1)
     assert contract.sliding_window_chunks == 24 and contract.memory_content == memory_content
-    assert (contract.multiview, contract.visual_layout, contract.rope) == ("sana_pixel", "sana_pixel_canvas", "aligned")
+    assert contract.chunk_observation is observation
+    assert (contract.multiview, contract.visual_layout, contract.rope) == ("sana_latent", "three_view_strip", "aligned")
     assert (contract.dt_bias_init, contract.a_log_init) == (-5.0, 0.0)
-    assert contract.describe().startswith("protocol=per_chunk_obs ") and f"memory_content={memory_content}" in contract.describe()
+    text = contract.describe()
+    assert text.startswith("protocol=episode ") and f"memory_content={memory_content}" in text
+    assert f"chunk_observation={observation}" in text
+
+
+def test_a_sana_pixel_canvas_resolves_on_the_episode_protocol():
+    contract = resolve_causal_contract(_pixel_episode_cfg())
+    assert (contract.multiview, contract.visual_layout) == ("sana_pixel", "sana_pixel_canvas")
+    assert contract.chunk_observation is True
 
 
 def test_the_bidirectional_view_restores_the_sft_tier(causal_cfg):
     view = bidirectional_view(causal_cfg)
     assert view["model"]["model"] == THREE_VIEW_POLICY_FACTORY
     assert view["data"]["num_frames"] == 33 and view["data"]["multi_fps"] == {"25": [33]}
-    assert causal_cfg["data"]["num_frames"] == 1537  # the source is left untouched
+    assert causal_cfg["data"]["num_frames"] == 1569  # the source is left untouched
     config = policy_config_from_train_config(view)
     assert (config.depth, config.hidden_size, tuple(config.softmax_layer_indices)) == (32, 2560, (3, 7, 11, 15, 19, 23, 27, 31))
     assert config.rope == "aligned" and config.separate_action_schedule
+    assert tuple(config.multiview_spatial_rope_tile_shape) == (8, 16)
+
+
+@pytest.mark.parametrize("path", [SINKLESS_VA, SINKLESS_VO], ids=["video_and_action", "video_only"])
+def test_the_sinkless_pantheon14k_checkpoints_are_refused(path):
+    """The real config.yaml of the pantheon14k m48n24 step-5000 checkpoints (the sink-less per-chunk observation
+    protocol) is refused by its marker, before any weight is read."""
+
+    with pytest.raises(ValueError, match="window_repeats: this checkpoint trained the sink-less per-chunk observation"):
+        resolve_causal_contract(_load(path))
 
 
 def test_the_retired_chunk0_observation_checkpoint_is_refused():
-    """The real config.yaml of the vanilla52k causal checkpoint s7646 (chunk-0-only observation) is refused by name."""
+    """The real config.yaml of the vanilla52k causal checkpoint s7646 (chunk-0-only observation) is refused."""
 
-    with pytest.raises(ValueError, match="obs_in_first_chunk=True: this checkpoint trained a retired observation layout"):
-        resolve_causal_contract(_load(FIXTURE_RETIRED))
+    with pytest.raises(ValueError, match="window_repeats|obs_in_first_chunk"):
+        resolve_causal_contract(_load(RETIRED_CHUNK0))
 
 
 def _policy(cfg):
@@ -79,23 +112,37 @@ def _policy(cfg):
     "edit,match",
     [
         (lambda c: c["model"].__setitem__("model", THREE_VIEW_POLICY_FACTORY), "not the chunk-causal policy class"),
+        (lambda c: c["data"]["extra"].__setitem__("window_repeats", [[1, 1], [35, 3]]), "sink-less"),
         (lambda c: _policy(c).__setitem__("obs_in_first_chunk", False), "retired observation layout"),
         (lambda c: _policy(c).__setitem__("memory_content", "video_and_state"), "memory_content"),
+        (lambda c: _policy(c).__setitem__("chunk_observation", "no"), "chunk_observation"),
+        (lambda c: _policy(c).__setitem__("hierarchical_memory", {"gdn": "dense"}), "SANA_WAM_HM"),
         (lambda c: c["model"]["extra"].__setitem__("rope", "independent"), "aligned only"),
         (lambda c: c["model"].__setitem__("use_time_conditioning", True), "use_time_conditioning"),
-        (lambda c: c["model"]["extra"].__setitem__("sana_pixel_pad", "masked"), "sana_pixel_pad"),
-        (lambda c: c["data"]["extra"].__setitem__("multiview", "sana_latent"), "sana_pixel canvas"),
+        (lambda c: (c["data"]["extra"].__setitem__("multiview", "openwam"),
+                    c["data"].__setitem__("aspect_ratio_type", "ASPECT_RATIO_OPENWAM_LSHAPE_384_320")),
+         "sana_latent strip and the one-view"),
         (lambda c: c["data"].__setitem__("type", "RoboDojoSFTDataset"), "causal chunk-window dataset"),
         (lambda c: _policy(c).__setitem__("actions_per_chunk", {"25": 24}), "disagree"),
     ],
-    ids=["sft-class", "obs-key", "memory-content", "independent", "time-conditioning", "padmask", "strip", "sft-dataset",
-         "chunk-mismatch"],
+    ids=["sft-class", "window-repeats", "obs-key", "memory-content", "chunk-observation", "hierarchical", "independent",
+         "time-conditioning", "openwam", "sft-dataset", "chunk-mismatch"],
 )
 def test_unsupported_contracts_are_refused(causal_cfg, edit, match):
     cfg = copy.deepcopy(causal_cfg)
     edit(cfg)
     with pytest.raises((ValueError, NotImplementedError), match=match):
         resolve_causal_contract(cfg)
+
+
+def test_a_masked_sana_pixel_pad_is_refused():
+    cfg = _pixel_episode_cfg()
+    cfg["model"]["extra"]["sana_pixel_pad"] = "masked"
+    with pytest.raises(NotImplementedError, match="sana_pixel_pad"):
+        resolve_causal_contract(cfg)
+
+
+# -- the memory --------------------------------------------------------------------------------------------------------
 
 
 class _Cfg(SimpleNamespace):
@@ -108,30 +155,38 @@ class _Model:
         self.blocks = [type("B", (), {"attn_type": kind})() for kind in kinds]
 
 
-def _add(memory: CausalMemory) -> None:
-    """Commit ONE chunk numbered by the memory's count: softmax (pre-RoPE k, v) = (id, id) as [1, 1, 1, 2]."""
-
-    from sana_wam_causal.layers import LayerCache
-
-    chunk = memory.committed
+def _entry_caches(memory: CausalMemory, value: float) -> list[LayerCache]:
     caches = []
     for kind in memory.kinds:
         cache = LayerCache(commit=True)
         if kind == "GatedDeltaNet":
-            cache.gdn_next = (torch.full((1,), float(chunk)), torch.full((1,), float(chunk)))
+            cache.gdn_next = (torch.full((1,), value), torch.full((1,), value))
         else:
-            cache.softmax_new = (torch.full((1, 1, 1, 2), float(chunk), dtype=torch.float64),
-                                 torch.full((1, 1, 1, 2), float(chunk), dtype=torch.float64))
+            cache.softmax_new = (torch.full((1, 1, 1, 2), value, dtype=torch.float64),
+                                 torch.full((1, 1, 1, 2), value, dtype=torch.float64))
         caches.append(cache)
-    memory.absorb(caches)
+    return caches
+
+
+def _sink(memory: CausalMemory) -> None:
+    """Commit the sink: softmax (pre-RoPE k, v) = (-1, -1) as [1, 1, 1, 2]."""
+
+    memory.absorb_sink(_entry_caches(memory, -1.0))
+
+
+def _add(memory: CausalMemory) -> None:
+    """Commit ONE chunk numbered by the memory's count: softmax (pre-RoPE k, v) = (id, id) as [1, 1, 1, 2]."""
+
+    memory.absorb(_entry_caches(memory, float(memory.committed)))
 
 
 def _fill(memory: CausalMemory, chunks: int) -> None:
+    _sink(memory)
     for _ in range(chunks):
         _add(memory)
 
 
-def _identity_rope(slot):
+def _identity_rope(slot=None):
     return torch.ones(1, 1, 1, 1, dtype=torch.complex128)   # [B, 1, T = 1, D / 2 = 1]
 
 
@@ -147,26 +202,37 @@ def _identity_rope(slot):
         (2, 1, [0]),
     ],
 )
-def test_the_read_is_the_newest_window_of_committed_chunks(window, chunks, expected):
+def test_the_read_is_the_sink_and_the_newest_window_of_committed_chunks(window, chunks, expected):
     memory = CausalMemory(_Model(["GatedDeltaNet", "GatedSoftmaxAttention"]), window)
     _fill(memory, chunks)
     assert memory.read_chunk_ids() == expected
-    k, v = memory.layer_caches(commit=False, rope_of=_identity_rope)[1].softmax_context
-    assert k[..., 0].reshape(-1).tolist() == v[..., 0].reshape(-1).tolist() == [float(c) for c in expected]
+    k, v = memory.layer_caches(commit=False, rope_of=_identity_rope, sink_rope=_identity_rope())[1].softmax_context
+    assert k[..., 0].reshape(-1).tolist() == v[..., 0].reshape(-1).tolist() == [-1.0] + [float(c) for c in expected]
     assert memory.gdn[0][0].item() == float(chunks - 1)       # the GDN state of the last commit, never windowed
     assert len(memory.chunks[1]) == len(expected)              # only what can be read again is kept
 
 
-def test_an_empty_memory_reads_nothing():
+def test_the_sink_opens_the_memory_once():
     memory = CausalMemory(_Model(["GatedDeltaNet", "GatedSoftmaxAttention"]), 3)
     assert memory.read_plan() == ([], 0)
-    caches = memory.layer_caches(commit=False)   # no rope needed: nothing is read
+    caches = memory.layer_caches(commit=False)   # nothing to read before the sink
     assert caches[0].gdn_state is None and caches[1].softmax_context is None
+    with pytest.raises(RuntimeError, match="commit the sink first"):
+        _add(memory)
+    _sink(memory)
+    assert memory.has_sink and memory.committed == 0 and memory.gdn[0][0].item() == -1.0
+    k, _ = memory.layer_caches(commit=False, sink_rope=_identity_rope())[1].softmax_context   # the sink alone
+    assert k[..., 0].reshape(-1).tolist() == [-1.0]
+    with pytest.raises(ValueError, match="sink's rope"):
+        memory.layer_caches(commit=False)
+    with pytest.raises(RuntimeError, match="committed once"):
+        _sink(memory)
 
 
 @pytest.mark.parametrize(
     "window,chunks,ids,origin",
     [
+        (3, 0, [], 0),             # the frozen chunk 0's commit reads the sink alone
         (3, 2, [0, 1], 0),
         (3, 3, [0, 1, 2], 0),
         (3, 4, [1, 2, 3], 1),      # chunk 4's read: chunks 1..3 in slots 0..2, chunk 4 itself in slot 3
@@ -184,34 +250,37 @@ def test_every_read_is_numbered_from_zero_at_its_oldest_chunk(window, chunks, id
         asked.append(slot)
         return _identity_rope(slot)
 
-    memory.layer_caches(commit=False, rope_of=rope_of)
+    memory.layer_caches(commit=False, rope_of=rope_of, sink_rope=_identity_rope())
     assert asked == list(range(len(ids)))
 
 
 def test_reads_rotate_the_pre_rope_keys_at_their_slots():
-    """The stored keys are pre-RoPE: a read multiplies them by its own phase per slot, values stay untouched."""
+    """The stored keys are pre-RoPE: a read multiplies them by its own phase per slot (the sink by its own), values stay
+    untouched."""
 
     memory = CausalMemory(_Model(["GatedSoftmaxAttention"]), 2)
-    _fill(memory, 5)   # chunks 0..4; the read takes chunks 3, 4 (origin 3) in slots 0, 1
+    _fill(memory, 5)   # the sink, chunks 0..4; the read takes chunks 3, 4 (origin 3) in slots 0, 1
 
-    def rope_of(slot):
-        angle = 1.0 + slot
+    def phase(angle):
         return torch.polar(torch.ones(1, 1, 1, 1, dtype=torch.float64), torch.full((1, 1, 1, 1), angle, dtype=torch.float64))
 
-    k, v = memory.layer_caches(commit=False, rope_of=rope_of)[0].softmax_context
+    k, v = memory.layer_caches(commit=False, rope_of=lambda slot: phase(1.0 + slot), sink_rope=phase(0.5))[0].softmax_context
     expected = []
-    for chunk, angle in ((3, 1.0), (4, 2.0)):
-        z = complex(chunk, chunk) * complex(math.cos(angle), math.sin(angle))
+    for value, angle in ((-1, 0.5), (3, 1.0), (4, 2.0)):
+        z = complex(value, value) * complex(math.cos(angle), math.sin(angle))
         expected.append([z.real, z.imag])
-    torch.testing.assert_close(k.reshape(2, 2), torch.tensor(expected, dtype=torch.float64), rtol=0, atol=1e-12)
-    assert v[..., 0].reshape(-1).tolist() == [3.0, 4.0]
+    torch.testing.assert_close(k.reshape(3, 2), torch.tensor(expected, dtype=torch.float64), rtol=0, atol=1e-12)
+    assert v[..., 0].reshape(-1).tolist() == [-1.0, 3.0, 4.0]
     with pytest.raises(ValueError, match="rope_of"):
-        memory.layer_caches(commit=False)
+        memory.layer_caches(commit=False, sink_rope=phase(0.5))
     with pytest.raises(ValueError, match=">= 1 committed chunks"):
         CausalMemory(_Model(["GatedSoftmaxAttention"]), 0)
 
 
-def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION):
+# -- the session on a tiny model -----------------------------------------------------------------------------------------
+
+
+def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION, observation=True):
     config = PolicyConfig.from_sana_kwargs(
         depth=4, hidden_size=64, patch_size=(1, 1, 1), num_heads=2, in_channels=4, caption_channels=16,
         model_max_length=7, linear_head_dim=32, softmax_head_dim=32, softmax_ratio=0.5, attn_res_block_size=2,
@@ -220,8 +289,9 @@ def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION):
     )
     contract = CausalContract(
         actions_per_chunk=32, video_frame_stride=4, latent_frames_per_chunk=1, sliding_window_chunks=window,
-        memory_content=memory_content, model_fps=25.0, tier_num_frames=33, multiview="sana_pixel",
-        visual_layout="sana_pixel_canvas", rope="aligned", dt_bias_init=-5.0, a_log_init=0.0, reset_legacy_beta=False,
+        memory_content=memory_content, chunk_observation=observation, model_fps=25.0, tier_num_frames=33,
+        multiview="sana_pixel", visual_layout="sana_pixel_canvas", rope="aligned", dt_bias_init=-5.0, a_log_init=0.0,
+        reset_legacy_beta=False,
     )
     torch.manual_seed(0)
     model = CausalPolicyModel(config, contract)
@@ -231,21 +301,36 @@ def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION):
     return model.eval()
 
 
-def _session(model, caption, null, window=2):
+def _session(model, caption, null, window=2, video_cfg=6.0, steps=3):
     return CausalPolicySession(
-        model, caption=caption, unconditional_caption=null, steps=3, flow_shift=5.0, action_flow_shift=1.0,
-        video_cfg_scale=6.0, action_cfg_scale=1.0, model_fps=25.0, window=window,
+        model, caption=caption, unconditional_caption=null, steps=steps, flow_shift=5.0, action_flow_shift=1.0,
+        video_cfg_scale=video_cfg, action_cfg_scale=1.0, model_fps=25.0, window=window,
     )
 
 
-@pytest.mark.parametrize("memory_content", [MEMORY_VIDEO_AND_ACTION, MEMORY_VIDEO_ONLY])
-def test_the_session_runs_a_deterministic_episode_on_cpu(memory_content):
-    model = _tiny_model(window=2, memory_content=memory_content)
-    g = torch.Generator().manual_seed(1)
+def _captions(seed):
+    g = torch.Generator().manual_seed(seed)
     caption = Caption(torch.randn(1, 1, 1, 7, 16, generator=g), torch.ones(1, 1, 7, dtype=torch.int16))
     null = Caption(torch.randn(1, 1, 1, 7, 16, generator=g), torch.ones(1, 1, 7, dtype=torch.int16))
-    observations = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(4)]
-    clean = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(4)]
+    return caption, null, g
+
+
+def _open(session, sink, frozen, state, mask):
+    session.commit_sink(sink)
+    session.commit_chunk(frozen, torch.zeros(1, 32, 80), anchor_state=state, anchor_state_mask=mask[0, 0], action_mask=mask)
+
+
+@pytest.mark.parametrize(
+    "memory_content,observation",
+    [(MEMORY_VIDEO_AND_ACTION, True), (MEMORY_VIDEO_ONLY, True), (MEMORY_VIDEO_ONLY, False)],
+    ids=["video_and_action", "video_only", "video_only-noobs"],
+)
+def test_the_session_runs_a_deterministic_episode_on_cpu(memory_content, observation):
+    model = _tiny_model(window=2, memory_content=memory_content, observation=observation)
+    caption, null, g = _captions(1)
+    sink, frozen = torch.randn(1, 4, 1, 3, 4, generator=g), torch.randn(1, 4, 1, 3, 4, generator=g)
+    observations = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(5)]
+    clean = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(5)]
     mask = torch.zeros(1, 32, 80, dtype=torch.bool)
     mask[..., 7:17] = True
     mask[..., 36:46] = True
@@ -253,20 +338,21 @@ def test_the_session_runs_a_deterministic_episode_on_cpu(memory_content):
 
     def run():
         session = _session(model, caption, null)
+        _open(session, sink, frozen, state, mask)
         outs = []
-        for c in range(4):
-            assert session.read_chunk_ids() == list(range(max(0, c - 2), c))
+        for c in range(1, 5):
+            assert session.chunk_idx == c and session.read_chunk_ids() == list(range(max(0, c - 2), c))
             gen = torch.Generator().manual_seed(100 + c)
             action, video = session.generate_chunk(
-                observations[c], anchor_state=state, anchor_state_mask=mask[0, 0], action_mask=mask, generator=gen,
-                gripper_bounds=((-1.0, 1.0), (-1.0, 1.0)),
+                observations[c] if observation else None, anchor_state=state, anchor_state_mask=mask[0, 0],
+                action_mask=mask, generator=gen, gripper_bounds=((-1.0, 1.0), (-1.0, 1.0)),
             )
             assert action.shape == (1, 32, 80) and video.shape == (1, 4, 1, 3, 4)
             assert torch.count_nonzero(action[~mask]) == 0
             assert float(action[..., 16].abs().max()) <= 1.0 and float(action[..., 45].abs().max()) <= 1.0
             outs.append((action, video))
             session.commit_chunk(clean[c], action, anchor_state=state, anchor_state_mask=mask[0, 0], action_mask=mask)
-        assert session.chunk_idx == 4 and session.read_chunk_ids() == [2, 3] and session.softmax_origin() == 2
+        assert session.chunk_idx == 5 and session.read_chunk_ids() == [3, 4] and session.softmax_origin() == 3
         return outs
 
     first, second = run(), run()
@@ -274,25 +360,65 @@ def test_the_session_runs_a_deterministic_episode_on_cpu(memory_content):
         assert torch.equal(a1, a2) and torch.equal(v1, v2)
 
 
-def test_reset_memory_makes_the_next_chunk_a_first_chunk():
+def test_every_text_stream_commits_on_its_own_clock():
+    """CFG is linear in the two streams, so with one solver step the guided video at s = 2 is 2 * (cond only) - (null
+    only) exactly -- past the softmax window too, which holds only when every stream's commit reads on its own clock
+    (a commit runs the streams one after the other; a regression found while porting)."""
+
+    model = _tiny_model(window=2).double()
+    caption, null, g = _captions(4)
+    caption, null = Caption(caption.y.double(), caption.mask), Caption(null.y.double(), null.mask)
+    sink, frozen = torch.randn(1, 4, 1, 3, 4, generator=g).double(), torch.randn(1, 4, 1, 3, 4, generator=g).double()
+    observations = [torch.randn(1, 4, 1, 3, 4, generator=g).double() for _ in range(6)]
+    clean = [torch.randn(1, 4, 1, 3, 4, generator=g).double() for _ in range(6)]
+    noise = [torch.randn(1, 4, 1, 3, 4, generator=g).double() for _ in range(6)]
+    mask = torch.ones(1, 32, 80, dtype=torch.bool)
+    state = torch.randn(1, 80, generator=g).double()
+
+    def episode(first, second, scale):
+        session = CausalPolicySession(
+            model, caption=first, unconditional_caption=second, steps=1, flow_shift=5.0, action_flow_shift=1.0,
+            video_cfg_scale=scale, action_cfg_scale=1.0, model_fps=25.0, window=2, autocast_dtype=None,
+        )
+        _open(session, sink, frozen, state.float(), mask)
+        videos = []
+        for c in range(1, 6):
+            _, video = session.generate_chunk(
+                observations[c], anchor_state=state, anchor_state_mask=mask[0, 0], action_mask=mask,
+                video_noise=noise[c], action_noise=torch.zeros(1, 32, 80, dtype=torch.float64),
+            )
+            videos.append(video)
+            session.commit_chunk(clean[c], torch.zeros(1, 32, 80, dtype=torch.float64), anchor_state=state,
+                                 anchor_state_mask=mask[0, 0], action_mask=mask)
+        return videos
+
+    cond, uncond, guided = episode(caption, null, 1.0), episode(null, caption, 1.0), episode(caption, null, 2.0)
+    for c, (a, b, d) in enumerate(zip(cond, uncond, guided), start=1):
+        torch.testing.assert_close(2 * a - b, d, rtol=1e-9, atol=1e-12, msg=lambda m: f"chunk {c}: {m}")
+
+
+def test_reset_memory_reopens_the_episode():
     model = _tiny_model(window=2)
-    g = torch.Generator().manual_seed(2)
-    caption = Caption(torch.randn(1, 1, 1, 7, 16, generator=g), torch.ones(1, 1, 7, dtype=torch.int16))
-    null = Caption(torch.randn(1, 1, 1, 7, 16, generator=g), torch.ones(1, 1, 7, dtype=torch.int16))
-    observation = torch.randn(1, 4, 1, 3, 4, generator=g)
+    caption, null, g = _captions(2)
+    sink, frozen, observation = (torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(3))
     mask = torch.ones(1, 32, 80, dtype=torch.bool)
     state = torch.randn(1, 80, generator=g)
     kwargs = dict(anchor_state=state, anchor_state_mask=mask[0, 0], action_mask=mask)
 
     fresh = _session(model, caption, null)
+    _open(fresh, sink, frozen, state, mask)
     reference = fresh.generate_chunk(observation, generator=torch.Generator().manual_seed(5), **kwargs)
     used = _session(model, caption, null)
-    for c in range(3):
+    _open(used, torch.randn(1, 4, 1, 3, 4, generator=g), torch.randn(1, 4, 1, 3, 4, generator=g), state, mask)
+    for _ in range(3):
         used.commit_chunk(torch.randn(1, 4, 1, 3, 4, generator=g), torch.randn(1, 32, 80, generator=g), **kwargs)
     with_memory = used.generate_chunk(observation, generator=torch.Generator().manual_seed(5), **kwargs)
     assert not torch.equal(with_memory[0], reference[0])
     used.reset_memory()
-    assert used.chunk_idx == 0 and used.read_chunk_ids() == []
+    assert used.chunk_idx == 0 and used.read_chunk_ids() == [] and not used.has_sink
+    with pytest.raises(RuntimeError, match="first emission is chunk 1"):
+        used.generate_chunk(observation, generator=torch.Generator().manual_seed(5), **kwargs)
+    _open(used, sink, frozen, state, mask)
     again = used.generate_chunk(observation, generator=torch.Generator().manual_seed(5), **kwargs)
     assert torch.equal(again[0], reference[0]) and torch.equal(again[1], reference[1])
 
@@ -311,11 +437,14 @@ def test_a_session_refuses_misuse():
     )
     mask = torch.ones(1, 32, 80, dtype=torch.bool)
     kwargs = dict(anchor_state=torch.zeros(1, 80), anchor_state_mask=mask[0, 0], action_mask=mask)
+    with pytest.raises(ValueError, match="sink_latent must be"):
+        session.commit_sink(torch.zeros(1, 4, 2, 3, 4))   # two frames: not one observation
+    _open(session, torch.zeros(1, 4, 1, 3, 4), torch.zeros(1, 4, 1, 3, 4), torch.zeros(1, 80), mask)
     with pytest.raises(ValueError, match="observation_latent must be"):
         session.generate_chunk(torch.zeros(1, 4, 2, 3, 4), **kwargs)   # two frames: not one observation
     session.generate_chunk(torch.zeros(1, 4, 1, 3, 4), **kwargs)
     with pytest.raises(ValueError, match="latent grid"):
-        session.generate_chunk(torch.zeros(1, 4, 1, 4, 4), **kwargs)   # the canvas grid is fixed per session
+        session.generate_chunk(torch.zeros(1, 4, 1, 4, 4), **kwargs)   # the latent grid is fixed per session
     with pytest.raises(ValueError, match="chunk_latent"):
         session.commit_chunk(torch.zeros(1, 4, 2, 3, 4), torch.zeros(1, 32, 80), **kwargs)
     with pytest.raises(ValueError, match="executed_action"):

@@ -1,11 +1,13 @@
 """Everything a causal deploy loads once: the causal model, the shared front-end, the encoders, the normalization.
 
 The non-model half is ``sana_wam_min``'s ``PolicyInferenceSession`` (the bidirectional SANA_WAM front-end) built on the
-causal checkpoint's *bidirectional view* (``contract.bidirectional_view``): the sana_pixel canvas and its single-frame
-VAE encode, the G = 1 canvas prompt rows and their Gemma encoding (conditional + unconditional), the normalization
-artifact resolved and selected exactly as for the parent SFT checkpoint (f33 file name, yaml sha pin, absolute-EEF
-statistics), and the action denormalization. This module adds what only the causal deploy needs: the causal model,
-the per-chunk observation encode, the 9-frame encode of an executed chunk and the per-episode ``CausalPolicySession``.
+causal checkpoint's *bidirectional view* (``contract.bidirectional_view``): the view pixels (the three-view strip, each
+camera resized to its bucket, or the sana_pixel canvas), the prompt rows (G = V + 1 for the strip, G = 1 for the
+canvas) and their Gemma encoding (conditional + unconditional), the normalization artifact resolved and selected
+exactly as for the parent SFT checkpoint (f33 file name, yaml sha pin, absolute-EEF statistics), and the action
+denormalization. This module adds what only the causal deploy needs: the causal model, the single-frame observation
+encode, the per-view causal VAE streams of an episode (``vae_stream.ViewStreams``: the sink, the frozen first chunk
+and every executed chunk's targets) and the per-episode ``CausalPolicySession``.
 """
 
 from __future__ import annotations
@@ -25,7 +27,9 @@ from sana_wam_min.config import (  # noqa: E402
     policy_config_from_train_config,
     resolve_rope_contract,
 )
-from sana_wam_min.pixels import frames_to_vae_input  # noqa: E402
+from sana_wam_min.config import VISUAL_LAYOUT_SANA_PIXEL_CANVAS, VISUAL_LAYOUT_THREE_VIEW_STRIP  # noqa: E402
+from sana_wam_min.multiview import pack_multiview_latents  # noqa: E402
+from sana_wam_min.pixels import frame_to_model_tensor, target_size_hw  # noqa: E402
 from sana_wam_min.robodojo_io import VIEW_SLOT_IDS  # noqa: E402
 from sana_wam_min.sana_pixel_canvas import expected_sana_pixel_latent_hw, sana_pixel_canvas_from_frames  # noqa: E402
 from sana_wam_min.session import (  # noqa: E402
@@ -37,12 +41,13 @@ from sana_wam_min.session import (  # noqa: E402
     resolve_sampling_knobs,
 )
 from sana_wam_min.text import load_text_encoder  # noqa: E402
-from sana_wam_min.vae import encode_video, load_vae  # noqa: E402
+from sana_wam_min.vae import load_vae  # noqa: E402
 
 from .checkpoint import load_causal_weights  # noqa: E402
 from .contract import CausalContract, bidirectional_view, resolve_causal_contract  # noqa: E402
 from .model import CausalPolicyModel, build_causal_policy  # noqa: E402
 from .session import Caption, CausalPolicySession  # noqa: E402
+from .vae_stream import ViewStreams, encode_window  # noqa: E402
 
 
 @dataclass
@@ -129,8 +134,12 @@ class CausalRuntime:
             raise RuntimeError(f"front-end layout {frontend.visual_layout} != contract {self.contract.visual_layout}")
         if int(frontend.video_frame_stride) != int(self.contract.video_frame_stride):
             raise RuntimeError("front-end and contract disagree on the video frame stride")
-        if int(frontend.text_groups) != 1:
-            raise RuntimeError(f"the one-view canvas carries one prompt row, the front-end resolved G={frontend.text_groups}")
+        views = len(frontend.view_slot_ids)
+        groups = 1 if frontend.visual_layout == VISUAL_LAYOUT_SANA_PIXEL_CANVAS else views + 1
+        if int(frontend.text_groups) != groups:
+            raise RuntimeError(
+                f"the {frontend.visual_layout} front-end carries G = {groups} prompt rows, it resolved G={frontend.text_groups}"
+            )
 
     # -- per episode -------------------------------------------------------------------------------------------------
 
@@ -138,8 +147,19 @@ class CausalRuntime:
     def device(self) -> torch.device:
         return self.frontend.device
 
-    def new_session(self, instruction: str) -> CausalPolicySession:
-        """A fresh memory for one episode, conditioned on ``instruction`` (conditional + unconditional rows)."""
+    @property
+    def strip(self) -> bool:
+        """The three-view strip (several views on the batch's width axis) rather than the one-view canvas."""
+
+        return self.frontend.visual_layout == VISUAL_LAYOUT_THREE_VIEW_STRIP
+
+    @property
+    def view_slot_ids(self) -> tuple[int, ...]:
+        return tuple(int(slot) for slot in self.frontend.view_slot_ids) if self.strip else (0,)
+
+    def new_session(self, instruction: str, view_shapes=None) -> CausalPolicySession:
+        """A fresh memory for one episode, conditioned on ``instruction`` (conditional + unconditional rows);
+        ``view_shapes`` are the strip's per-view latent shapes (None for the canvas)."""
 
         y, mask, null_y, null_mask = self.frontend.encode_instruction(instruction)
         frontend = self.frontend
@@ -154,53 +174,60 @@ class CausalRuntime:
             action_cfg_scale=frontend.action_cfg_scale,
             model_fps=self.contract.model_fps,
             window=self.contract.sliding_window_chunks,
+            view_shapes=view_shapes if self.strip else None,
+            view_slot_ids=self.view_slot_ids,
         )
 
-    def _canvas(self, frames_rgb: Sequence[np.ndarray]) -> torch.Tensor:
+    def view_frames(self, frames_rgb: Sequence[np.ndarray]) -> list[torch.Tensor]:
+        """One tick's cameras (``ROBODOJO_VIEW_ORDER``) as the float ``[3, H, W]`` model tensors the VAE encodes: every
+        view resized to its bucket (the strip), or the three composited into the sana_pixel canvas (one view)."""
+
         frontend = self.frontend
-        return sana_pixel_canvas_from_frames(
-            [np.asarray(frame) for frame in frames_rgb],
-            VIEW_SLOT_IDS,
-            frontend.sana_pixel_canvas_hw,
-            view_resize=frontend.view_resize,
-        )
+        frames = [np.asarray(frame) for frame in frames_rgb]
+        if len(frames) != len(frontend.view_order):
+            raise ValueError(f"expected {len(frontend.view_order)} camera frames in order {frontend.view_order}")
+        if not self.strip:
+            return [
+                sana_pixel_canvas_from_frames(
+                    frames, VIEW_SLOT_IDS, frontend.sana_pixel_canvas_hw, view_resize=frontend.view_resize
+                )
+            ]
+        return [
+            frame_to_model_tensor(
+                frame,
+                target_size_hw(frontend.image_size, frame_hw=(int(frame.shape[0]), int(frame.shape[1]))),
+                frontend.view_resize,
+            )
+            for frame in frames
+        ]
+
+    def _check_grid(self, latent: torch.Tensor, view_shapes) -> None:
+        vae = self.frontend.vae
+        if not self.strip:
+            expected = tuple(expected_sana_pixel_latent_hw(vae.spatial_compression, self.frontend.sana_pixel_canvas_hw))
+            if (int(latent.shape[-2]), int(latent.shape[-1])) != expected:
+                raise ValueError(f"canvas latent grid {tuple(latent.shape[-2:])} differs from the trained {expected}")
+        elif len(set(view_shapes or ())) != 1:
+            raise ValueError(f"single-resolution contract violated: view latent shapes {view_shapes}")
 
     @torch.inference_mode()
-    def encode_frames(self, canvases: Sequence[torch.Tensor]) -> torch.Tensor:
-        """Encode ``[3, H, W]`` canvases as ONE clip (causal LTX-2.3: frame 0 alone, then groups of 8)."""
+    def encode_observation(self, views: Sequence[torch.Tensor]) -> tuple[torch.Tensor, Optional[tuple]]:
+        """A chunk's observation: its start frame encoded alone, every view on its own (``view_frames``) and packed ->
+        (``[1, C_lat, 1, H, W]`` canvas or ``[1, C_lat, 1, 1, sum(h * w)]`` strip, the strip's view shapes or None).
+        By the causal VAE it is the window encode's latent of that frame alone (chunk 1: the sink)."""
 
-        vae = self.frontend.vae
-        clip = torch.stack(list(canvases), dim=0)
-        video = frames_to_vae_input(clip).to(device=vae.device, dtype=vae.dtype)
-        latent = encode_video(vae, video)
-        expected = expected_sana_pixel_latent_hw(vae.spatial_compression, self.frontend.sana_pixel_canvas_hw)
-        if (int(latent.shape[-2]), int(latent.shape[-1])) != tuple(expected):
-            raise ValueError(f"canvas latent grid {tuple(latent.shape[-2:])} differs from the trained {expected}")
-        return latent
+        latents = [encode_window(self.frontend.vae, [view]) for view in views]
+        packed, shapes = pack_multiview_latents(latents)
+        shapes = tuple(shapes) if self.strip else None
+        self._check_grid(packed, shapes)
+        return packed, shapes
 
-    def encode_observation(self, frames_rgb: Sequence[np.ndarray]) -> torch.Tensor:
-        """A chunk's observation: its start frame encoded alone, ``[1, C_lat, 1, H, W]`` -- by the causal VAE the anchor
-        latent of the chunk's own C+1-row encode, which is the observation every noisy chunk carries in training
-        (store member ``w{s + cC}``, latent 0)."""
+    def new_streams(self) -> ViewStreams:
+        """The per-view causal VAE streams of one episode (``start`` at its first frame, then one chunk at a time)."""
 
-        return self.encode_frames([self._canvas(frames_rgb)])
-
-    def encode_executed_chunk(self, frames_per_view: Sequence[Sequence[np.ndarray]]) -> tuple[torch.Tensor, torch.Tensor]:
-        """The executed chunk's 1 + C/s observed frames (ticks 0, s, .., C of the chunk) encoded as one clip ->
-        (target latents ``[1, C_lat, f_c, H, W]``, the committed memory, training's ``w{s + cC}`` latents 1..; anchor
-        latent ``[1, C_lat, 1, H, W]``, which equals the chunk's single-frame observation encode under the causal
-        VAE -- the adapter logs their gap)."""
-
-        expected = 1 + self.contract.actions_per_chunk // self.contract.video_frame_stride
-        if len(frames_per_view) != expected:
-            raise ValueError(f"an executed chunk needs {expected} observed frames, got {len(frames_per_view)}")
-        latent = self.encode_frames([self._canvas(frames) for frames in frames_per_view])
-        targets = latent[:, :, 1:]
-        if targets.shape[2] != self.contract.latent_frames_per_chunk:
-            raise ValueError(
-                f"the chunk clip encoded to {latent.shape[2]} latent frames; expected 1 + {self.contract.latent_frames_per_chunk}"
-            )
-        return targets, latent[:, :, :1]
+        return ViewStreams(
+            self.frontend.vae, frames_per_chunk=self.contract.actions_per_chunk // self.contract.video_frame_stride
+        )
 
 
 def timed(fn, *args, **kwargs):

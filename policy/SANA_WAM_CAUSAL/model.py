@@ -1,21 +1,24 @@
 """XPolicyLab adapter of the SANA chunk-causal policy (RoboDojo ARX-X5, EEF-only absolute targets, EE-pose actions).
 
 The policy runs in-process through the vendored, Sana-free ``sana_wam_causal`` package (on top of SANA_WAM's
-``sana_wam_min`` runtime) and is deployed teacher-forced, exactly as it trains (two-stream teacher forcing, the
-per-chunk observation protocol):
+``sana_wam_min`` runtime) and is deployed teacher-forced, exactly as it trains (two-stream teacher forcing, the episode
+protocol of Sana ``d37817788`` / ``4bd1b674c``):
 
-* every ``get_action`` encodes the chunk-start frame alone as the chunk's observation and denoises the chunk as the
-  window [observation | targets] + [state | actions] against the memory (GDN state of everything committed; softmax
-  over the newest ``sliding_window_chunks`` committed chunks, the training forward's rule); the first chunk of an
-  episode reads an empty memory;
+* the first ``get_action`` of an episode opens one causal VAE stream per view at the first frame and the memory with two
+  commits: the sink (the first frame encoded alone) and the frozen first chunk (the first frame repeated over one
+  chunk's frames, encoded on after it; under ``memory_content`` video_and_action its rows hold the robot at its first
+  state). It then generates chunk 1 from the first frame -- the training's phase window whose head is one whole chunk;
+* every ``get_action`` denoises its chunk as the window [observation | targets] + [state | actions] ([targets] + rows
+  for a model trained without chunk observations) against the memory: the GDN state of everything committed, and on
+  the softmax side the sink plus the newest ``sliding_window_chunks`` committed chunks (the training forward's rule);
 * while a chunk executes, every ``update_obs`` advances the chunk clock tau (RoboDojo calls it once after every
-  executed action, the last one right before the next ``get_action``) and keeps the camera frames of ticks
-  0, s, 2s, .., C (s = the video frame stride, C = the chunk);
-* every later ``get_action`` first COMMITS the executed chunk -- the 1 + C/s observed frames encoded as one clip with
-  the anchor latent dropped and, under ``memory_content`` video_and_action, the committed actions and the chunk-start
-  state -- then encodes the new chunk's observation and generates it. The observation itself never enters memory;
-* ``reset`` (RoboDojo sends it twice per episode) drops the memory; the episode counter advances on the first
-  ``update_obs`` of the next episode.
+  executed action, the last one right before the next ``get_action``) and keeps the camera frames of ticks s, 2s, .., C
+  (s = the video frame stride, C = the chunk);
+* every later ``get_action`` first COMMITS the executed chunk -- its C / s observed frames encoded on in the per-view
+  streams and, under video_and_action, the committed actions and the chunk-start state -- then encodes the new chunk's
+  observation (its start frame alone) and generates it. No observation but the sink enters memory;
+* ``reset`` (RoboDojo sends it twice per episode) drops the memory and the streams; the episode counter advances on the
+  first ``update_obs`` of the next episode.
 
 Returned actions: C dicts ``{left,right}_ee_pose`` (link6 in the env-relative world frame, xyz + wxyz) and
 ``{left,right}_ee_joint_state`` (normalized opening), the evaluator solving IK per tick (``action_type: ee``).
@@ -80,9 +83,9 @@ CHECKPOINT_EXPLICIT_KEYS = ("checkpoint_dir", "checkpoint_path", "ckpt_dir", "mo
 # the measured joints after each action, gripper as observed) -- training's rows are both at once (the dataset state is
 # the previous command)
 COMMIT_ACTIONS = ("executed", "predicted", "reached")
-# full = the deployment (memory of the whole episode); none = the memory ablation: nothing is committed and every chunk
-# reads an empty memory, i.e. is generated like chunk 0 of an episode (the [observation | targets] window, which every
-# training window's first chunk is)
+# full = the deployment (memory of the whole episode); none = the memory ablation: every chunk reopens the memory at
+# its own start frame (the sink and the frozen first chunk of that frame) and is generated as chunk 1, i.e. as the
+# first emission of an episode starting there -- the episode protocol trains no memoryless window
 MEMORY_MODES = ("full", "none")
 SEED_DOMAIN = "sana_wam_causal_xpolicylab.diffusion_seed.v1"
 MAX_JSON_SAFE_INTEGER = 2**53 - 1
@@ -289,11 +292,13 @@ class Model(ModelTemplate):
         self.chunk_actions = int(contract.actions_per_chunk)
         self.frame_stride = int(contract.video_frame_stride)
         self.memory_content = str(contract.memory_content)
+        self.chunk_observation = bool(contract.chunk_observation)
         check_commit_actions(self.commit_actions, self.memory_content)
 
         # diagnostics: per-chunk memory-read aggregates of every generation forward (attention_probe.py)
         self._probe = AttentionProbe(self.runtime.model) if self.attention_dump_dir else None
         self._session = None
+        self._streams = None
         self._episode_open = False
         self._episode_index = 0
         self._chunk_index = 0
@@ -306,7 +311,7 @@ class Model(ModelTemplate):
         self._size_warned = False
         report = self.runtime.load_report
         print(
-            f"{TAG} ready: ckpt={self.ckpt_dir} {contract.describe()} softmax_positions=rank "
+            f"{TAG} ready: ckpt={self.ckpt_dir} {contract.describe()} softmax_positions=rank+sink "
             f"steps={frontend.steps} video_cfg_scale={frontend.video_cfg_scale} action_cfg_scale={frontend.action_cfg_scale} "
             f"flow_shift={frontend.flow_shift} action_flow_shift={frontend.action_flow_shift} "
             f"view_resize={frontend.view_resize} ({frontend.view_resize_source}) commit_actions={self.commit_actions} "
@@ -375,7 +380,7 @@ class Model(ModelTemplate):
     def _anchor(self, obs: Mapping[str, Any], *, check_pose: bool = False) -> tuple[np.ndarray, np.ndarray, torch.Tensor]:
         """(raw state80, EEF-only mask80, normalized state [80]) of the chunk-start observation: measured joints ->
         URDF FK -> base-frame E pose (position + rot6d), gripper closedness from the observed opening; joints masked.
-        ``check_pose`` (chunk 0 of an episode) also runs the observed-pose check."""
+        ``check_pose`` (the first decision of an episode) also runs the observed-pose check."""
 
         state80, mask80 = self._measured_row(obs), eef_state_slot_mask(True)
         mask80 = np.array(mask80, dtype=np.bool_, copy=True)
@@ -402,11 +407,20 @@ class Model(ModelTemplate):
         if any(pos > EEF_POSE_CHECK_WARN_M or deg > EEF_POSE_CHECK_WARN_DEG for pos, deg in gaps.values()):
             warnings.warn(f"observed end-effector pose disagrees with FK(measured joints): {text}", stacklevel=2)
 
-    def _commit_pending(self, timings: dict, *, commit: bool = True) -> tuple[Optional[float], str, Optional[float]]:
-        """Fold the executed chunk into memory (``commit``); return the world-model error of its prediction, the
-        commanded-vs-reached gap of its actions and the gap between its observation (the single-frame encode it was
-        generated from) and the anchor latent of its clip encode. ``commit=False`` (``memory_mode: none``) only
-        encodes it for those errors and drops it."""
+    def _chunk_views(self) -> list[list[torch.Tensor]]:
+        """The executed chunk's C / s observed frames (ticks s, 2s, .., C) as per-view model tensors (``view_frames``)."""
+
+        ticks = list(range(self.frame_stride, self.chunk_actions + 1, self.frame_stride))
+        missing = [t for t in ticks if t not in self._frames]
+        if missing:
+            raise RuntimeError(f"{TAG} frames of ticks {missing} were not observed for chunk {self._pending['chunk']}")
+        per_tick = [self.runtime.view_frames(self._frames[t]) for t in ticks]
+        return [[views[v] for views in per_tick] for v in range(len(per_tick[0]))]
+
+    def _commit_pending(self, timings: dict, *, commit: bool = True) -> tuple[Optional[float], str]:
+        """Encode the executed chunk on in the per-view streams and fold it into memory (``commit``); return the
+        world-model error of its prediction and the commanded-vs-reached gap of its actions. ``commit=False``
+        (``memory_mode: none``) encodes it on the stream its memory reopened at, for the error alone."""
 
         pending = self._pending
         if self._tau != self.chunk_actions:
@@ -414,10 +428,6 @@ class Model(ModelTemplate):
                 f"{TAG} chunk {pending['chunk']} was executed for {self._tau} of {self.chunk_actions} ticks; only a "
                 "complete chunk can be committed (the causal policy never trained on a partial context chunk)"
             )
-        ticks = list(range(0, self.chunk_actions + 1, self.frame_stride))
-        missing = [t for t in ticks if t not in self._frames]
-        if missing:
-            raise RuntimeError(f"{TAG} frames of ticks {missing} were not observed for chunk {pending['chunk']}")
         # the pose reached after action j is the one measured at tick j + 1
         reached = np.stack([self._reached[t] for t in range(1, self.chunk_actions + 1)])
         mask_cpu = pending["mask_cpu"]
@@ -426,16 +436,13 @@ class Model(ModelTemplate):
             committed = normalize_action(torch.from_numpy(reached), mask_cpu, self.normalization).masked_fill(~mask_cpu, 0)
             pending["committed_action"] = committed.unsqueeze(0).to(device=self.runtime.device)
         if not commit and not self.log_world_model_error:
-            return None, gap, None
-        (latent, anchor), timings["encode_s"] = timed(
-            self.runtime.encode_executed_chunk, [self._frames[t] for t in ticks]
-        )
+            return None, gap
+        latent, timings["stream_s"] = timed(self._streams.encode_chunk, self._chunk_views())
         wm_error = None
         if self.log_world_model_error and pending.get("predicted_latent") is not None:
             wm_error = relative_rmse(pending["predicted_latent"], latent)
-        anchor_gap = relative_rmse(anchor, pending["observation_latent"])
         if not commit:
-            return wm_error, gap, anchor_gap
+            return wm_error, gap
         _, timings["commit_s"] = timed(
             self._session.commit_chunk,
             latent,
@@ -444,7 +451,33 @@ class Model(ModelTemplate):
             anchor_state_mask=pending["anchor_mask"],
             action_mask=pending["action_mask"],
         )
-        return wm_error, gap, anchor_gap
+        return wm_error, gap
+
+    def _open_memory(self, views: list[torch.Tensor], anchor_raw: np.ndarray, anchor_norm: torch.Tensor,
+                     action_mask: torch.Tensor, timings: dict) -> torch.Tensor:
+        """(Re)open the streams and the memory at this frame: the sink, then the frozen first chunk (its rows hold the
+        robot at this state under video_and_action); returns the sink, which is chunk 1's observation."""
+
+        device = self.runtime.device
+        self._streams = self.runtime.new_streams()
+        (sink, frozen), timings["open_stream_s"] = timed(self._streams.start, views)
+        if self._session is None:
+            raise RuntimeError(f"{TAG} no session to open")
+        self._session.reset_memory()
+        self._session.view_shapes = self._streams.view_shapes if self.runtime.strip else None
+        mask_cpu = action_mask[0].detach().cpu()
+        hold_raw = torch.from_numpy(np.repeat(anchor_raw[None].astype(np.float32), self.chunk_actions, axis=0))
+        hold = normalize_action(hold_raw, mask_cpu, self.normalization).masked_fill(~mask_cpu, 0)
+
+        def opening():
+            self._session.commit_sink(sink)
+            self._session.commit_chunk(
+                frozen, hold.unsqueeze(0).to(device), anchor_state=anchor_norm.to(device),
+                anchor_state_mask=action_mask[0, 0], action_mask=action_mask,
+            )
+
+        _, timings["open_commit_s"] = timed(opening)
+        return sink
 
     def get_action(self) -> list[dict[str, np.ndarray]]:
         obs = self._latest_obs
@@ -454,8 +487,9 @@ class Model(ModelTemplate):
         timings: dict[str, float] = {}
         frames = self._frames_from_obs(obs)
         instruction = self._instruction_from_obs(obs)
-        wm_error, gap, anchor_gap = None, None, None
-        if self._session is None:
+        first = self._session is None
+        wm_error, gap = None, None
+        if first:
             self._session = self.runtime.new_session(instruction)
             self._session.probe = self._probe
             self._instruction = instruction
@@ -466,28 +500,35 @@ class Model(ModelTemplate):
                     f"{TAG} the instruction changed within episode {self._episode_index} ({self._instruction!r} -> "
                     f"{instruction!r}); the memory is caption-conditioned"
                 )
-            wm_error, gap, anchor_gap = self._commit_pending(timings, commit=self.memory_mode == "full")
-            if self.memory_mode == "none":
-                # the memory ablation: nothing is committed, so every chunk reads an empty memory (chunk 0's form)
-                self._session.reset_memory()
-        chunk = self._chunk_index   # the episode's chunk index (noise seed, logs)
-        if self.memory_mode == "full" and self._session.chunk_idx != chunk:
-            raise RuntimeError(f"{TAG} the session committed {self._session.chunk_idx} chunks before chunk {chunk}")
-        if self.max_chunks_per_episode is not None and chunk >= self.max_chunks_per_episode:
+            wm_error, gap = self._commit_pending(timings, commit=self.memory_mode == "full")
+        decision = self._chunk_index   # the episode's decision count (0-based)
+        if self.max_chunks_per_episode is not None and decision >= self.max_chunks_per_episode:
             raise RuntimeError(f"{TAG} episode {self._episode_index} reached max_chunks_per_episode={self.max_chunks_per_episode}")
-        read_ids = self._session.read_chunk_ids()
-        origin = self._session.softmax_origin()   # the read is numbered from 0 here
-        observation_latent, timings["obs_encode_s"] = timed(self.runtime.encode_observation, frames)
 
-        anchor_raw, anchor_mask, anchor_norm = self._anchor(obs, check_pose=chunk == 0)
+        anchor_raw, anchor_mask, anchor_norm = self._anchor(obs, check_pose=first)
         device = self.runtime.device
         anchor_mask_t = torch.as_tensor(anchor_mask, dtype=torch.bool, device=device)
         action_mask = anchor_mask_t.reshape(1, 1, -1).expand(1, self.chunk_actions, -1).contiguous()
-        seed = derive_diffusion_seed(self.diffusion_seed_base, self.eval_seed, self._episode_index, chunk)
+        views = self.runtime.view_frames(frames)
+        if first or self.memory_mode == "none":
+            # the episode opens here (memory none: every chunk reopens it at its own start frame); chunk 1's
+            # observation is the first frame encoded alone, i.e. the sink
+            observation_latent = self._open_memory(views, anchor_raw, anchor_norm, action_mask, timings)
+        elif self.chunk_observation:
+            (observation_latent, _), timings["obs_encode_s"] = timed(self.runtime.encode_observation, views)
+        else:
+            observation_latent = None   # the chunk reads its current frame from the memory
+        chunk = self._session.chunk_idx   # the training chunk this window is (1 at an episode's first frame)
+        expected = 1 if self.memory_mode == "none" else decision + 1
+        if chunk != expected:
+            raise RuntimeError(f"{TAG} the session is at chunk {chunk} for decision {decision} (expected {expected})")
+        read_ids = self._session.read_chunk_ids()
+        origin = self._session.softmax_origin()   # the read is numbered from 0 here, the sink one frame before it
+        seed = derive_diffusion_seed(self.diffusion_seed_base, self.eval_seed, self._episode_index, decision)
         generator = torch.Generator(device=device).manual_seed(seed)
         (action_norm, predicted_latent), timings["generate_s"] = timed(
             self._session.generate_chunk,
-            observation_latent,
+            observation_latent if self.chunk_observation else None,
             anchor_state=anchor_norm.to(device),
             anchor_state_mask=anchor_mask_t,
             action_mask=action_mask,
@@ -498,7 +539,8 @@ class Model(ModelTemplate):
             self._probe.write(
                 self.attention_dump_dir, self._episode_index,
                 {"instruction": instruction, "memory_mode": self.memory_mode, "memory_content": self.memory_content,
-                 "diffusion_seed": int(seed), "checkpoint": str(self.ckpt_dir)},
+                 "chunk_observation": self.chunk_observation, "decision": int(decision), "diffusion_seed": int(seed),
+                 "checkpoint": str(self.ckpt_dir)},
             )
         mask_cpu = action_mask[0].detach().cpu()
         action_raw = model_action_to_absolute(
@@ -515,7 +557,6 @@ class Model(ModelTemplate):
 
         self._pending = {
             "chunk": chunk,
-            "observation_latent": observation_latent.detach(),
             "anchor_norm": anchor_norm.to(device),
             "anchor_mask": anchor_mask_t,
             "action_mask": action_mask,
@@ -524,17 +565,17 @@ class Model(ModelTemplate):
             "executed_raw": executed_raw,
             "mask_cpu": mask_cpu,
         }
-        self._frames = {0: frames}
+        self._frames = {}
         self._reached = {}
         self._tau = 0
-        self._chunk_index = chunk + 1
+        self._chunk_index = decision + 1
         total = time.perf_counter() - start
         detail = " ".join(f"{k}={v:.2f}" for k, v in timings.items())
         print(
-            f"{TAG} ep {self._episode_index} chunk {chunk}: read_chunks={read_ids} origin={origin} {detail} total_s={total:.2f}"
-            + ("" if wm_error is None else f" world_model_rel_rmse(chunk {chunk - 1})={wm_error:.4f}")
-            + ("" if gap is None else f" cmd_vs_reached(chunk {chunk - 1}): {gap}")
-            + ("" if anchor_gap is None else f" obs_anchor_gap(chunk {chunk - 1})={anchor_gap:.2e}"),
+            f"{TAG} ep {self._episode_index} decision {decision} chunk {chunk}: read_chunks={read_ids} origin={origin} "
+            f"{detail} total_s={total:.2f}"
+            + ("" if wm_error is None else f" world_model_rel_rmse(decision {decision - 1})={wm_error:.4f}")
+            + ("" if gap is None else f" cmd_vs_reached(decision {decision - 1}): {gap}"),
             flush=True,
         )
         return [
@@ -552,6 +593,7 @@ class Model(ModelTemplate):
         """Drop the episode's memory; idempotent (RoboDojo sends two resets per episode)."""
 
         self._session = None
+        self._streams = None
         self._episode_open = False
         self._latest_obs = None
         self._tau = None

@@ -1,23 +1,31 @@
-"""Inference-only mirror of the chunk-causal policy (Sana ``sana_qwennext_policy_causal.py``, per-chunk observation
-protocol: ``61aad2d58`` / ``3a6b2bf07``, checked against ``9ee9c2d9d``).
+"""Inference-only mirror of the chunk-causal policy (Sana ``sana_qwennext_policy_causal.py``, episode protocol:
+``d37817788`` / ``fcccb4c88`` / ``3cbe3d85e`` and the deploy forms of ``4bd1b674c``).
 
 The model is the bidirectional policy trunk (``sana_wam_min.policy_model.PolicyModel``: embedders, AdaLN table,
 Block AttnRes V2, text cross-attention, final layer, action head) with every block rebuilt around the chunk-causal
-shells of ``layers.py``. It evaluates ONE deploy window per call, always a single chunk segment, which is every form
-the streaming session needs (Sana ``CausalPolicyChunkSession`` + ``forward_chunk``):
+shells of ``layers.py``. It evaluates ONE deploy window per call, always a single segment, which is every form the
+streaming session needs (Sana ``CausalPolicyChunkSession`` with ``forward_sink`` / ``forward_chunk``):
 
-* the denoising window of chunk c: [observation_c (t = 0) | chunk-c targets] + [state | C actions] -- the two-stream
-  noisy chunk c, which reads the session memory (chunk 0 reads nothing: the bidirectional single-chunk window with the
-  causal GDN formula);
-* the commit of the executed chunk c at t = 0: [chunk-c targets] + [state | C actions] under ``memory_content``
-  video_and_action, the targets alone (no robot rows) under video_only -- the two-stream clean chunk c, which reads
-  like the generation of chunk c, then writes its GDN state and softmax K/V.
+* the sink commit: the episode's first observation (one latent frame, no robot rows, t = 0) on video frame 0 -- the
+  two-stream sink segment, which reads only itself and which every later forward reads;
+* the denoising window of chunk c >= 1: [observation_c (t = 0) | chunk-c targets] + [state | C actions] ([targets] +
+  rows under ``chunk_observation`` false) -- the two-stream noisy chunk c, which reads the session memory;
+* the commit of chunk c at t = 0: [chunk-c targets] + [state | C actions] under ``memory_content`` video_and_action,
+  the targets alone (no robot rows) under video_only -- the two-stream clean chunk c (chunk 0 the frozen first chunk),
+  which reads like the generation of chunk c, then writes its GDN state and softmax K/V.
 
-RoPE (``rope: aligned``): latent frame phi sits at ``base_fps * phi / (fps / s)`` (s = the video frame stride) and
-robot step n at ``base_fps * n / (8 * fps)``; chunk c's observation is latent frame ``c * f_chunk`` (the instant of
-chunk c - 1's last target), its targets ``c * f_chunk + 1`` onwards, its state row step ``c * C`` and its actions steps
-``c * C + 1 .. c * C + C`` (Sana ``_physical_frame_ids``, ``forward_chunk``). The canvas keeps the plain (t, y, x)
-grid; the robot rows carry spatial ids 0. One text group (G = 1) spans the window.
+Front-ends: the one-view canvas ``[B, C, F, H, W]`` (``sana_pixel``) and the three-view strip ``[B, C, F, 1,
+sum(H_v * W_v)]`` (``sana_latent``), restored to view-major tokens (every view's frames in turn) before the trunk, the
+robot rows after them (Sana ``_chunk_permutation`` of a single segment).
+
+RoPE (``rope: aligned``): the bidirectional policy's video ids (the plain (t, y, x) grid for one view, the semantic 2x2
+tiles for three, Sana ``_video_position_ids``) with the time column on the physical frame clock: latent frame phi at
+``base_fps * phi / (fps / s)`` (s = the video frame stride), robot step n at ``base_fps * n / (8 * fps)`` with spatial
+ids 0. The sink sits at frame 0, chunk c's observation at latent frame ``c * f_chunk`` (the instant of chunk c - 1's last
+target), its targets at ``c * f_chunk + 1`` onwards, its state row at step ``c * C`` and its actions at steps
+``c * C + 1 .. c * C + C`` (Sana ``_causal_multiview_rope``, ``forward_sink``, ``forward_chunk``). Text: one prompt row
+(G = 1) for the canvas, G = V + 1 rows for the strip (one per view, then the robot tail; a robotless window reads the V
+view rows only, Sana ``_grouped_query_sublens``).
 """
 
 from __future__ import annotations
@@ -43,7 +51,11 @@ from sana_wam_min.policy_model.embeddings import (  # noqa: E402
 )
 from sana_wam_min.policy_model.geometry import strip_to_view_tokens, view_to_strip_tokens  # noqa: E402
 from sana_wam_min.policy_model.model import PolicyModel  # noqa: E402
-from sana_wam_min.policy_model.rope import PhysicalTimeWanRotaryPosEmbed, WanRotaryPosEmbed  # noqa: E402
+from sana_wam_min.policy_model.rope import (  # noqa: E402
+    PhysicalTimeWanRotaryPosEmbed,
+    WanRotaryPosEmbed,
+    semantic_2x2_position_ids,
+)
 
 from .contract import ACTION_TEMPORAL_COMPRESSION, MEMORY_VIDEO_AND_ACTION, CausalContract  # noqa: E402
 from .layers import GDN_KIND, CausalPolicyBlock, LayerCache  # noqa: E402
@@ -51,8 +63,18 @@ from .layers import GDN_KIND, CausalPolicyBlock, LayerCache  # noqa: E402
 GDN_RECURRENCE_KEYS = ("gate_proj.weight", "gate_proj.bias", "A_log", "dt_bias", "recall_gate")
 
 
+ViewShapes = tuple[tuple[int, int], ...]
+
+
+def view_token_counts(frames: int, view_shapes: ViewShapes) -> list[int]:
+    """Tokens of every view's run in a window of ``frames`` latent frames (view-major order)."""
+
+    return [int(frames) * int(height) * int(width) for height, width in view_shapes]
+
+
 class CausalPolicyModel(PolicyModel):
-    """The causal policy's deploy windows on the bidirectional trunk (single view canvas, ``rope: aligned``)."""
+    """The causal policy's deploy windows on the bidirectional trunk (one-view canvas or three-view strip, ``rope:
+    aligned``)."""
 
     def __init__(self, config: PolicyConfig, contract: CausalContract) -> None:
         nn.Module.__init__(self)
@@ -94,6 +116,7 @@ class CausalPolicyModel(PolicyModel):
         self.video_frame_stride = int(contract.video_frame_stride)
         self.latent_frames_per_chunk = int(contract.latent_frames_per_chunk)
         self.memory_content = str(contract.memory_content)
+        self.chunk_observation = bool(contract.chunk_observation)
 
         self.x_embedder = PatchEmbedMS3D(config.patch_size, config.in_channels, config.hidden_size)
         self.t_embedder = TimestepEmbedder(config.hidden_size)
@@ -154,24 +177,38 @@ class CausalPolicyModel(PolicyModel):
         rope: PhysicalTimeWanRotaryPosEmbed,
         fps: torch.Tensor,
         frames: int,
-        height: int,
-        width: int,
+        view_shapes: ViewShapes,
+        view_slot_ids: tuple[int, ...],
         robot_rows: int,
         frame_offset: int,
         step_offset: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Rotary table ``[B, 1, F*H*W + robot_rows, D/2]`` of one window on the physical clock.
+        """Rotary table ``[B, 1, sum_v F*H_v*W_v + robot_rows, D/2]`` of one window on the physical clock.
 
-        Video token (phi, y, x): time ``base_fps * phi / (fps / s)`` with phi = ``frame_offset + j``; robot row r: time
-        ``base_fps * (step_offset + r) / (8 * fps)`` and spatial ids 0 (Sana ``_causal_multiview_rope`` +
-        ``_action_rope`` for one chunk: row 0 is the state at the chunk's first step, row j + 1 action j)."""
+        Video tokens in view-major order with the bidirectional policy's spatial ids (the plain grid for one view, the
+        semantic 2x2 tiles for several) and time ``base_fps * phi / (fps / s)``, phi = ``frame_offset + j`` for the
+        window's frame j; robot row r: time ``base_fps * (step_offset + r) / (8 * fps)`` and spatial ids 0 (Sana
+        ``_causal_multiview_rope`` + ``_action_rope`` for one segment: row 0 is the state at the chunk's first step,
+        row j + 1 action j)."""
 
         batch = fps.numel()
         fps_video = fps.to(device=device, dtype=torch.float64) / int(self.video_frame_stride)
-        ids = rope._position_ids(frames, height, width, fps_video, device)
+        if len(view_shapes) == 1:
+            (height, width), = view_shapes
+            ids = rope._position_ids(frames, int(height), int(width), fps_video, device)
+        else:
+            ids = semantic_2x2_position_ids(
+                frames, view_shapes, view_slot_ids, fps_video, rope.base_fps, self.multiview_spatial_rope_tile_shape,
+                device,
+            )
         phi = int(frame_offset) + torch.arange(frames, dtype=torch.float64, device=device)
-        frame_of_token = torch.arange(frames, device=device, dtype=torch.long).repeat_interleave(height * width)
+        frame_of_token = torch.cat(
+            [
+                torch.arange(frames, device=device, dtype=torch.long).repeat_interleave(int(height) * int(width))
+                for height, width in view_shapes
+            ]
+        )
         ids = ids.clone()
         ids[..., 0] = rope.base_fps * phi[frame_of_token][None] / fps_video[:, None]
         if robot_rows:
@@ -181,19 +218,32 @@ class CausalPolicyModel(PolicyModel):
             ids = torch.cat((ids, robot.expand(batch, -1, -1)), dim=1)
         return rope.from_position_ids(ids)
 
-    def softmax_entry_rope(self, slot: int, model_fps: Any, height: int, width: int, device) -> torch.Tensor:
-        """Softmax rotary table of the committed chunk read at chunk slot ``slot`` of a read numbered from 0.
-
-        A committed chunk in its window's token order: its ``f_c`` target frames from latent frame ``slot * f_c + 1``,
-        then, under ``memory_content`` video_and_action, its state row (step ``slot * C``) and its C action rows --
-        where training's clean chunk ``slot`` sits in a window that starts at its first chunk."""
+    def softmax_entry_rope(
+        self,
+        *,
+        frames: int,
+        frame_offset: int,
+        robot_rows: int,
+        step_offset: int,
+        model_fps: Any,
+        view_shapes: ViewShapes,
+        view_slot_ids: tuple[int, ...],
+        device,
+    ) -> torch.Tensor:
+        """Softmax rotary table of one committed entry, in its window's token order, at the read's positions: the sink
+        (one frame, no rows) or a committed chunk (``f_c`` target frames from ``slot * f_c + 1``, then its state row
+        at step ``slot * C`` and its C action rows under ``memory_content`` video_and_action)."""
 
         fps = PhysicalTimeWanRotaryPosEmbed._normalize_fps(model_fps, 1, device)
-        f_c, chunk = int(self.latent_frames_per_chunk), int(self.chunk_actions)
-        robot_rows = 1 + chunk if self.memory_content == MEMORY_VIDEO_AND_ACTION else 0
         return self.window_rope(
-            self.rope_softmax, fps, f_c, height, width, robot_rows, int(slot) * f_c + 1, int(slot) * chunk, device
+            self.rope_softmax, fps, int(frames), view_shapes, view_slot_ids, int(robot_rows), int(frame_offset),
+            int(step_offset), device,
         )
+
+    def chunk_robot_rows(self) -> int:
+        """Robot rows a committed chunk keeps: its state and C actions under video_and_action, none under video_only."""
+
+        return 1 + self.chunk_actions if self.memory_content == MEMORY_VIDEO_AND_ACTION else 0
 
     # -- the trunk -----------------------------------------------------------------------------------------------------
 
@@ -245,6 +295,31 @@ class CausalPolicyModel(PolicyModel):
 
     # -- one deploy window ---------------------------------------------------------------------------------------------
 
+    def _window_text_spans(self, text, text_mask, view_shapes: ViewShapes, robot_rows: int, tokens: int):
+        """(text, mask, query spans) of one window: G = 1 is one span over every token; G = V + 1 is one span per view
+        run, then the robot tail, a robotless window reading the V view rows alone (Sana ``_grouped_query_sublens``:
+        a robotless segment has no robot entry, so the robot group receives no query)."""
+
+        groups = int(text.shape[1])
+        if groups == 1:
+            return text, text_mask, ((0, tokens),)
+        views = len(view_shapes)
+        if groups != views + 1:
+            raise ValueError(f"a {views}-view window reads G = 1 or G = V + 1 = {views + 1} prompt rows, got G={groups}")
+        spans, offset = [], 0
+        for count in view_token_counts(self.f, view_shapes):
+            spans.append((offset, count))
+            offset += count
+        if robot_rows:
+            spans.append((offset, int(robot_rows)))
+            offset += int(robot_rows)
+        else:
+            text = text[:, :views]
+            text_mask = None if text_mask is None else text_mask[:, :views]
+        if offset != tokens:
+            raise ValueError(f"the text spans cover {offset} of {tokens} window tokens")
+        return text, text_mask, tuple(spans)
+
     @torch.no_grad()
     def forward_window(
         self,
@@ -256,33 +331,41 @@ class CausalPolicyModel(PolicyModel):
         model_fps: Any,
         frame_offset: int,
         step_offset: int,
+        view_shapes: Optional[ViewShapes] = None,
+        view_slot_ids: tuple[int, ...] = (0,),
         robot: Optional[Mapping[str, torch.Tensor]] = None,
         caches: Optional[Sequence[LayerCache]] = None,
         softmax_frame_offset: Optional[int] = None,
         softmax_step_offset: Optional[int] = None,
     ) -> dict[str, torch.Tensor]:
-        """Evaluate one single-segment window: a chunk's denoising window [observation | targets] + robot rows, or
-        the commit of an executed chunk [targets] (+ robot rows under ``memory_content`` video_and_action).
+        """Evaluate one single-segment window: a chunk's denoising window [observation | targets] + robot rows
+        ([targets] + rows without chunk observations), the commit of an executed chunk [targets] (+ robot rows under
+        ``memory_content`` video_and_action), or the sink commit (one frame, no rows).
 
         Args:
-            latent: ``[B, C, F, H, W]`` canvas latent frames of the window (observation and / or chunk targets).
+            latent: the window's latent frames: ``[B, C, F, H, W]`` for one view (``view_shapes`` None or one entry),
+                the view-major strip ``[B, C, F, 1, sum(H_v * W_v)]`` for several.
+            view_shapes / view_slot_ids: per-view latent (H, W) and semantic 2x2 slot of a strip (None: the one-view
+                grid of ``latent``).
             video_timesteps: ``[B, F]`` raw per-frame timesteps (0 for clean frames).
-            y / mask: ``[B, 1, 1, L, C_text]`` caption embeddings and ``[B, 1, L]`` key mask (G = 1).
+            y / mask: ``[B, G, 1, L, C_text]`` caption embeddings and ``[B, G, L]`` key mask (G = 1 for the canvas,
+                G = V + 1 for the strip).
             model_fps: the batch fps (25 for RoboDojo).
             frame_offset / step_offset: physical index of the window's first latent frame and first robot step (the
                 GDN layers' clock: their state keeps keys rotated at the physical positions of the whole episode):
-                ``c * f_c`` / ``c * C`` for chunk c's denoising window, ``c * f_c + 1`` / ``c * C`` for its commit.
+                0 / 0 for the sink, ``c * f_c`` / ``c * C`` for chunk c's denoising window (``c * f_c + 1`` without
+                chunk observations), ``c * f_c + 1`` / ``c * C`` for its commit.
             softmax_frame_offset / softmax_step_offset: the same window on the softmax layers' clock, numbered from 0
                 at the read's origin (the session's ``read_plan``; the cached entries are rotated on that clock too);
                 None = the physical offsets (nothing slid out of the window yet).
-            robot: None for a robotless window (the commit under ``memory_content`` video_only), else ``state80`` /
+            robot: None for a robotless window (the sink, the commit under ``memory_content`` video_only), else ``state80`` /
                 ``state_mask80`` ``[B, 80]``, ``action80`` / ``action_mask80`` ``[B, C, 80]`` and ``action_timesteps``
                 ``[B, C]`` (raw).
-            caches: None for a window that reads nothing (chunk 0), else one ``LayerCache`` per block.
+            caches: None for a window that reads and writes nothing, else one ``LayerCache`` per block.
 
         Returns:
-            ``{}`` for a robotless window (nothing reads its prediction); else ``{"x": [B, C, F, H, W] velocity,
-            "action_pred": [B, C, 80] velocity}``.
+            ``{}`` for a robotless window (nothing reads its prediction); else ``{"x": velocity in ``latent``'s
+            layout, "action_pred": [B, C, 80] velocity}``.
         """
 
         if self.training:
@@ -300,7 +383,18 @@ class CausalPolicyModel(PolicyModel):
             x.shape[-2] // self.patch_size[1],
             x.shape[-1] // self.patch_size[2],
         )
-        view_shapes = ((self.h, self.w),)
+        if view_shapes is None or len(view_shapes) == 1:
+            view_shapes = ((self.h, self.w),) if view_shapes is None else tuple((int(h), int(w)) for h, w in view_shapes)
+            if view_shapes != ((self.h, self.w),):
+                raise ValueError(f"a one-view window is the {view_shapes[0]} grid, got {(self.h, self.w)}")
+            view_slot_ids = (0,)
+        else:
+            view_shapes = tuple((int(h), int(w)) for h, w in view_shapes)
+            if self.h != 1 or self.w != sum(h * w for h, w in view_shapes):
+                raise ValueError(f"a {len(view_shapes)}-view strip is [B, C, F, 1, {sum(h * w for h, w in view_shapes)}]")
+            view_slot_ids = tuple(int(slot) for slot in view_slot_ids)
+            if len(view_slot_ids) != len(view_shapes):
+                raise ValueError(f"{len(view_shapes)} views need as many slot ids, got {view_slot_ids}")
         timesteps = torch.as_tensor(video_timesteps, device=device).reshape(batch, -1)
         if timesteps.shape[1] != self.f:
             raise ValueError(f"video_timesteps carries {timesteps.shape[1]} frames for a {self.f}-frame window")
@@ -343,10 +437,10 @@ class CausalPolicyModel(PolicyModel):
 
         fps = PhysicalTimeWanRotaryPosEmbed._normalize_fps(model_fps, batch, device)
         rope_linear = self.window_rope(
-            self.rope_linear, fps, self.f, self.h, self.w, robot_rows, frame_offset, step_offset, device
+            self.rope_linear, fps, self.f, view_shapes, view_slot_ids, robot_rows, frame_offset, step_offset, device
         )
         rope_softmax = self.window_rope(
-            self.rope_softmax, fps, self.f, self.h, self.w, robot_rows,
+            self.rope_softmax, fps, self.f, view_shapes, view_slot_ids, robot_rows,
             frame_offset if softmax_frame_offset is None else softmax_frame_offset,
             step_offset if softmax_step_offset is None else softmax_step_offset,
             device,
@@ -354,14 +448,13 @@ class CausalPolicyModel(PolicyModel):
         time_embedding = self.t_embedder(token_timestep.flatten()).unflatten(0, token_timestep.shape)
         modulation = self.t_block(time_embedding)
         text, text_mask = self._grouped_text_condition(y, mask)
-        if text.shape[1] != 1:
-            raise ValueError(f"the one-view canvas carries ONE prompt row (G = 1), got G={text.shape[1]}")
+        text, text_mask, spans = self._window_text_spans(text, text_mask, view_shapes, robot_rows, int(tokens.shape[1]))
         tokens = self._causal_trunk(
             tokens,
             text,
             modulation,
             text_mask,
-            ((0, int(tokens.shape[1])),),
+            spans,
             rope_linear,
             rope_softmax,
             caches,
@@ -390,4 +483,4 @@ def build_causal_policy(
     return model.to(device=device, dtype=dtype).eval()
 
 
-__all__ = ["CausalPolicyModel", "GDN_RECURRENCE_KEYS", "build_causal_policy"]
+__all__ = ["CausalPolicyModel", "GDN_RECURRENCE_KEYS", "ViewShapes", "build_causal_policy", "view_token_counts"]
