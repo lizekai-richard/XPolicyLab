@@ -821,3 +821,52 @@ def test_the_pantheon33k_sana_latent_videoaug_serves_like_the_pantheon33k_strip(
     assert cfg["train"]["extra"]["video_augmentation"]["enabled"] is True
     session = _session(cfg)
     assert (session.view_resize, session.view_resize_source) == ("stretch", "default")
+
+
+# logits/sft_robodojo_eefabs_sana_pixel_320x512_vanilla_pantheon14k_aligned_f33fps8_nocfg (Sana 9da55937e): the Pantheon14k pixel
+# recipe trained WITHOUT condition dropout (class_dropout_prob and instruction_dropout_probability 0.1 -> 0, the yaml's inference
+# CFG 6 -> 1); served with guidance off (cfg_scale 1, action_cfg_scale 1)
+PANTHEON14K_PIXEL_NOCFG = os.path.join(os.path.dirname(__file__), "fixtures", "config_pantheon14k_sana_pixel_320x512_nocfg_9da55937e.yaml")
+
+
+def test_the_pantheon14k_sana_pixel_nocfg_serves_like_the_pantheon14k_pixel():
+    cfg, twin = wam_config.load_train_config(PANTHEON14K_PIXEL_NOCFG), wam_config.load_train_config(PANTHEON14K_PIXEL)
+    flat, twin_flat = _flat(cfg), _flat(twin)
+    differ = {key for key in flat.keys() | twin_flat.keys() if flat.get(key) != twin_flat.get(key)}
+    training_only = {"name", "work_dir", "train.valid_prompt_embed_root"}
+    assert differ - training_only == {"model.class_dropout_prob", "train.extra.instruction_dropout_probability",
+                                      "scheduler.inference_cfg_scale", "scheduler.inference_action_cfg_scale"}
+    assert flat["model.class_dropout_prob"] == 0.0 and flat["train.extra.instruction_dropout_probability"] == 0.0
+    assert flat["model.load_from"] == twin_flat["model.load_from"]
+    assert wam_config.view_resize_from_train_config(cfg) == ("stretch", "default")
+    assert wam_config.sana_pixel_pad_from_train_config(cfg) == "unmasked"
+    assert wam_config.sana_pixel_canvas_hw_from_train_config(cfg) == (320, 512)
+    assert wam_config.policy_config_from_train_config(cfg) == wam_config.policy_config_from_train_config(twin)
+    assert wam_config.resolve_canvas_text_contract(cfg) == wam_config.resolve_canvas_text_contract(twin)
+    assert cfg["data"]["extra"]["robot_sft"]["normalization_sha256"].startswith("9f8b98ed")
+    session = _session(cfg)
+    assert (session.sana_pixel_pad, session.view_resize, session.view_resize_source) == ("unmasked", "stretch", "default")
+    assert tuple(session.sana_pixel_canvas_hw) == (320, 512)
+
+
+# logits/sft_robodojo_eefabs_openwam_384x320_vanilla_pantheon14k_aligned_f33fps8 (Sana 9da55937e): the OpenWAM L-shaped
+# 384x320 canvas on the ONE policy class, warm-started from the Pantheon14k sana_pixel donor e4s14173 (the donor of the
+# Pantheon14k pixel), condition dropout 0.1, norm 9f8b98e. The newer trainer dumps every default, so the yaml is compared with the
+# vanilla34k openwam through the adapter's resolved contracts rather than key by key
+PANTHEON14K_OPENWAM = os.path.join(os.path.dirname(__file__), "fixtures", "config_pantheon14k_openwam_9da55937e.yaml")
+
+
+def test_the_pantheon14k_openwam_serves_like_the_vanilla34k_openwam():
+    cfg, twin = wam_config.load_train_config(PANTHEON14K_OPENWAM), wam_config.load_train_config(V34K_OPENWAM)
+    assert wam_config.resolve_visual_layout(cfg) == "openwam_canvas"
+    assert cfg["data"]["aspect_ratio_type"] == twin["data"]["aspect_ratio_type"] == "ASPECT_RATIO_OPENWAM_LSHAPE_384_320"
+    assert wam_config.policy_config_from_train_config(cfg) == wam_config.policy_config_from_train_config(twin)
+    assert wam_config.resolve_canvas_text_contract(cfg) == wam_config.resolve_canvas_text_contract(twin)
+    assert wam_config.resolve_canvas_text_contract(cfg)[:2] == (1, "two_rows")
+    assert wam_config.resolve_rope_contract(cfg) == wam_config.resolve_rope_contract(twin)
+    assert wam_config.view_resize_from_train_config(cfg) == ("stretch", "default")
+    assert wam_config.video_frame_stride_from_train_config(cfg) == 4
+    assert cfg["data"]["extra"]["robot_sft"]["normalization_sha256"].startswith("9f8b98ed")
+    assert cfg["model"]["class_dropout_prob"] == 0.1 and cfg["model"]["load_from"].endswith("sanapixel_pantheon_e4s14173")
+    session = _session(cfg)
+    assert (session.visual_layout, session.view_resize, session.view_resize_source) == ("openwam_canvas", "stretch", "default")
