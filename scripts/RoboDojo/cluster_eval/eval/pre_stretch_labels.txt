@@ -1,0 +1,62 @@
+# LEGACY view-resize registry: checkpoint labels (the basename of the checkpoint dir: the dirs under
+# /homes/jiamingt/checkpoints/huggingface/logits/) VERIFIED to be trained BEFORE the SFT view stretch -- rwm/zekai-merge
+# 1061b16f0 (2026-09-27 15:05 PDT) / rwm/mot 034e55dca (15:52 PDT) -- i.e. with every camera view scaled to cover its
+# bucket and centre-cropped. The SANA_WAM / SANA_MOT adapters default to stretch (the only SFT resize upstream since
+# then; user, 2026-09-29). run_unit_xpl.sh serves every label listed here with view_resize=crop (a driver's explicit
+# view_resize override still wins), and the campaign drivers read it to name forced-mode runs (_evalcrop / _evalstretch).
+# The OpenWAM canvas stretched in every era and ignores the key. A checkpoint trained at or after those commits must NOT
+# be listed. Add a label only with its evidence. Checked 2026-09-29 against ~/zekail/Sana (bc2a3e667) and
+# ~/zekail/Sana_mot (f06615b2f). Lives next to run_unit_xpl.sh: rsync it to /homes/jiamingt/robodojo_install/eval/.
+#
+# evidence  git   training revision from its model card / memory; `git merge-base --is-ancestor` of both fix commits: no
+#           date  no revision on its card; its NFS directory (UTC) predates the fix, and so does its first served run
+#           run   no longer on NFS; first served (UTC) long before the fix
+#
+# label                                                                          evidence  revision / date (UTC)
+abs_nsc_s30k                                                                   git       daa100068
+abs_nsc_s36k                                                                   git       daa100068
+delta_nsc_s30k                                                                 git       daa100068
+delta_nsc_s36k                                                                 git       daa100068
+eefabs_nsc_s30k                                                                git       daa100068
+eefabs_nsc_s36k                                                                git       daa100068
+eefabs_openwam_320x384_mot49500_aligned_f33fps8                                git       0928354f8 (rwm/mot; card: "later development-branch changes were not applied")
+eefabs_sana_latent_256x320_mot49500_aligned_f33fps8                            git       0928354f8 (rwm/mot; card: "later stretch-resize changes ... were not applied")
+eefabs_sana_latent_256x320_vanilla34k_aligned_f33fps8                          git       5309c7c77 (zekai-merge)
+eefabs_sana_latent_256x320_vanilla48k_aligned_f33fps8_videoaug                 git       5309c7c77 (zekai-merge; RUN_ID source_commit; ResizeCrop-only multiview dataset there, VAE encoded online)
+eefabs_sana_pixel_320x480_sanavideo_independent_f33                            date      2026-09-27 02:37
+eefabs_sana_pixel_320x512_mot49500_aligned_f33fps8                             git       0928354f8 (rwm/mot)
+jointabs_f33fps8_nsc                                                           date      2026-09-20 23:54
+jointabs_f33fps8_s35641_nsc                                                    date      2026-09-21 05:04
+mot_canvas_nsc_s15k                                                            date      2026-09-16 20:11
+mot_canvas_nsc_s36k                                                            date      2026-09-18 20:04
+mot_eefabs_openwam_384x320_pretrained_aligned_f33fps8                          git       b010eb9a5 (rwm/mot)
+mot_eefabs_sana_pixel_320x480_pretrained_aligned_f33dense                      git       b010eb9a5 (rwm/mot)
+mot_eefabs_sana_pixel_320x480_pretrained_aligned_f33fps8                       git       b010eb9a5 (rwm/mot)
+mot_eefabs_sana_pixel_320x480_sanavideo_aligned_f33fps8                        git       b010eb9a5 (rwm/mot)
+mot_eefabs_sana_pixel_320x480_sanavideo_independent_f33dense                   git       b010eb9a5 (rwm/mot)
+mot_eefabs_sana_pixel_320x480_sanavideo_independent_f33fps8                    git       e54ec7d97 (rwm/mot)
+mot_eefabs_sana_pixel_320x512_pretrained_aligned_f33fps8                       git       b010eb9a5 (rwm/mot)
+mot_jointabs_f25_multiview                                                     git       3058e5785 / 803e56a9b (both on its card, both pre-stretch)
+mot_jointabs_f33fps16_nsc                                                      date      2026-09-21 18:21
+mot_jointabs_f33fps8_nsc                                                       date      2026-09-20 19:59
+mot_jointabs_f33fps8_openwam                                                   git       8e4d6d019
+openwam_canvas_4node                                                           date      2026-09-16 19:51
+openwam_canvas_4node_latest                                                    date      2026-09-17 10:06
+openwam_robodojo                                                               date      2026-09-16 08:06
+r18_s61k                                                                       date      2026-09-17 19:09
+r18_s72k                                                                       date      2026-09-19 03:31 (card: 2e50c88d7, early-September line, in neither clone)
+s55k_eef                                                                       run       2026-09-13 06:20 (no longer on NFS; first served then)
+s55k_video                                                                     run       2026-09-14 08:57 (no longer on NFS; first served then)
+s68k_video                                                                     date      2026-09-17 00:26
+sana_rwm_policy_from_pretrained_robodojo_320px_epoch10_step65690               run       2026-09-08 07:29 (no longer on NFS; first served then)
+sana_rwm_policy_from_pretrained_robodojo_320px_epoch10_step65690_lr5e-5_clip1  run       2026-09-10 08:35 (no longer on NFS; first served then)
+sana_rwm_policy_from_pretrained_robodojo_320px_epoch4_step25000                run       2026-09-09 04:43 (no longer on NFS; first served then)
+sana_rwm_policy_from_pretrained_robodojo_320px_epoch7_step45000_lr5e-5_clip1   run       2026-09-08 20:57 (no longer on NFS; first served then)
+sanavideo_eefabs_f33fps8_sana_pixel                                            git       167d45af1 / 6c98ae586 (both on its card, both pre-stretch)
+sanavideo_eefabs_f33fps8_sana_pixel_aligned                                    git       5e03e8f6f / b95ea93bf (both on its card, both pre-stretch)
+sft_p120k_1e-4cos_clip1_s50k                                                   run       2026-09-11 07:03 (no longer on NFS; first served then)
+sft_p120k_1e-4cos_clip1_s65k                                                   run       2026-09-12 14:33 (no longer on NFS; first served then)
+vanilla34k_eefabs_f33fps8_openwam_aligned                                      git       52f3db1f0 / b86f8a2f9 (both on its card, both pre-stretch)
+vanilla34k_eefabs_f33fps8_sana_pixel_aligned                                   git       5295c208d / b86f8a2f9 (both on its card, both pre-stretch)
+vanilla48k_eefabs_f33fps8_openwam_aligned_videoaug                             git       7070353ec (zekai-merge)
+vanilla48k_eefabs_f33fps8_sana_pixel_aligned_videoaug                          git       7070353ec (zekai-merge)

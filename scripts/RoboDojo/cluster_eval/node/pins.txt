@@ -1,0 +1,14 @@
+numpy==1.26.0
+packaging==23.0
+typing_extensions==4.12.2
+filelock==3.13.1
+websockets==12.0
+click==8.1.7
+psutil==5.9.8
+wheel==0.45.1
+starlette==0.45.3
+scipy==1.15.3
+warp-lang==1.11.0
+onnx>=1.18,<1.22
+ipython<9
+virtualenv==20.30.0
