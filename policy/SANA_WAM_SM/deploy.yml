@@ -1,0 +1,63 @@
+policy_name: SANA_WAM_SM
+protocol: ws
+host: localhost
+port: null
+bench_name: null
+task_name: null
+ckpt_name: null
+env_cfg_type: null
+seed: null
+action_type: ee
+gpu_id: null
+eval_batch: false
+
+# One get_action = the prefix encode (1 + 8n canvases in one causal pass: 17 for memory_frames 16, up to 65 for the
+# strided recipe's n <= 8) + one prefix forward per text stream + sampling_steps x 2 forwards of the target chunk (193
+# tokens), and from decision 1 on the previous decision's world-model reference (one more encode of 1 + 8n + 8 canvases);
+# the first call of an episode also encodes the prompt. The RoboDojo client times every RPC out after 120 s whatever
+# this says.
+request_timeout_s: 600.0
+
+# --- SANA_WAM_SM keys (see README "Configuration") ---
+# HF-style checkpoint dir of a SPARSE-MEMORY run (Sana rwm/sparse-memory, e.g. the pantheon14k sparse_memory (strided) /
+# sparse_memory_fixed recipes): config.yaml (model.model ...MultiViewCausal_5B_P1_D36 with
+# model.extra.chunk_causal_policy.memory_type fixed | strided and memory_frames | memory_stride) +
+# model/pytorch_model_fsdp.bin [+ normalization/*.json]. null -> XPolicyLab resolution of ckpt_name.
+checkpoint_dir: null
+# An SFT (bidirectional) checkpoint has no GDN recurrence parameters; true serves it as the policy's step-0 model
+# (recurrence initialized as the causal trainer does on its first load). Pipeline checks only, never an evaluation.
+allow_donor_checkpoint: false
+# null -> <checkpoint_dir>/normalization/<f33 name>, else the packaged copy (refused by the yaml pin of an EEF line)
+normalization_path: null
+normalization_sha256: null
+text_encoder_path: null
+vae_path: null
+# Sampling: the RoboDojo defaults of every SANA evaluation (10 Euler steps, video CFG 6, action CFG 1; the flow shifts
+# from the checkpoint's scheduler.inference_flow_shift / inference_action_flow_shift when null).
+sampling_steps: 10
+cfg_scale: 6.0
+video_cfg_scale: null
+action_cfg_scale: 1.0
+flow_shift: null
+action_flow_shift: null
+# How a decision is evaluated: cached = the prefix [S | M_1..M_n] runs ONCE per text stream into per-layer caches (GDN
+# state, softmax K/V), then every denoising step runs the target chunk alone against them (Sana
+# SparseMemoryPolicySession.decide; exact up to round-off); uncached = every denoising step runs the TRAINING sequence
+# [S | M_1..M_n | T] + rows (Sana decide_uncached, the reference). null = cached.
+deploy_form: null
+# Refuse an episode longer than this many decisions (null = no limit; a strided memory warns once past the recipe's
+# top rung)
+max_chunks_per_episode: null
+# Per-decision log of the relative RMSE between the predicted target latent and the target latent of the decision's
+# training sample (one more causal encode of the prefix rows + the 8 executed target rows, at the next decision)
+log_world_model_error: true
+# null = stretch (the only SFT view resize of the line's donors); a contradicting value is refused
+view_resize: null
+diffusion_seed_base: 20261012
+eef_pose_check: true
+urdf_path: null
+robot_root_poses: null
+device: cuda
+weight_dtype: bfloat16
+strict_image_size: false
+default_instruction: follow the instruction
