@@ -1,33 +1,32 @@
 """Teacher-forced streaming session of the chunk-causal policy (Sana ``deploy/causal/session.py``, inference subset),
-episode protocol (Sana ``d37817788`` / ``fcccb4c88`` / ``3cbe3d85e``, deploy ``4bd1b674c``; inference handoff 03).
+episode protocol (Sana ``d37817788`` / ``fcccb4c88`` / ``3cbe3d85e``, deploy ``4bd1b674c``; inference handoff 03) in its
+single form since Sana ``4bd6eca83`` (checked against rwm/zekai-merge ``7de7711c2``): a chunk carries no observation
+latent; its observation, the frame at its start instant, is the last frame of the most recent latent in memory.
 
 An episode opens at its first frame as the training's phase window aligned on it (``aligned_phase_window``):
 
-0) ``commit_sink(sink_latent)`` -- the episode's first observation (each view's first frame encoded alone, the first
-   latent of the view's causal VAE stream): one clean forward per text stream on video frame 0 without robot rows. Its
-   GDN state is the state's first write and its softmax K/V the sink every later forward reads besides its window.
-   ``padded`` (h = C): then ``commit_chunk`` of chunk 0, the frozen first chunk: the first frame repeated over the
-   chunk's C / s frames, encoded on after the sink in the same stream (under ``memory_content`` video_and_action its
-   rows hold the robot at its first state). Chunk 0 is memory only, as the training's padded chunk 0, and is never
-   generated; the first emission is chunk 1 at the first frame. ``first_frame`` (h = 0, Sana ``04c8acbee``): chunk 0 is
-   the first frame's own chunk and the first emission. Without chunk observations it reads the sink (Sana's
-   ``two_stream_first_reads_sink``: commit the sink, then generate chunk 0); with them it reads nothing (generate chunk
-   0 on its observation, the sink's latent, then commit the sink, then commit chunk 0).
+0) ``commit_sink(sink_latent)`` -- the episode's first frame (each view's first frame encoded alone, the first latent of
+   the view's causal VAE stream): one clean forward per text stream on video frame 0 without robot rows. Its GDN state
+   is the state's first write and its softmax K/V the sink every later forward reads besides its window; it comes
+   before everything else, chunk 0's generation included. ``padded`` (h = C): then ``commit_chunk`` of chunk 0, the
+   frozen first chunk: the first frame repeated over the chunk's C / s frames, encoded on after the sink in the same
+   stream (under ``memory_content`` video_and_action its rows hold the robot at its first state). Chunk 0 is memory
+   only, as the training's padded chunk 0, and is never generated; the first emission is chunk 1 at the first frame.
+   ``first_frame`` (h = 0, Sana ``04c8acbee``): chunk 0 is the first frame's own chunk and the first emission; the sink
+   is its observation.
 
 Then one emitted chunk per cycle, mirroring the robot loop, from the first emitted chunk on:
 
-1) ``generate_chunk(observation_latent, ...)`` -- denoise chunk c against frozen memory. The window is [observation_c |
-   targets_c] + [state_c | C actions]: its own observation (the chunk-start frame encoded alone; at the first emitted
-   chunk the first frame, i.e. the sink's latent) at t = 0, the noisy targets, the measured chunk-start state and the noisy actions.
-   Under ``chunk_observation`` false the window is [targets_c] + rows and the current frame is read from the memory
-   (the last frame of chunk c - 1's targets); pass ``observation_latent=None``. It reads the GDN state after the sink
-   and the commits of chunks 0..c-1 and the softmax entries of the read rule below;
+1) ``generate_chunk(...)`` -- denoise chunk c against frozen memory. The window is [targets_c] + [state_c | C actions]:
+   the noisy targets, the measured chunk-start state and the noisy actions. It reads the GDN state after the sink and
+   the commits of chunks 0..c-1 and the softmax entries of the read rule below, and takes its observation from the last
+   frame of the most recent latent among them (the sink for chunk 0, chunk c - 1's last target latent for chunk c);
 2) the caller executes the returned chunk and observes the outcome;
 3) ``commit_chunk`` -- ONE clean forward (t = 0) of the EXECUTED chunk c: its target latents (the next latents of the
-   per-view causal VAE streams over the chunk's observed frames) and, under ``memory_content`` video_and_action, its
-   chunk-start state and C committed actions (video_only: the targets alone, no robot rows). It reads like the
-   generation of chunk c, then writes the next GDN state and keeps its softmax K/V as entry c. No observation but the
-   sink is ever committed.
+   per-view causal VAE streams over the chunk's observed frames; the last one ends on the frame the next chunk starts
+   from) and, under ``memory_content`` video_and_action, its chunk-start state and C committed actions (video_only: the
+   targets alone, no robot rows). It reads like the generation of chunk c, then writes the next GDN state and keeps its
+   softmax K/V as entry c.
 
 Softmax read, W = ``sliding_window_chunks``: the forwards on chunk c (its denoising steps and its commit) read the sink
 and the newest ``min(c, W)`` committed chunks, ``c - W .. c - 1``. This is the two-stream training forward's rule (Sana
@@ -38,11 +37,11 @@ default read of Sana's deploy session (W - 1 older chunks plus the most recent o
 Positions. Softmax entries are kept BEFORE the rotary embedding and rotated on the fly at every read, on a clock
 numbered from 0 at the read's ORIGIN O = the oldest chunk read (``read_plan``; O = max(0, c - W)): chunk k at slot
 k - O (targets from latent frame ``(k - O) * f_c + 1``, state at step ``(k - O) * C``, its actions after it), the
-window of chunk c at slot c - O (its observation at frame ``(c - O) * f_c``, its targets after it) and the sink at
-frame 0, one frame before the earliest frame the read takes: the training canvas's StreamingLLM sink, which an evicting
-reader takes next to its window (``_sink_shift_phases``), and Sana's deploy KV store, which puts it at the first read
-frame - 1 (``kv_position_mode="absolute"``) or at 0 (``"rank"``); the relative RoPE of the aligned clock sees one
-common shift between the three. The GDN layers are never windowed: their state keeps keys rotated at the physical
+window of chunk c at slot c - O (its targets from frame ``(c - O) * f_c + 1``) and the sink at frame 0, one frame
+before the earliest frame the read takes: the training canvas's StreamingLLM sink, which an evicting reader takes next
+to its window (``_sink_shift_phases``), and Sana's deploy KV store, which puts it at the first read frame - 1
+(``kv_position_mode="absolute"``) or at 0 (``"rank"``); the relative RoPE of the aligned clock sees one common shift
+between the three. The GDN layers are never windowed: their state keeps keys rotated at the physical
 positions of the whole episode (the sink at frame 0), and their windows run on that clock.
 
 Conditional and unconditional text streams hold separate memories (the caption reaches every layer through
@@ -172,7 +171,7 @@ class CausalMemory:
         """Keep what a chunk commit left in its caches: the next GDN states and the chunk's (pre-RoPE) softmax entry."""
 
         if not self.has_sink:
-            raise RuntimeError("commit the sink first: the episode's first observation opens the memory")
+            raise RuntimeError("commit the sink first: the episode's first frame opens the memory")
         for index, (kind, cache) in enumerate(zip(self.kinds, caches)):
             if kind == GDN_KIND:
                 self._absorb_gdn(index, cache)
@@ -214,7 +213,6 @@ class CausalPolicySession:
         self.f_chunk = int(model.latent_frames_per_chunk)
         self.memory_content = str(model.memory_content)
         self.robot_memory = self.memory_content == MEMORY_VIDEO_AND_ACTION
-        self.chunk_observation = bool(model.chunk_observation)
         self.first_chunk = int(model.first_chunk)   # 1 after a padded window's frozen chunk 0, 0 on a first-frame window
         self.steps = int(steps)
         if self.steps <= 0:
@@ -342,10 +340,10 @@ class CausalPolicySession:
 
     @torch.inference_mode()
     def commit_sink(self, sink_latent: torch.Tensor) -> None:
-        """Open the episode's memory with its first observation ``[1, C_lat, 1, H, W]`` (Sana ``commit_sink``): one
-        clean forward per stream on video frame 0 without robot rows, reading nothing; its GDN state and softmax K/V
-        open every layer's memory. A padded window's frozen first chunk follows through ``commit_chunk`` (chunk 0); a
-        first-frame window with chunk observations commits the sink after generating chunk 0, which reads nothing."""
+        """Open the episode's memory with its first frame ``[1, C_lat, 1, H, W]`` (Sana ``commit_sink``): one clean
+        forward per stream on video frame 0 without robot rows, reading nothing; its GDN state and softmax K/V open every
+        layer's memory. It precedes everything else: a padded window's frozen first chunk (``commit_chunk`` of chunk 0)
+        and a first-frame window's chunk 0, which reads it as its observation."""
 
         if self.has_sink or self.chunk_idx:
             raise RuntimeError("the sink opens the memory: commit it once, before the first chunk")
@@ -365,7 +363,6 @@ class CausalPolicySession:
     @torch.inference_mode()
     def generate_chunk(
         self,
-        observation_latent: Optional[torch.Tensor],
         *,
         anchor_state: torch.Tensor,
         anchor_state_mask: torch.Tensor,
@@ -375,29 +372,16 @@ class CausalPolicySession:
         action_noise: Optional[torch.Tensor] = None,
         gripper_bounds: Optional[tuple[tuple[float, float], tuple[float, float]]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Denoise chunk ``chunk_idx`` (from the first emitted chunk on) from its observation ``[1, C_lat, 1, H, W]``
-        (None without chunk observations) against frozen memory; returns (normalized actions [1, C, 80], target latents
-        [1, C_lat, f_c, H, W]). Nothing is written."""
+        """Denoise chunk ``chunk_idx`` (from the first emitted chunk on) against frozen memory, which holds its
+        observation; returns (normalized actions [1, C, 80], target latents [1, C_lat, f_c, H, W]). Nothing is
+        written."""
 
+        if not self.has_sink:
+            raise RuntimeError("every chunk reads the sink, chunk 0's only view of a frame: commit_sink first")
         if self.chunk_idx < self.first_chunk:
             raise RuntimeError(
                 "a padded window's first emission is chunk 1: commit_sink, then commit_chunk of the frozen first chunk "
                 "(chunk 0 is memory only, as the training's padded chunk)"
-            )
-        # every chunk reads the sink but a first-frame window's chunk 0 with chunk observations, which reads nothing
-        reads_sink = self.chunk_idx > 0 or not self.chunk_observation
-        if reads_sink != self.has_sink:
-            raise RuntimeError(
-                f"chunk {self.chunk_idx} reads " + ("the sink: commit_sink first" if reads_sink else
-                "nothing (a first-frame window's chunk 0 with chunk observations): generate it before commit_sink")
-            )
-        if self.chunk_observation:
-            self._check_latent(observation_latent, 1, "observation_latent")
-            self._latent_like = observation_latent
-        elif observation_latent is not None:
-            raise ValueError(
-                "the model trains without chunk observations (chunk_observation false): pass observation_latent=None, "
-                "the chunk reads the current frame from the memory"
             )
         chunk = self.chunk_actions
         action_mask = action_mask.to(dtype=torch.bool)
@@ -418,13 +402,11 @@ class CausalPolicySession:
         self._check_latent(video, self.f_chunk, "video_noise")
         action = action_noise.to(device=device, dtype=latent_dtype).masked_fill(~action_mask.to(device), 0)
         action_mask = action_mask.to(device)
-        observation = [] if observation_latent is None else [observation_latent.to(dtype=video.dtype)]
-        obs_frames = len(observation)
         video_scheduler = make_scheduler(self.steps, self.flow_shift, device)
         action_scheduler = make_scheduler(self.steps, self.action_flow_shift, device)
         caches_by_stream = [self._caches(memory, commit=False) for memory in self.memories]
-        # the observation sits at c * f_c, the targets after it (at c * f_c + 1 without an observation)
-        frame_offset = self.chunk_idx * self.f_chunk + (0 if obs_frames else 1)
+        # the targets sit at c * f_c + 1 .., after the instant c * f_c of the frame they read as their observation
+        frame_offset = self.chunk_idx * self.f_chunk + 1
         step_offset = self.chunk_idx * chunk
         state = anchor_state.reshape(1, -1).to(device)
         state_mask = anchor_state_mask.reshape(1, -1).to(device=device, dtype=torch.bool)
@@ -436,7 +418,7 @@ class CausalPolicySession:
                 chunk=self.chunk_idx, read_ids=read_ids, origin=origin,
                 tokens_per_frame=(self._grid[0] // patch[1]) * (self._grid[1] // patch[2]),
                 latent_frames_per_chunk=self.f_chunk, chunk_actions=chunk, robot_memory=self.robot_memory,
-                steps=self.steps, streams=len(self.captions), sink=self.has_sink, observation=bool(obs_frames),
+                steps=self.steps, streams=len(self.captions), sink=self.has_sink, observation=False,
             )
         try:
             with self._autocast(device):
@@ -444,8 +426,8 @@ class CausalPolicySession:
                     action_timestep = action_scheduler.timesteps[step_index]
                     video_t = timestep.reshape(1, 1).expand(1, self.f_chunk).to(torch.float32)
                     action_t = action_timestep.reshape(1, 1).expand(1, chunk).to(torch.float32)
-                    latent = torch.cat(observation + [video], dim=2)
-                    window_t = torch.cat((video_t.new_zeros(1, obs_frames), video_t), dim=1)
+                    latent = video
+                    window_t = video_t
                     robot = {
                         "state80": state,
                         "state_mask80": state_mask,
@@ -467,12 +449,9 @@ class CausalPolicySession:
                         )
                     cond = outputs[0]
                     uncond = outputs[1] if self.guided else None
-                    targets = slice(obs_frames, None)
-                    video_prediction = cond["x"][:, :, targets]
+                    video_prediction = cond["x"]
                     if uncond is not None and self.video_cfg_scale > 1:
-                        video_prediction = uncond["x"][:, :, targets] + self.video_cfg_scale * (
-                            video_prediction - uncond["x"][:, :, targets]
-                        )
+                        video_prediction = uncond["x"] + self.video_cfg_scale * (video_prediction - uncond["x"])
                     action_prediction = cond["action_pred"]
                     if uncond is not None and self.action_cfg_scale > 1:
                         action_prediction = uncond["action_pred"] + self.action_cfg_scale * (
@@ -508,7 +487,7 @@ class CausalPolicySession:
         but not committed (Sana's session does the same)."""
 
         if not self.has_sink:
-            raise RuntimeError("commit_sink first: the episode's first observation opens the memory")
+            raise RuntimeError("commit_sink first: the episode's first frame opens the memory")
         self._check_latent(chunk_latent, self.f_chunk, "chunk_latent")
         chunk = self.chunk_actions
         action_mask = action_mask.to(dtype=torch.bool)

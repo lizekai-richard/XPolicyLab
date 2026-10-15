@@ -1,19 +1,25 @@
-# NSC Sana Latent causal pair on whole-episode windows; warm-start from the completed Pantheon33k SFT.
-# Every window holds an episode from its first frame, opening with a padded chunk of 1..C frozen first-frame rows (one
-# window per chunk-grid phase; wholly frozen for the phase whose next chunk starts at the first frame). The padded
-# chunk is memory only, so every trained chunk reads the first observation and at least the padded chunk, and every
-# row but the last is the observation of exactly one trained chunk. The first observation is a sink every chunk reads
-# besides the N24 softmax window and the GDN scan writes first.
+# NSC Sana Latent causal recipe on whole-episode windows, video_only memory, softmax window N1 (user 2026-10-14): every
+# softmax layer reads the sink and the most recent memory chunk only, and the GDN state carries the rest of the history.
+# Twin of causal_robodojo_pantheon33k_eefabs_f33fps8_sana_latent_aligned_episode_n24_nsc_videoonly_noobs.yaml (the N24
+# run) apart from sliding_window_chunks, the name and the work dir; warm-start from the completed Pantheon33k SFT.
+# Every window holds an episode from its first frame, one window per chunk-grid phase. The phase whose chunk grid lands
+# on the first frame opens there (data.extra.aligned_phase_window: first_frame, user 2026-10-12): its chunk 0 starts at
+# the first frame, as a deployment does, and it is trained. Every other phase opens with a padded chunk of 1..C-1
+# frozen first-frame rows, memory only. Every row but the last is the observation of exactly one trained chunk. A
+# chunk is its target latents alone: its observation is the last frame of its most recent memory latent, the sink
+# (the first frame, read by every chunk besides the N1 softmax window, written first by the GDN scan) for chunk 0 and
+# the previous chunk's last target latent for the others (user 2026-10-14).
 # Latents: the phase-window store v2-f33-vs4-phase-stretch-ae44f4a5961380ab (build_causal_phase_latent_cache.py), one
-# member per window: one causal VAE encode of the whole window gives every chunk's targets, each chunk's observation
-# frame is encoded alone.
-# N24 as in the causal campaign. Schedule (user 2026-10-12): 10k optimizer steps (~10.6 epochs at 941 steps per epoch
-# over 16 ranks), 500-step warmup to lr 5e-5, then cosine to 1e-6.
+# member per padded window (phases 1..C): one causal VAE encode of the whole window gives every chunk's targets; the
+# store also holds each chunk's observation frame encoded alone, of which only chunk 0's, the sink, is read. The
+# first-frame window reads the wholly frozen phase's member less its chunk 0.
+# Schedule as the N24 run's (user 2026-10-12): 10k optimizer steps (~10.6 epochs at 941 steps per epoch over 16 ranks),
+# 500-step warmup to lr 5e-5, then cosine to 1e-6.
 task: ltx
 report_to: wandb
 tracker_project_name: sana-rwm
-name: causal_robodojo_eefabs_sana_latent_256x320_pantheon33k_aligned_f33fps8_episode_n24_nsc_videoonly
-work_dir: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/output/causal_robodojo_pantheon33k_eefabs_f33fps8_sana_latent_aligned_episode_n24_nsc_videoonly
+name: causal_robodojo_eefabs_sana_latent_256x320_pantheon33k_aligned_f33fps8_episode_n1_nsc_videoonly
+work_dir: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/output/causal_robodojo_pantheon33k_eefabs_f33fps8_sana_latent_aligned_episode_n1_nsc_videoonly
 
 data:
   data_dir:
@@ -34,6 +40,7 @@ data:
   extra:
     multiview: sana_latent
     actions_per_chunk: {"25": 32}
+    aligned_phase_window: first_frame
     action_representation: current_anchor_qwen
     action_mode_sample_ratio: [0.0, 1.0, 0.0]
     joint_target_mode: absolute
@@ -74,7 +81,7 @@ model:
     rope: aligned
     chunk_causal_policy:
       actions_per_chunk: {"25": 32}
-      sliding_window_chunks: 24
+      sliding_window_chunks: 1
       memory_content: video_only
   image_size: 320
   mixed_precision: bf16
@@ -200,4 +207,5 @@ train:
       # Measured on 4 NSC nodes x 4 B300, jobs 165401_0 / 165630 (2026-10-08).
       # Both memory modes passed the fixed-length grid and mixed-length smoke.
       # 4x the initial tiers; same batches in both twins. See handoff 04, section 6.6.
+      # Kept at N1 for the comparison with the N24 run: a shorter softmax window only shrinks the attention spans.
       local_batch_sizes: [[1, 256], [2, 64], [4, 32], [7, 16], [12, 8], [23, 4]]

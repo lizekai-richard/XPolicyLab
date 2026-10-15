@@ -5,8 +5,8 @@ causal checkpoint's *bidirectional view* (``contract.bidirectional_view``): the 
 camera resized to its bucket, or the sana_pixel canvas), the prompt rows (G = V + 1 for the strip, G = 1 for the
 canvas) and their Gemma encoding (conditional + unconditional), the normalization artifact resolved and selected
 exactly as for the parent SFT checkpoint (f33 file name, yaml sha pin, absolute-EEF statistics), and the action
-denormalization. This module adds what only the causal deploy needs: the causal model, the single-frame observation
-encode, the per-view causal VAE streams of an episode (``vae_stream.ViewStreams``: the sink, the frozen first chunk
+denormalization. This module adds what only the causal deploy needs: the causal model, the single-frame encode of
+the sink, the per-view causal VAE streams of an episode (``vae_stream.ViewStreams``: the sink, the frozen first chunk
 and every executed chunk's targets) and the per-episode ``CausalPolicySession``.
 """
 
@@ -211,11 +211,10 @@ class CausalRuntime:
             raise ValueError(f"single-resolution contract violated: view latent shapes {view_shapes}")
 
     @torch.inference_mode()
-    def encode_observation(self, views: Sequence[torch.Tensor]) -> tuple[torch.Tensor, Optional[tuple]]:
-        """A chunk's observation: its start frame encoded alone, every view on its own (``view_frames``) and packed ->
-        (``[1, C_lat, 1, H, W]`` canvas or ``[1, C_lat, 1, 1, sum(h * w)]`` strip, the strip's view shapes or None).
-        By the causal VAE it is the window encode's latent of that frame alone (the first emitted chunk's: the
-        sink)."""
+    def encode_sink(self, views: Sequence[torch.Tensor]) -> tuple[torch.Tensor, Optional[tuple]]:
+        """One frame encoded alone, every view on its own (``view_frames``) and packed -> (``[1, C_lat, 1, H, W]``
+        canvas or ``[1, C_lat, 1, 1, sum(h * w)]`` strip, the strip's view shapes or None): at the episode's first frame
+        the sink (Sana ``CausalGraphedFrontend.encode_sink``), which the causal VAE makes the streams' first latent."""
 
         latents = [encode_window(self.frontend.vae, [view]) for view in views]
         packed, shapes = pack_multiview_latents(latents)

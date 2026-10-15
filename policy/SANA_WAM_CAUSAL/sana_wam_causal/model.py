@@ -1,15 +1,16 @@
 """Inference-only mirror of the chunk-causal policy (Sana ``sana_qwennext_policy_causal.py``, episode protocol:
-``d37817788`` / ``fcccb4c88`` / ``3cbe3d85e`` and the deploy forms of ``4bd1b674c``).
+``d37817788`` / ``fcccb4c88`` / ``3cbe3d85e`` and the deploy forms of ``4bd1b674c``, single form since ``4bd6eca83``:
+no chunk observations; checked against rwm/zekai-merge ``7de7711c2``).
 
 The model is the bidirectional policy trunk (``sana_wam_min.policy_model.PolicyModel``: embedders, AdaLN table,
 Block AttnRes V2, text cross-attention, final layer, action head) with every block rebuilt around the chunk-causal
 shells of ``layers.py``. It evaluates ONE deploy window per call, always a single segment, which is every form the
 streaming session needs (Sana ``CausalPolicyChunkSession`` with ``forward_sink`` / ``forward_chunk``):
 
-* the sink commit: the episode's first observation (one latent frame, no robot rows, t = 0) on video frame 0 -- the
+* the sink commit: the episode's first frame (one latent frame, no robot rows, t = 0) on video frame 0 -- the
   two-stream sink segment, which reads only itself and which every later forward reads;
-* the denoising window of chunk c >= 1: [observation_c (t = 0) | chunk-c targets] + [state | C actions] ([targets] +
-  rows under ``chunk_observation`` false) -- the two-stream noisy chunk c, which reads the session memory;
+* the denoising window of chunk c: [chunk-c targets] + [state | C actions] -- the two-stream noisy chunk c, which reads
+  the session memory and takes its observation from the last frame of the most recent latent in it;
 * the commit of chunk c at t = 0: [chunk-c targets] + [state | C actions] under ``memory_content`` video_and_action,
   the targets alone (no robot rows) under video_only -- the two-stream clean chunk c (chunk 0 the frozen first chunk),
   which reads like the generation of chunk c, then writes its GDN state and softmax K/V.
@@ -21,8 +22,8 @@ robot rows after them (Sana ``_chunk_permutation`` of a single segment).
 RoPE (``rope: aligned``): the bidirectional policy's video ids (the plain (t, y, x) grid for one view, the semantic 2x2
 tiles for three, Sana ``_video_position_ids``) with the time column on the physical frame clock: latent frame phi at
 ``base_fps * phi / (fps / s)`` (s = the video frame stride), robot step n at ``base_fps * n / (8 * fps)`` with spatial
-ids 0. The sink sits at frame 0, chunk c's observation at latent frame ``c * f_chunk`` (the instant of chunk c - 1's last
-target), its targets at ``c * f_chunk + 1`` onwards, its state row at step ``c * C`` and its actions at steps
+ids 0. The sink sits at frame 0, chunk c's targets at ``c * f_chunk + 1`` onwards (its observation instant
+``c * f_chunk`` is the frame of chunk c - 1's last target, or of the sink), its state row at step ``c * C`` and its actions at steps
 ``c * C + 1 .. c * C + C`` (Sana ``_causal_multiview_rope``, ``forward_sink``, ``forward_chunk``). Text: one prompt row
 (G = 1) for the canvas, G = V + 1 rows for the strip (one per view, then the robot tail; a robotless window reads the V
 view rows only, Sana ``_grouped_query_sublens``).
@@ -116,7 +117,6 @@ class CausalPolicyModel(PolicyModel):
         self.video_frame_stride = int(contract.video_frame_stride)
         self.latent_frames_per_chunk = int(contract.latent_frames_per_chunk)
         self.memory_content = str(contract.memory_content)
-        self.chunk_observation = bool(contract.chunk_observation)
         self.aligned_phase_window = str(contract.aligned_phase_window)
         self.first_chunk = int(contract.first_chunk)   # the chunk an episode emits first (0: first-frame window)
 
@@ -340,9 +340,9 @@ class CausalPolicyModel(PolicyModel):
         softmax_frame_offset: Optional[int] = None,
         softmax_step_offset: Optional[int] = None,
     ) -> dict[str, torch.Tensor]:
-        """Evaluate one single-segment window: a chunk's denoising window [observation | targets] + robot rows
-        ([targets] + rows without chunk observations), the commit of an executed chunk [targets] (+ robot rows under
-        ``memory_content`` video_and_action), or the sink commit (one frame, no rows).
+        """Evaluate one single-segment window: a chunk's denoising window [targets] + robot rows, the commit of an
+        executed chunk [targets] (+ robot rows under ``memory_content`` video_and_action), or the sink commit (one
+        frame, no rows).
 
         Args:
             latent: the window's latent frames: ``[B, C, F, H, W]`` for one view (``view_shapes`` None or one entry),
@@ -355,8 +355,7 @@ class CausalPolicyModel(PolicyModel):
             model_fps: the batch fps (25 for RoboDojo).
             frame_offset / step_offset: physical index of the window's first latent frame and first robot step (the
                 GDN layers' clock: their state keeps keys rotated at the physical positions of the whole episode):
-                0 / 0 for the sink, ``c * f_c`` / ``c * C`` for chunk c's denoising window (``c * f_c + 1`` without
-                chunk observations), ``c * f_c + 1`` / ``c * C`` for its commit.
+                0 / 0 for the sink, ``c * f_c + 1`` / ``c * C`` for chunk c's denoising window and for its commit.
             softmax_frame_offset / softmax_step_offset: the same window on the softmax layers' clock, numbered from 0
                 at the read's origin (the session's ``read_plan``; the cached entries are rotated on that clock too);
                 None = the physical offsets (nothing slid out of the window yet).

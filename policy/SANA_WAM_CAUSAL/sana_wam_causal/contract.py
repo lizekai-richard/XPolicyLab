@@ -2,25 +2,30 @@
 
 A causal recipe is its parent SFT recipe plus the causal blocks (Sana ``posttrain_causal_handoff/04_configs.md``
 section 5): ``model.model`` names the causal class, ``model.extra.chunk_causal_policy`` sets the chunk size, the
-softmax sliding window, what a memory chunk carries and whether a noisy chunk carries its own observation,
-``data.type`` is the causal chunk-window dataset and the window ladder replaces the SFT tier. Everything else
+softmax sliding window and what a memory chunk carries, ``data.type`` is the causal chunk-window dataset and the window
+ladder replaces the SFT tier. Everything else
 (multiview front-end, RoPE mode, action / target modes, normalization pin, noise schedule) keeps its SFT meaning, so the
 shared ``sana_wam_min`` resolvers read it from a *bidirectional view* of the yaml: the same dict with the SFT policy
 class and the one-chunk tier put back.
 
 This adapter serves the episode protocol (Sana ``d37817788`` / ``fcccb4c88`` / ``3cbe3d85e``, deploy ``4bd1b674c``;
-inference handoff 03, first status note): every training window is a whole episode from its first frame, the memory
-opens with the first-observation sink and a frozen first chunk, every noisy chunk carries its own observation latent
-unless ``chunk_observation`` is false, and a memory chunk holds its target latents (plus its anchor state and actions
-under ``memory_content: video_and_action``, the value of a config without the key). Front-ends: the three-view
-``sana_latent`` strip and the one-view ``sana_pixel`` canvas, ``rope: aligned``, no AttnRes time conditioning, unmasked
-canvas pad.
+inference handoff 03, first status note) in its single form since Sana ``4bd6eca83`` (rwm/zekai-merge, checked against
+``7de7711c2``): every training window is a whole episode from its first frame, the memory opens with the sink (the
+episode's first frame, on every canvas), a noisy chunk is its target latents alone and reads its observation from the
+memory -- the last frame of the most recent memory latent: the sink for chunk 0, chunk c - 1's last target latent for
+chunk c -- and a memory chunk holds its target latents (plus its anchor state and actions under ``memory_content:
+video_and_action``, the value of a config without the key). ``model.extra.chunk_causal_policy.chunk_observation`` is
+accepted absent or false (Sana ``refuse_chunk_observation``); a checkpoint trained with chunk observations (``true``)
+is refused: its protocol needs Sana 404c9bf0e or earlier, served by this adapter up to XPolicyLab ``d57a617``. Like
+Sana, the adapter cannot tell a config from before 2026-10-14 that trained chunk observations without declaring the
+key (absent meant true then). Front-ends: the three-view ``sana_latent`` strip and the one-view ``sana_pixel`` canvas,
+``rope: aligned``, no AttnRes time conditioning, unmasked canvas pad.
 
 ``data.extra.aligned_phase_window`` (Sana ``04c8acbee``; ``padded`` when absent) decides how a deployed episode opens. The
 phase window whose chunk grid lands on the first frame is ``padded`` (h = C: its chunk 0 the first frame frozen over
 one chunk, memory only; the deploy commits it and emits from chunk 1) or ``first_frame`` (h = 0: chunk 0 is the first
-frame's own chunk with no memory before it and is supervised; the deploy emits from chunk 0, which reads the
-first-observation sink without chunk observations and nothing with them -- Sana's ``two_stream_first_reads_sink``).
+frame's own chunk with no memory before it but the sink and is supervised; the deploy emits from chunk 0, which reads
+the sink as its observation).
 
 The sink-less per-chunk observation protocol (Sana ``61aad2d58`` .. ``3cbe3d85e``'s deploy, the pantheon14k m48n24
 checkpoints) is retired here as in Sana; its configs carry ``data.extra.window_repeats``, which no episode recipe does
@@ -81,7 +86,6 @@ class CausalContract:
     latent_frames_per_chunk: int     # f_c = C / (8 s): target latent frames of one chunk
     sliding_window_chunks: Optional[int]  # W: committed chunks a chunk's softmax layers read (None = all of them)
     memory_content: str              # video_and_action | video_only: what a committed chunk keeps besides its targets
-    chunk_observation: bool          # a noisy chunk opens with its own observation latent (False: its targets alone)
     model_fps: float
     tier_num_frames: int             # C + 1: the one-chunk window of the parent SFT recipe
     multiview: str
@@ -104,7 +108,7 @@ class CausalContract:
             f"protocol={PROTOCOL_EPISODE} actions_per_chunk={self.actions_per_chunk} "
             f"video_frame_stride={self.video_frame_stride} latent_frames_per_chunk={self.latent_frames_per_chunk} "
             f"sliding_window_chunks={window} memory_content={self.memory_content} "
-            f"chunk_observation={self.chunk_observation} multiview={self.multiview} visual_layout={self.visual_layout} "
+            f"chunk_observation=False multiview={self.multiview} visual_layout={self.visual_layout} "
             f"rope={self.rope} aligned_phase_window={self.aligned_phase_window} first_chunk={self.first_chunk}"
         )
 
@@ -163,15 +167,17 @@ def resolve_aligned_phase_window(value: Any) -> str:
     return str(value)
 
 
-def resolve_chunk_observation(value: Any) -> bool:
-    """``chunk_observation`` as Sana reads it (``causal_rwm_train.resolve_chunk_observation``): None (a config older
-    than the key) -> True; otherwise a bool."""
+def refuse_chunk_observation(value: Any) -> None:
+    """``chunk_observation`` as Sana reads it since 4bd6eca83 (``causal_rwm_train.refuse_chunk_observation``): chunk
+    observations are retired, every noisy chunk reads its observation from the memory; absent or ``false`` is accepted
+    and changes nothing, anything else is refused."""
 
-    if value is None:
-        return True
-    if not isinstance(value, bool):
-        raise ValueError(f"model.extra.chunk_causal_policy.chunk_observation={value!r}: must be true or false")
-    return value
+    if value is not None and value is not False:
+        raise ValueError(
+            f"model.extra.chunk_causal_policy.chunk_observation={value!r}: chunk observations are retired (Sana "
+            "4bd6eca83), every noisy chunk reads its observation from the memory. A checkpoint trained with chunk "
+            "observations needs Sana 404c9bf0e or earlier; it is served by SANA_WAM_CAUSAL up to XPolicyLab d57a617"
+        )
 
 
 def is_causal_policy_config(cfg: Mapping[str, Any]) -> bool:
@@ -210,13 +216,23 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
     if data_type not in CAUSAL_DATASET_TYPES:
         raise ValueError(f"data.type {data_type!r} is not a causal chunk-window dataset {CAUSAL_DATASET_TYPES}")
     options = chunk_causal_options(cfg)
-    # memory_uniform / memory_split: the same design's keys before Sana rwm/sparse-memory 3e7435754 renamed them
+    # the memory designs of Sana rwm/sparse-memory, which the causal net ignores (it would mis-serve them): the sparse
+    # memory (memory_type strided | fixed, since 3f6f8daa5) and the hierarchical memory it replaced (hierarchical_memory;
+    # memory_uniform / memory_split before 3e7435754 renamed them)
+    sparse_keys = [key for key in ("memory_type", "memory_stride", "memory_frames") if key in options]
+    if sparse_keys:
+        raise ValueError(
+            f"model.extra.chunk_causal_policy.{sparse_keys[0]}: this is a sparse-memory checkpoint (Sana "
+            "rwm/sparse-memory: one strided / fixed RGB memory every block reads), which this adapter would mis-serve as "
+            "the episode protocol; serve it with SANA_WAM_SM"
+        )
     memory_keys = [key for key in ("hierarchical_memory", "memory_uniform", "memory_split") if key in options]
     if memory_keys:
         raise ValueError(
             f"model.extra.chunk_causal_policy.{memory_keys[0]}: this is a hierarchical-memory checkpoint (Sana "
-            "rwm/sparse-memory, a dense / sparse memory read per block kind), which this adapter would mis-serve as the "
-            "per-chunk observation protocol; serve it with SANA_WAM_HM"
+            "rwm/sparse-memory before 3f6f8daa5, a dense / sparse memory read per block kind), which this adapter would "
+            "mis-serve as the episode protocol; it is served by SANA_WAM_HM up to XPolicyLab d57a617 (SANA_WAM_SM serves "
+            "the sparse memory that replaced it)"
         )
     if "window_repeats" in _extra(cfg.get("data")):
         raise ValueError(
@@ -255,7 +271,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
             "protocol only (the earlier protocol is archived in XPolicyLab commit 69cfb8e)"
         )
     memory_content = resolve_memory_content(options.get("memory_content"))
-    chunk_observation = resolve_chunk_observation(options.get("chunk_observation"))
+    refuse_chunk_observation(options.get("chunk_observation"))
     aligned_phase_window = resolve_aligned_phase_window(_extra(cfg.get("data")).get("aligned_phase_window"))
     window = options.get("sliding_window_chunks")
     window = None if window is None else int(window)
@@ -288,7 +304,6 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         latent_frames_per_chunk=f_chunk,
         sliding_window_chunks=window,
         memory_content=memory_content,
-        chunk_observation=chunk_observation,
         model_fps=fps,
         tier_num_frames=tier,
         multiview=str(multiview),
@@ -319,7 +334,7 @@ __all__ = [
     "is_causal_policy_config",
     "resolve_actions_per_chunk",
     "resolve_aligned_phase_window",
+    "refuse_chunk_observation",
     "resolve_causal_contract",
-    "resolve_chunk_observation",
     "resolve_memory_content",
 ]

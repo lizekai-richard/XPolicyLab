@@ -29,7 +29,6 @@ def _episode(model, probe=None, tmp_path=None):
     caption = Caption(torch.randn(1, 1, 1, 7, 16, generator=g), torch.ones(1, 1, 7, dtype=torch.int16))
     null = Caption(torch.randn(1, 1, 1, 7, 16, generator=g), torch.ones(1, 1, 7, dtype=torch.int16))
     sink, frozen = torch.randn(1, 4, 1, 3, 4, generator=g), torch.randn(1, 4, 1, 3, 4, generator=g)
-    observations = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(CHUNKS + 1)]
     clean = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(CHUNKS + 1)]
     mask = torch.zeros(1, 32, 80, dtype=torch.bool)
     mask[..., 7:17] = True
@@ -41,8 +40,8 @@ def _episode(model, probe=None, tmp_path=None):
     outs, paths = [], []
     for c in range(1, CHUNKS + 1):
         action, video = session.generate_chunk(
-            observations[c] if model.chunk_observation else None, anchor_state=state, anchor_state_mask=mask[0, 0],
-            action_mask=mask, generator=torch.Generator().manual_seed(100 + c),
+            anchor_state=state, anchor_state_mask=mask[0, 0], action_mask=mask,
+            generator=torch.Generator().manual_seed(100 + c),
         )
         outs.append((action, video))
         if probe is not None:
@@ -51,13 +50,9 @@ def _episode(model, probe=None, tmp_path=None):
     return outs, paths
 
 
-@pytest.mark.parametrize(
-    "memory_content,observation",
-    [(MEMORY_VIDEO_AND_ACTION, True), (MEMORY_VIDEO_ONLY, True), (MEMORY_VIDEO_ONLY, False)],
-    ids=["video_and_action", "video_only", "video_only-noobs"],
-)
-def test_the_probe_changes_nothing_and_its_masses_are_distributions(memory_content, observation, tmp_path):
-    model = _tiny_model(window=WINDOW, memory_content=memory_content, observation=observation)
+@pytest.mark.parametrize("memory_content", [MEMORY_VIDEO_AND_ACTION, MEMORY_VIDEO_ONLY], ids=["video_and_action", "video_only"])
+def test_the_probe_changes_nothing_and_its_masses_are_distributions(memory_content, tmp_path):
+    model = _tiny_model(window=WINDOW, memory_content=memory_content)
     plain, _ = _episode(model)
     probe = AttentionProbe(model)
     probed, paths = _episode(model, probe, tmp_path)
@@ -65,7 +60,7 @@ def test_the_probe_changes_nothing_and_its_masses_are_distributions(memory_conte
         assert torch.equal(a1, a2) and torch.equal(v1, v2)
     assert not probe.active
     robot = memory_content == MEMORY_VIDEO_AND_ACTION
-    groups = list(QUERY_GROUPS) if observation else list(QUERY_GROUPS[1:])
+    groups = list(QUERY_GROUPS[1:])   # no observation group: a chunk is its targets and robot rows
     for c, path in enumerate(paths, start=1):
         assert path.endswith(f"ep001_chunk{c:03d}.npz")
         data = np.load(path)
@@ -75,7 +70,7 @@ def test_the_probe_changes_nothing_and_its_masses_are_distributions(memory_conte
         per_chunk = ["video", "state", "action"] if robot else ["video"]
         assert meta["query_groups"] == groups
         assert meta["key_labels"] == ["sink.video"] + [f"mem{i}.{part}" for i in read for part in per_chunk] + [f"cur.{q}" for q in groups]
-        assert meta["query_sizes"] == ([12] if observation else []) + [12, 1, 32]
+        assert meta["query_sizes"] == [12, 1, 32]
         assert meta["memory_keys"] == 12 + len(read) * (12 + (33 if robot else 0))
         mass, out, gdn = data["softmax_mass"], data["softmax_out"], data["gdn"]
         steps, streams = 3, 2

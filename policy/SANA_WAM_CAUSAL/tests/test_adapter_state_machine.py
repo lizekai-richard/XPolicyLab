@@ -1,10 +1,11 @@
 """The XPolicyLab adapter's chunk cycle against a fake runtime (CPU, no weights), episode protocol: the RoboDojo call
 order of ``policy/<POLICY>/deploy.py`` (update_obs -> get_action, then update_obs after every executed action but the
 last, whose observation arrives right before the next get_action), tick counting, the episode opening (the per-view
-streams started at the first frame, the sink and the frozen first chunk committed, chunk 1 generated from the first
-frame; on a first-frame window chunk 0, with no frozen chunk in the memory), the frames every later commit streams, the order stream -> commit -> observation encode -> generate, the
-memory ablation (every chunk reopens the episode at its own start frame), a model without chunk observations, the
-double reset of every RoboDojo episode, and the refusals."""
+streams started at the first frame, the sink and the frozen first chunk committed, chunk 1 generated at the first
+frame; on a first-frame window the sink alone committed and chunk 0 generated), the frames every later commit streams,
+the order stream -> commit -> generate (no chunk carries an observation latent: it reads the last frame of the most
+recent memory latent), the memory ablation (every chunk reopens the episode at its own start frame), the double reset
+of every RoboDojo episode, and the refusals."""
 
 from __future__ import annotations
 
@@ -35,9 +36,9 @@ def _tick(view: torch.Tensor) -> int:
 class FakeSession:
     WINDOW = 2
 
-    def __init__(self, log, instruction, first_chunk=1, chunk_observation=True):
+    def __init__(self, log, instruction, first_chunk=1):
         self.log, self.instruction, self.chunk_idx, self.has_sink = log, instruction, 0, False
-        self.first_chunk, self.chunk_observation = first_chunk, chunk_observation
+        self.first_chunk = first_chunk
         self.view_shapes = "unset"
 
     def read_chunk_ids(self):
@@ -56,13 +57,10 @@ class FakeSession:
         self.log.append(("commit_sink", float(latent.flatten()[0])))
         self.has_sink = True
 
-    def generate_chunk(self, observation_latent, *, anchor_state, anchor_state_mask, action_mask, generator, gripper_bounds):
-        # the real session's rule: from the first emitted chunk on, every chunk reads the sink but a first-frame
-        # window's chunk 0 with chunk observations
-        assert self.chunk_idx >= self.first_chunk
-        assert self.has_sink == (self.chunk_idx > 0 or not self.chunk_observation)
-        obs = None if observation_latent is None else float(observation_latent.flatten()[0])
-        self.log.append(("generate", self.chunk_idx, anchor_state.clone(), action_mask.clone(), obs))
+    def generate_chunk(self, *, anchor_state, anchor_state_mask, action_mask, generator, gripper_bounds):
+        # the real session's rule: every chunk reads the sink, from the first emitted chunk on
+        assert self.has_sink and self.chunk_idx >= self.first_chunk
+        self.log.append(("generate", self.chunk_idx, anchor_state.clone(), action_mask.clone()))
         action = torch.zeros(1, C, 80)
         action[..., 10] = 1.0   # rot6d column 1 = x axis
         action[..., 14] = 1.0   # column 2 = y axis
@@ -100,7 +98,7 @@ class FakeRuntime:
     """One-view canvas; every view tensor carries the tick of its frame (the frames are filled with tick % 256)."""
 
     strip = False
-    first_chunk, chunk_observation = 1, True   # the session's contract (a padded window with chunk observations)
+    first_chunk = 1   # the session's contract (a padded window)
 
     def __init__(self, log):
         self.log = log
@@ -109,15 +107,10 @@ class FakeRuntime:
 
     def new_session(self, instruction):
         self.log.append(("new_session", instruction))
-        return FakeSession(self.log, instruction, self.first_chunk, self.chunk_observation)
+        return FakeSession(self.log, instruction, self.first_chunk)
 
     def view_frames(self, frames):
         return [torch.full((3, 1, 1), float(frames[0][0, 0, 0]))]
-
-    def encode_observation(self, views):
-        tick = _tick(views[0])
-        self.log.append(("encode_obs", tick))
-        return torch.full((1, 4, 1, 3, 4), float(tick)), None
 
     def new_streams(self):
         return FakeStreams(self.log)
@@ -158,7 +151,6 @@ def model():
     m.commit_actions = "executed"
     m.memory_mode = "full"
     m.memory_content = "video_and_action"
-    m.chunk_observation = True
     m.first_chunk = 1
     m.max_chunks_per_episode = None
     m.log_world_model_error = True
@@ -198,36 +190,24 @@ def test_the_robodojo_cycle(model):
         torch.from_numpy(np.repeat(m._anchor(_obs(0))[0][None].astype(np.float32), C, axis=0)), mask, m.normalization
     ).masked_fill(~mask, 0)
     assert torch.allclose(hold, expected, atol=1e-6) and torch.count_nonzero(hold[~mask]) == 0
-    assert (first[1], first[4]) == (1, 0.0)                      # chunk 1, generated from the first frame (the sink)
+    assert first[1] == 1                                         # chunk 1, generated at the first frame (reads the sink)
     _run_chunk(m, 0)
     m.get_action()
     names = [entry[0] for entry in m.log]
-    assert names == ["new_session"] + OPENING + ["stream_chunk", "commit_chunk", "encode_obs", "generate"]
-    stream, commit, encode, second = m.log[-4:]
+    assert names == ["new_session"] + OPENING + ["stream_chunk", "commit_chunk", "generate"]   # no observation encode
+    stream, commit, second = m.log[-3:]
     assert stream[1] == list(range(S, C + 1, S))                 # chunk 1's frames after its start: ticks 4, 8, .., 32
     assert commit[1] == 1 and commit[2] == float(sum(range(S, C + 1, S)))
     assert torch.equal(commit[4], first[2])                      # the chunk-start anchor of chunk 1, not the latest state
     assert not torch.equal(second[2], first[2])                  # chunk 2 anchors on the tick-32 observation
-    assert encode[1] == C and (second[1], second[4]) == (2, float(C))
+    assert second[1] == 2
     committed = commit[3][0]
     assert torch.count_nonzero(committed[~mask]) == 0
     _run_chunk(m, C)
     m.get_action()
-    assert [entry[0] for entry in m.log[-4:]] == ["stream_chunk", "commit_chunk", "encode_obs", "generate"]
-    assert m.log[-4][1] == list(range(C + S, 2 * C + 1, S))     # ticks 36, .., 64
-    assert m.log[-2][1] == 2 * C and m.log[-1][1:2] == (3,) and m.log[-1][4] == float(2 * C)
-
-
-def test_a_model_without_chunk_observations_generates_from_the_memory(model):
-    m = model
-    m.chunk_observation = False
-    m.update_obs(_obs(0))
-    m.get_action()
-    _run_chunk(m, 0)
-    m.get_action()
-    names = [entry[0] for entry in m.log]
-    assert names == ["new_session"] + OPENING + ["stream_chunk", "commit_chunk", "generate"]
-    assert all(entry[4] is None for entry in m.log if entry[0] == "generate")
+    assert [entry[0] for entry in m.log[-3:]] == ["stream_chunk", "commit_chunk", "generate"]
+    assert m.log[-3][1] == list(range(C + S, 2 * C + 1, S))     # ticks 36, .., 64: the last ends on chunk 3's start frame
+    assert m.log[-1][1] == 3
 
 
 def test_the_episode_counter_advances_once_per_episode(model):
@@ -293,7 +273,7 @@ def test_reset_drops_the_memory(model):
     m.get_action()
     names = [entry[0] for entry in m.log]
     assert names == ["new_session"] + OPENING + ["new_session"] + OPENING   # the new episode opens at its first frame
-    assert m.log[-5][1] == 100 and m.log[-1][1] == 1 and m.log[-1][4] == 100.0
+    assert m.log[-5][1] == 100 and m.log[-1][1] == 1         # streams reopened at tick 100, chunk 1 generated
 
 
 def test_memory_mode_none_reopens_the_episode_at_every_chunk(model, monkeypatch):
@@ -314,7 +294,7 @@ def test_memory_mode_none_reopens_the_episode_at_every_chunk(model, monkeypatch)
     # episode reopened at the chunk's own start frame; nothing of the past is committed
     assert names == ["new_session"] + OPENING + (["stream_chunk"] + OPENING) * 2
     assert [entry[1] for entry in m.log if entry[0] == "stream_start"] == [0, C, 2 * C]
-    assert [entry[1:2] + entry[4:5] for entry in m.log if entry[0] == "generate"] == [(1, 0.0), (1, float(C)), (1, float(2 * C))]
+    assert [entry[1] for entry in m.log if entry[0] == "generate"] == [1, 1, 1]
     assert [entry[1] for entry in m.log if entry[0] == "stream_chunk"] == [list(range(S, C + 1, S)), list(range(C + S, 2 * C + 1, S))]
     assert seeds == [0, 1, 2]                                    # the noise of the episode's decision index, as in full
     assert m._chunk_index == 3
@@ -378,7 +358,7 @@ def test_command_vs_reached_and_the_world_model_error_are_logged_for_every_execu
     assert "cmd_vs_reached(decision 0): L pos " in line and " | R pos " in line and " deg grip " in line
     assert "world_model_rel_rmse(decision 0)=" in line and "stream_s=" in line
     if memory_mode == "full":
-        assert "chunk 2:" in line and "read_chunks=[0, 1] origin=0" in line and "obs_encode_s=" in line
+        assert "chunk 2:" in line and "read_chunks=[0, 1] origin=0" in line and "commit_s=" in line
     else:
         assert "chunk 1:" in line and "read_chunks=[0] origin=0" in line and "open_stream_s=" in line
 
@@ -416,31 +396,28 @@ def test_command_vs_reached_measures_position_rotation_and_gripper():
     assert adapter.format_command_vs_reached(gaps).startswith("L pos 2.5/5.0 mm rot 10.00 deg grip 0.25 | R pos 0.0/0.0 mm")
 
 
-def _first_frame(m, observation):
-    m.first_chunk, m.chunk_observation = 0, observation
-    m.runtime.first_chunk, m.runtime.chunk_observation = 0, observation
+def _first_frame(m):
+    m.first_chunk = 0
+    m.runtime.first_chunk = 0
 
 
-@pytest.mark.parametrize("observation", [False, True], ids=["noobs", "obs"])
-def test_a_first_frame_window_emits_chunk_0_from_the_first_frame(model, observation):
-    """aligned_phase_window first_frame: the frozen chunk stays out of the memory and chunk 0 is generated at the first
-    frame -- after the sink without chunk observations (it reads it), before it with them (it reads nothing, its
-    observation is the sink's latent); the next cycle commits chunk 0 (its frames after the first one) and generates
-    chunk 1."""
+def test_a_first_frame_window_emits_chunk_0_from_the_first_frame(model):
+    """aligned_phase_window first_frame: the frozen chunk stays out of the memory, the sink is committed and chunk 0 is
+    generated at the first frame (reading the sink as its observation); the next cycle commits chunk 0 (its frames after
+    the first one) and generates chunk 1."""
 
     m = model
-    _first_frame(m, observation)
+    _first_frame(m)
     m.update_obs(_obs(0))
     m.get_action()
-    opening = ["stream_start", "reset_memory"] + (["generate", "commit_sink"] if observation else ["commit_sink", "generate"])
+    opening = ["stream_start", "reset_memory", "commit_sink", "generate"]
     assert [entry[0] for entry in m.log] == ["new_session"] + opening
     generate = next(entry for entry in m.log if entry[0] == "generate")
     sink = next(entry for entry in m.log if entry[0] == "commit_sink")
     assert sink[1] == 0.0 and generate[1] == 0                  # the sink: the first frame alone; chunk 0 emitted
-    assert generate[4] == (0.0 if observation else None)        # its observation: the sink's latent, or none
     _run_chunk(m, 0)
     m.get_action()
-    cycle = ["stream_chunk", "commit_chunk"] + (["encode_obs"] if observation else []) + ["generate"]
+    cycle = ["stream_chunk", "commit_chunk", "generate"]
     assert [entry[0] for entry in m.log] == ["new_session"] + opening + cycle
     commit = next(entry for entry in m.log if entry[0] == "commit_chunk")
     assert commit[1] == 0 and commit[2] == float(sum(range(S, C + 1, S)))   # chunk 0: ticks 4, 8, .., 32
@@ -450,7 +427,7 @@ def test_a_first_frame_window_emits_chunk_0_from_the_first_frame(model, observat
 
 def test_memory_mode_none_on_a_first_frame_window_emits_chunk_0_every_time(model):
     m = model
-    _first_frame(m, False)
+    _first_frame(m)
     m.memory_mode = "none"
     m.update_obs(_obs(0))
     m.get_action()
