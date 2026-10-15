@@ -3,8 +3,13 @@
 
 Training encodes each episode window once with the causal LTX-2.3 encoder (Sana ``crwm.encode_window_chunks``, the
 phase-window store): per view, the window's first frame alone gives the sink, then every C / s frames (C actions per
-chunk, video frame stride s) give one chunk's target latents, each encoded after the window's whole past. The deployed
-window is the phase whose head is one whole chunk: its chunk 0 is the first frame frozen over the chunk's C / s frames.
+chunk, video frame stride s) give one chunk's target latents, each encoded after the window's whole past. A padded window
+is the phase whose head is one whole chunk: its chunk 0 is the first frame frozen over the chunk's C / s frames, which
+the stream encodes after the sink. A first-frame window (``aligned_phase_window: first_frame``; Sana ``9fca24879``,
+``CausalViewStream.start`` returns the sink alone) opens on the sink alone, its chunk 0 the executed one: the causal
+encoder pads with the first frame, so its chunk latents equal the padded stream's up to float32 round-off (the phase
+store serves that window as the wholly frozen phase's member less its chunk 0, measured bit-identical by Sana's audit;
+<= 4e-7 apart on this CPU stream, ``test_vae_stream``).
 The encoder is causal, so feeding the same frames as a stream on one persistent feature cache (the first frame on a
 fresh cache, then 8-frame blocks) reproduces that window encode latent for latent (Sana ``test_causal_view_stream``),
 and a deployment encodes every observed frame once.
@@ -99,13 +104,14 @@ class LatentStream:
 
 
 class ViewStreams:
-    """The per-view streams of one episode (Sana ``CausalViewStream``): ``start`` gives the sink and the frozen first
-    chunk, ``encode_chunk`` every executed chunk's target latents, each packed as the policy reads it (the one-view
-    grid, or the view-major strip of several views)."""
+    """The per-view streams of one episode (Sana ``CausalViewStream``): ``start`` gives the sink and, on a padded
+    window (``frozen_first_chunk``), the frozen first chunk; ``encode_chunk`` every executed chunk's target latents, each
+    packed as the policy reads it (the one-view grid, or the view-major strip of several views)."""
 
-    def __init__(self, bundle: VaeBundle, *, frames_per_chunk: int) -> None:
+    def __init__(self, bundle: VaeBundle, *, frames_per_chunk: int, frozen_first_chunk: bool = True) -> None:
         self.bundle = bundle
         self.frames_per_chunk = int(frames_per_chunk)
+        self.frozen_first_chunk = bool(frozen_first_chunk)
         if self.frames_per_chunk < 1 or self.frames_per_chunk % ENCODER_BLOCK:
             raise ValueError(f"a chunk spans {frames_per_chunk} frames; the causal encoder streams whole blocks of {ENCODER_BLOCK}")
         self._streams: list[LatentStream] = []
@@ -121,16 +127,20 @@ class ViewStreams:
         return packed
 
     @torch.no_grad()
-    def start(self, first_frames: Sequence[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def start(self, first_frames: Sequence[torch.Tensor]) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Open every view's stream at the episode's first frame -> (sink ``[1, C, 1, ...]``, frozen first chunk
-        ``[1, C, f_c, ...]``): the first frame alone, then the first frame repeated over one chunk's frames, encoded
-        after it (the phase window whose head is one whole chunk)."""
+        ``[1, C, f_c, ...]`` or None): the first frame alone, then on a padded window the first frame repeated over one
+        chunk's frames, encoded after it (the phase window whose head is one whole chunk); a first-frame window opens on
+        the sink alone."""
 
         if not first_frames:
             raise ValueError("start needs one first frame per view")
         self._streams = [LatentStream(self.bundle) for _ in first_frames]
         self.view_shapes = None
         sinks = [stream.start(frame) for stream, frame in zip(self._streams, first_frames)]
+        if not self.frozen_first_chunk:
+            self.chunks = 0
+            return self._pack(sinks), None
         frozen = [
             stream.extend([frame] * self.frames_per_chunk) for stream, frame in zip(self._streams, first_frames)
         ]

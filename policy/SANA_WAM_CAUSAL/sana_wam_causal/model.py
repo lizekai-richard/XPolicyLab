@@ -117,6 +117,8 @@ class CausalPolicyModel(PolicyModel):
         self.latent_frames_per_chunk = int(contract.latent_frames_per_chunk)
         self.memory_content = str(contract.memory_content)
         self.chunk_observation = bool(contract.chunk_observation)
+        self.aligned_phase_window = str(contract.aligned_phase_window)
+        self.first_chunk = int(contract.first_chunk)   # the chunk an episode emits first (0: first-frame window)
 
         self.x_embedder = PatchEmbedMS3D(config.patch_size, config.in_channels, config.hidden_size)
         self.t_embedder = TimestepEmbedder(config.hidden_size)

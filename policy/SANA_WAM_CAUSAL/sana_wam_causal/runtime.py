@@ -214,7 +214,8 @@ class CausalRuntime:
     def encode_observation(self, views: Sequence[torch.Tensor]) -> tuple[torch.Tensor, Optional[tuple]]:
         """A chunk's observation: its start frame encoded alone, every view on its own (``view_frames``) and packed ->
         (``[1, C_lat, 1, H, W]`` canvas or ``[1, C_lat, 1, 1, sum(h * w)]`` strip, the strip's view shapes or None).
-        By the causal VAE it is the window encode's latent of that frame alone (chunk 1: the sink)."""
+        By the causal VAE it is the window encode's latent of that frame alone (the first emitted chunk's: the
+        sink)."""
 
         latents = [encode_window(self.frontend.vae, [view]) for view in views]
         packed, shapes = pack_multiview_latents(latents)
@@ -226,7 +227,8 @@ class CausalRuntime:
         """The per-view causal VAE streams of one episode (``start`` at its first frame, then one chunk at a time)."""
 
         return ViewStreams(
-            self.frontend.vae, frames_per_chunk=self.contract.actions_per_chunk // self.contract.video_frame_stride
+            self.frontend.vae, frames_per_chunk=self.contract.actions_per_chunk // self.contract.video_frame_stride,
+            frozen_first_chunk=self.contract.first_chunk == 1,   # a first-frame window opens on the sink alone
         )
 
 

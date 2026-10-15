@@ -7,7 +7,9 @@ two-stream TRAINING forward over [sink | clean targets 0..L-2 | noisy chunks 0..
 softmax sliding window with the sink taken next to an evicting reader's window, both memory contents, both
 ``chunk_observation`` settings, the one-view canvas and the three-view strip -- must equal, chunk by chunk from chunk 1
 on, what the streaming chain computes: the sink commit, the commit of the frozen chunk 0, then for every chunk its
-denoising window against the memory and the commit of its clean chunk. The mirror's session is also checked against
+denoising window against the memory and the commit of its clean chunk. On a first-frame window
+(``aligned_phase_window: first_frame``, Sana 04c8acbee) it must equal from chunk 0 on the chain that opens with chunk 0:
+reading the sink without chunk observations (Sana's ``two_stream_first_reads_sink``), nothing with them. The mirror's session is also checked against
 Sana's deploy ``CausalPolicyChunkSession`` past the window boundary, on both of its position clocks. Run on its own
 (the first file of a session owns the ``dev`` package).
 """
@@ -94,7 +96,7 @@ class Twins:
     0's observation), every chunk's own observation latent, clean targets and noisy targets."""
 
     def __init__(self, *, views=1, stride=4, chunk=32, window=None, separate=True, chunks=4, depth=4, seed=11,
-                 fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, observation=True):
+                 fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, observation=True, first_frame=False):
         causal, self.crwm = _live_modules()
         Live = causal.SanaRWMVideoQwenNextSubAttnResV2SelfFlowWorldModelCameraConditionMultiViewCausal
         self.views, self.stride, self.chunk, self.window = views, stride, chunk, window
@@ -136,6 +138,7 @@ class Twins:
             tier_num_frames=chunk + 1, multiview=multiview,
             visual_layout="sana_pixel_canvas" if views == 1 else "three_view_strip", rope="aligned",
             dt_bias_init=-5.0, a_log_init=0.0, reset_legacy_beta=False,
+            aligned_phase_window="first_frame" if first_frame else "padded",
         )
         policy_config = PolicyConfig.from_sana_kwargs(config=config, **kwargs)
         assert tuple(policy_config.multiview_spatial_rope_tile_shape) == (8, 16)
@@ -294,6 +297,36 @@ class Twins:
                 self.commit(session, k)
         return outputs
 
+    def streaming_first_frame(self, length: int, sink_at_chunk_0=None):
+        """The deploy chain of a first-frame window on the mirror: chunk 0's denoising window at the first frame --
+        after the sink without chunk observations (it reads it), before it with them (it reads nothing) -- then per
+        chunk the commit of the previous clean chunk and its own window. ``sink_at_chunk_0`` overrides whether chunk 0
+        reads the sink (a negative control). Returns chunks 0..L-1."""
+
+        session = self.session()
+        assert session.first_chunk == 0
+        reads_sink = (not self.observation) if sink_at_chunk_0 is None else bool(sink_at_chunk_0)
+        if reads_sink:
+            session.commit_sink(self.ours(self.obs[0]))
+        outputs = [self.denoise_forward(session, 0)]
+        if not reads_sink:
+            session.commit_sink(self.ours(self.obs[0]))
+        for k in range(1, length):
+            self.commit(session, k - 1)
+            outputs.append(self.denoise_forward(session, k))
+        return outputs
+
+
+def _first_reads_sink_in_training() -> bool:
+    """Whether the live tree's two-stream forward lets noisy chunk 0 read the sink without chunk observations (04c8acbee)."""
+
+    import inspect
+
+    _live_modules()
+    from dev.rwm.diffusion.model.layers import chunk_causal_gdn
+
+    return "first_reads_sink" in inspect.signature(chunk_causal_gdn.two_stream_read_version).parameters
+
 
 def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a - b).abs().max())
@@ -325,6 +358,42 @@ def test_deploy_chain_equals_two_stream_training_forward(views, stride, chunk, w
     for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming), start=1):
         torch.testing.assert_close(x_ours, x_live, **CLOSE, msg=lambda m: f"chunk {k} video: {m}")
         torch.testing.assert_close(a_ours, a_live, **CLOSE, msg=lambda m: f"chunk {k} action: {m}")
+
+
+@pytest.mark.parametrize("observation", OBSERVATIONS, ids=["obs", "noobs"])
+@pytest.mark.parametrize("memory", MEMORIES)
+@pytest.mark.parametrize("views,stride,chunk,window,length", CASES, ids=CASE_IDS)
+def test_first_frame_deploy_chain_equals_two_stream_training_forward(views, stride, chunk, window, length, memory,
+                                                                     observation):
+    """aligned_phase_window first_frame: EVERY noisy chunk of the training forward, chunk 0 included, == the deploy
+    chain that opens with chunk 0 at the first frame (past the softmax window too)."""
+
+    if not observation and not _first_reads_sink_in_training():
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates noisy chunk 0 reading the sink without chunk observations (04c8acbee)")
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=length, memory=memory,
+                  observation=observation, first_frame=True)
+    training = twins.two_stream(length)
+    streaming = twins.streaming_first_frame(length)
+    assert len(training) == len(streaming) == length
+    for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming)):
+        torch.testing.assert_close(x_ours, x_live, **CLOSE, msg=lambda m: f"chunk {k} video: {m}")
+        torch.testing.assert_close(a_ours, a_live, **CLOSE, msg=lambda m: f"chunk {k} action: {m}")
+
+
+@pytest.mark.parametrize("views", [1, 3])
+def test_a_first_frame_chunk_0_without_the_sink_is_caught(views):
+    """Negative control: without chunk observations, a chunk 0 that does not read the sink (noisy chunk 0's rule before
+    04c8acbee) misses the training forward at chunk 0 -- the parity above can tell whether chunk 0 reads the sink."""
+
+    if not _first_reads_sink_in_training():
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates noisy chunk 0 reading the sink without chunk observations (04c8acbee)")
+    twins = Twins(views=views, window=2, chunks=4, memory=MEMORY_VIDEO_ONLY, observation=False, first_frame=True)
+    training = twins.two_stream(4)
+    off = twins.streaming_first_frame(4, sink_at_chunk_0=False)
+    for index in (0, 1):   # video, action
+        with pytest.raises(AssertionError):
+            torch.testing.assert_close(off[0][index], training[0][index], **CLOSE)
+        assert _max_abs(off[0][index], training[0][index]) > 1e-8
 
 
 @pytest.mark.parametrize("views", [1, 3])
@@ -514,6 +583,73 @@ def test_session_matches_the_live_deploy_session(views, memory, observation, vid
                           anchor_state_mask=state_mask, action_mask=mask)
     assert ours.chunk_idx == live.chunk_idx == chunks
     assert origins == [max(0, k - 2) for k in range(1, chunks)]
+
+
+def _live_session_opens_on_the_first_frame() -> bool:
+    """Whether the live tree's deploy side starts on the first-frame window (9fca24879: ``CausalViewStream`` lost its
+    frozen chunk, hence ``frames_per_chunk``)."""
+
+    import inspect
+
+    _live_modules()
+    from dev.rwm.deploy.causal import view_stream
+
+    return "frames_per_chunk" not in inspect.signature(view_stream.CausalViewStream.__init__).parameters
+
+
+FIRST_FRAME_SESSION_CASES = [
+    # views, memory, observation, video_cfg, action_cfg, position mode
+    (1, MEMORY_VIDEO_ONLY, False, 3.0, 1.0, "rank"),
+    (3, MEMORY_VIDEO_ONLY, False, 2.5, 1.7, "absolute"),
+    (3, MEMORY_VIDEO_ONLY, True, 3.0, 1.0, "rank"),
+    (1, MEMORY_VIDEO_AND_ACTION, True, 2.5, 1.7, "absolute"),
+    (3, MEMORY_VIDEO_AND_ACTION, False, 3.0, 1.0, "rank"),
+]
+
+
+@pytest.mark.parametrize("views,memory,observation,video_cfg,action_cfg,position_mode", FIRST_FRAME_SESSION_CASES)
+def test_a_first_frame_session_matches_the_live_deploy_session(views, memory, observation, video_cfg, action_cfg,
+                                                              position_mode):
+    """A first-frame episode of the mirror's session == Sana's CausalPolicyChunkSession, which starts there since
+    9fca24879: chunk 0 generated at the first frame (after the sink without chunk observations, before it with them),
+    then generate / commit cycles with per-stream CFG past the window boundary (W = 2, 6 chunks)."""
+
+    if not _live_session_opens_on_the_first_frame():
+        pytest.skip(f"{SANA_CAUSAL_REPO}'s deploy session predates the first-frame start (9fca24879)")
+    steps, chunks = 3, 6
+    twins = Twins(views=views, window=2, chunks=chunks, memory=memory, observation=observation, first_frame=True)
+    live = _live_session(twins, steps, video_cfg, action_cfg, position_mode)
+    ours = twins.session(steps=steps, video_cfg=video_cfg, action_cfg=action_cfg)
+    mask = torch.ones(1, twins.chunk, 80, dtype=torch.bool)
+    mask[..., 60:] = False
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+
+    def commit_sink():
+        live.commit_sink(twins.obs[0])
+        ours.commit_sink(twins.ours(twins.obs[0]))
+
+    if not observation:
+        commit_sink()
+    g = torch.Generator().manual_seed(19)
+    for k in range(chunks):
+        video_noise = torch.randn(1, C_LAT, twins.f_chunk, 1, twins.width, generator=g, dtype=torch.float64)
+        action_noise = torch.randn(1, twins.chunk, 80, generator=g, dtype=torch.float64)
+        a_live, v_live = live.generate_chunk(
+            twins.obs[k] if observation else None, anchor_state=twins.states[k], anchor_state_mask=state_mask,
+            action_mask=mask, video_noise=video_noise, action_noise=action_noise,
+        )
+        a_ours, v_ours = ours.generate_chunk(
+            twins.ours(twins.obs[k]) if observation else None, anchor_state=twins.states[k], anchor_state_mask=state_mask,
+            action_mask=mask, video_noise=twins.ours(video_noise), action_noise=action_noise,
+        )
+        torch.testing.assert_close(a_ours, a_live, **CLOSE, msg=lambda m: f"chunk {k} action: {m}")
+        torch.testing.assert_close(v_ours, twins.ours(v_live), **CLOSE, msg=lambda m: f"chunk {k} video: {m}")
+        if k == 0 and observation:
+            commit_sink()
+        live.commit_chunk(twins.clean[k], twins.a_clean[k], anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask)
+        ours.commit_chunk(twins.ours(twins.clean[k]), twins.a_clean[k], anchor_state=twins.states[k],
+                          anchor_state_mask=state_mask, action_mask=mask)
+    assert ours.chunk_idx == live.chunk_idx == chunks
 
 
 def test_the_softmax_clock_stays_in_a_training_window_and_the_gdn_clock_is_physical():

@@ -16,6 +16,12 @@ under ``memory_content: video_and_action``, the value of a config without the ke
 ``sana_latent`` strip and the one-view ``sana_pixel`` canvas, ``rope: aligned``, no AttnRes time conditioning, unmasked
 canvas pad.
 
+``data.extra.aligned_phase_window`` (Sana ``04c8acbee``; ``padded`` when absent) decides how a deployed episode opens. The
+phase window whose chunk grid lands on the first frame is ``padded`` (h = C: its chunk 0 the first frame frozen over
+one chunk, memory only; the deploy commits it and emits from chunk 1) or ``first_frame`` (h = 0: chunk 0 is the first
+frame's own chunk with no memory before it and is supervised; the deploy emits from chunk 0, which reads the
+first-observation sink without chunk observations and nothing with them -- Sana's ``two_stream_first_reads_sink``).
+
 The sink-less per-chunk observation protocol (Sana ``61aad2d58`` .. ``3cbe3d85e``'s deploy, the pantheon14k m48n24
 checkpoints) is retired here as in Sana; its configs carry ``data.extra.window_repeats``, which no episode recipe does
 (the episode launcher refuses it), and are refused with the reason, at start-up, before the weights are read. So are a
@@ -60,6 +66,10 @@ MEMORY_CONTENTS = (MEMORY_VIDEO_AND_ACTION, MEMORY_VIDEO_ONLY)
 # the front-ends this adapter serves: the three-view strip (multiview sana_latent) and the one-view sana_pixel canvas
 SERVED_VISUAL_LAYOUTS = (VISUAL_LAYOUT_THREE_VIEW_STRIP, VISUAL_LAYOUT_SANA_PIXEL_CANVAS)
 PROTOCOL_EPISODE = "episode"
+# data.extra.aligned_phase_window (Sana causal_chunk_window_data.aligned_phase_window): absent = padded
+ALIGNED_PHASE_PADDED = "padded"
+ALIGNED_PHASE_FIRST_FRAME = "first_frame"
+ALIGNED_PHASE_WINDOWS = (ALIGNED_PHASE_PADDED, ALIGNED_PHASE_FIRST_FRAME)
 
 
 @dataclass(frozen=True)
@@ -80,6 +90,13 @@ class CausalContract:
     dt_bias_init: float
     a_log_init: float
     reset_legacy_beta: bool
+    aligned_phase_window: str = ALIGNED_PHASE_PADDED  # padded: chunk 0 frozen, memory only | first_frame: chunk 0 emitted
+
+    @property
+    def first_chunk(self) -> int:
+        """The chunk an episode emits first: 1 after the frozen chunk 0 of a padded window, 0 on a first-frame window."""
+
+        return 0 if self.aligned_phase_window == ALIGNED_PHASE_FIRST_FRAME else 1
 
     def describe(self) -> str:
         window = "all" if self.sliding_window_chunks is None else str(self.sliding_window_chunks)
@@ -88,7 +105,7 @@ class CausalContract:
             f"video_frame_stride={self.video_frame_stride} latent_frames_per_chunk={self.latent_frames_per_chunk} "
             f"sliding_window_chunks={window} memory_content={self.memory_content} "
             f"chunk_observation={self.chunk_observation} multiview={self.multiview} visual_layout={self.visual_layout} "
-            f"rope={self.rope}"
+            f"rope={self.rope} aligned_phase_window={self.aligned_phase_window} first_chunk={self.first_chunk}"
         )
 
 
@@ -133,6 +150,16 @@ def resolve_memory_content(value: Any) -> str:
         raise ValueError(
             f"model.extra.chunk_causal_policy.memory_content={value!r}: allowed values are {list(MEMORY_CONTENTS)}"
         )
+    return str(value)
+
+
+def resolve_aligned_phase_window(value: Any) -> str:
+    """``data.extra.aligned_phase_window`` as Sana reads it (``causal_chunk_window_data.aligned_phase_window``): None (a
+    config older than the key) -> padded; padded | first_frame otherwise."""
+
+    value = ALIGNED_PHASE_PADDED if value is None else value
+    if value not in ALIGNED_PHASE_WINDOWS:
+        raise ValueError(f"data.extra.aligned_phase_window must be one of {list(ALIGNED_PHASE_WINDOWS)}; got {value!r}")
     return str(value)
 
 
@@ -183,9 +210,11 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
     if data_type not in CAUSAL_DATASET_TYPES:
         raise ValueError(f"data.type {data_type!r} is not a causal chunk-window dataset {CAUSAL_DATASET_TYPES}")
     options = chunk_causal_options(cfg)
-    if "hierarchical_memory" in options:
+    # memory_uniform / memory_split: the same design's keys before Sana rwm/sparse-memory 3e7435754 renamed them
+    memory_keys = [key for key in ("hierarchical_memory", "memory_uniform", "memory_split") if key in options]
+    if memory_keys:
         raise ValueError(
-            "model.extra.chunk_causal_policy.hierarchical_memory: this is a hierarchical-memory checkpoint (Sana "
+            f"model.extra.chunk_causal_policy.{memory_keys[0]}: this is a hierarchical-memory checkpoint (Sana "
             "rwm/sparse-memory, a dense / sparse memory read per block kind), which this adapter would mis-serve as the "
             "per-chunk observation protocol; serve it with SANA_WAM_HM"
         )
@@ -227,6 +256,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         )
     memory_content = resolve_memory_content(options.get("memory_content"))
     chunk_observation = resolve_chunk_observation(options.get("chunk_observation"))
+    aligned_phase_window = resolve_aligned_phase_window(_extra(cfg.get("data")).get("aligned_phase_window"))
     window = options.get("sliding_window_chunks")
     window = None if window is None else int(window)
     if window is not None and window < 1:
@@ -267,11 +297,15 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         dt_bias_init=float(options.get("dt_bias_init", DEFAULT_DT_BIAS_INIT)),
         a_log_init=float(options.get("a_log_init", DEFAULT_A_LOG_INIT)),
         reset_legacy_beta=bool(options.get("reset_legacy_beta", False)),
+        aligned_phase_window=aligned_phase_window,
     )
 
 
 __all__ = [
     "ACTION_TEMPORAL_COMPRESSION",
+    "ALIGNED_PHASE_FIRST_FRAME",
+    "ALIGNED_PHASE_PADDED",
+    "ALIGNED_PHASE_WINDOWS",
     "CAUSAL_DATASET_TYPES",
     "CAUSAL_POLICY_FACTORY",
     "CausalContract",
@@ -284,6 +318,7 @@ __all__ = [
     "chunk_causal_options",
     "is_causal_policy_config",
     "resolve_actions_per_chunk",
+    "resolve_aligned_phase_window",
     "resolve_causal_contract",
     "resolve_chunk_observation",
     "resolve_memory_content",

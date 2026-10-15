@@ -15,6 +15,8 @@ import yaml
 import _paths
 
 from sana_wam_causal.contract import (
+    ALIGNED_PHASE_FIRST_FRAME,
+    ALIGNED_PHASE_PADDED,
     MEMORY_VIDEO_AND_ACTION,
     MEMORY_VIDEO_ONLY,
     CausalContract,
@@ -30,6 +32,8 @@ from sana_wam_min.policy_model.config import PolicyConfig
 EPISODE_VA = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoandaction_0081aa702.yaml")
 EPISODE_VO = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoonly_0081aa702.yaml")
 EPISODE_NOOBS = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoonly_noobs_0081aa702.yaml")
+# the released no-observation checkpoint, trained on the first-frame window (data.extra.aligned_phase_window first_frame)
+FIRST_FRAME_NOOBS = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoonly_noobs_first_frame_s3324.yaml")
 SINKLESS_VA = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
 SINKLESS_VO = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoonly_s5000.yaml")
 RETIRED_CHUNK0 = os.path.join(_paths.FIXTURES, "config_causal_vanilla52k_m48n24_s7646.yaml")
@@ -69,6 +73,19 @@ def test_the_pantheon33k_episode_recipes_resolve(path, memory_content, observati
     text = contract.describe()
     assert text.startswith("protocol=episode ") and f"memory_content={memory_content}" in text
     assert f"chunk_observation={observation}" in text
+    assert (contract.aligned_phase_window, contract.first_chunk) == (ALIGNED_PHASE_PADDED, 1)   # no key: padded
+    assert "aligned_phase_window=padded first_chunk=1" in text
+
+
+def test_the_first_frame_checkpoint_emits_chunk_0():
+    """The released no-observation checkpoint trains the first-frame window (Sana 04c8acbee): its episodes open on
+    chunk 0, which reads the sink."""
+
+    contract = resolve_causal_contract(_load(FIRST_FRAME_NOOBS))
+    assert (contract.aligned_phase_window, contract.first_chunk) == (ALIGNED_PHASE_FIRST_FRAME, 0)
+    assert contract.chunk_observation is False and contract.memory_content == MEMORY_VIDEO_ONLY
+    assert (contract.sliding_window_chunks, contract.multiview, contract.visual_layout) == (24, "sana_latent", "three_view_strip")
+    assert "aligned_phase_window=first_frame first_chunk=0" in contract.describe()
 
 
 def test_a_sana_pixel_canvas_resolves_on_the_episode_protocol():
@@ -117,16 +134,20 @@ def _policy(cfg):
         (lambda c: _policy(c).__setitem__("memory_content", "video_and_state"), "memory_content"),
         (lambda c: _policy(c).__setitem__("chunk_observation", "no"), "chunk_observation"),
         (lambda c: _policy(c).__setitem__("hierarchical_memory", {"gdn": "dense"}), "SANA_WAM_HM"),
+        (lambda c: _policy(c).__setitem__("memory_uniform", {"sparse_frames": 16}), "SANA_WAM_HM"),
+        (lambda c: _policy(c).__setitem__("memory_split", {"sparse_frames": 16}), "SANA_WAM_HM"),
         (lambda c: c["model"]["extra"].__setitem__("rope", "independent"), "aligned only"),
         (lambda c: c["model"].__setitem__("use_time_conditioning", True), "use_time_conditioning"),
         (lambda c: (c["data"]["extra"].__setitem__("multiview", "openwam"),
                     c["data"].__setitem__("aspect_ratio_type", "ASPECT_RATIO_OPENWAM_LSHAPE_384_320")),
          "sana_latent strip and the one-view"),
         (lambda c: c["data"].__setitem__("type", "RoboDojoSFTDataset"), "causal chunk-window dataset"),
+        (lambda c: c["data"]["extra"].__setitem__("aligned_phase_window", "h0"), "aligned_phase_window"),
         (lambda c: _policy(c).__setitem__("actions_per_chunk", {"25": 24}), "disagree"),
     ],
-    ids=["sft-class", "window-repeats", "obs-key", "memory-content", "chunk-observation", "hierarchical", "independent",
-         "time-conditioning", "openwam", "sft-dataset", "chunk-mismatch"],
+    ids=["sft-class", "window-repeats", "obs-key", "memory-content", "chunk-observation", "hierarchical",
+         "memory-uniform", "memory-split", "independent", "time-conditioning", "openwam", "sft-dataset",
+         "phase-window", "chunk-mismatch"],
 )
 def test_unsupported_contracts_are_refused(causal_cfg, edit, match):
     cfg = copy.deepcopy(causal_cfg)
@@ -280,7 +301,7 @@ def test_reads_rotate_the_pre_rope_keys_at_their_slots():
 # -- the session on a tiny model -----------------------------------------------------------------------------------------
 
 
-def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION, observation=True):
+def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION, observation=True, phase=ALIGNED_PHASE_PADDED):
     config = PolicyConfig.from_sana_kwargs(
         depth=4, hidden_size=64, patch_size=(1, 1, 1), num_heads=2, in_channels=4, caption_channels=16,
         model_max_length=7, linear_head_dim=32, softmax_head_dim=32, softmax_ratio=0.5, attn_res_block_size=2,
@@ -291,7 +312,7 @@ def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION, observation=Tr
         actions_per_chunk=32, video_frame_stride=4, latent_frames_per_chunk=1, sliding_window_chunks=window,
         memory_content=memory_content, chunk_observation=observation, model_fps=25.0, tier_num_frames=33,
         multiview="sana_pixel", visual_layout="sana_pixel_canvas", rope="aligned", dt_bias_init=-5.0, a_log_init=0.0,
-        reset_legacy_beta=False,
+        reset_legacy_beta=False, aligned_phase_window=phase,
     )
     torch.manual_seed(0)
     model = CausalPolicyModel(config, contract)
@@ -449,3 +470,51 @@ def test_a_session_refuses_misuse():
         session.commit_chunk(torch.zeros(1, 4, 2, 3, 4), torch.zeros(1, 32, 80), **kwargs)
     with pytest.raises(ValueError, match="executed_action"):
         session.commit_chunk(torch.zeros(1, 4, 1, 3, 4), torch.zeros(1, 31, 80), **kwargs)
+
+
+@pytest.mark.parametrize("observation", [False, True], ids=["noobs", "obs"])
+def test_a_first_frame_session_emits_from_chunk_0(observation):
+    """aligned_phase_window first_frame: no frozen chunk, chunk 0 is generated at the first frame -- after the sink
+    without chunk observations (it reads it), before it with them (it reads nothing) -- and the cycle runs on from there;
+    the wrong order is refused."""
+
+    model = _tiny_model(window=2, memory_content=MEMORY_VIDEO_ONLY, observation=observation, phase=ALIGNED_PHASE_FIRST_FRAME)
+    caption, null, g = _captions(6)
+    sink = torch.randn(1, 4, 1, 3, 4, generator=g)
+    observations = [sink] + [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(3)]
+    clean = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(4)]
+    mask = torch.ones(1, 32, 80, dtype=torch.bool)
+    state = torch.randn(1, 80, generator=g)
+    kwargs = dict(anchor_state=state, anchor_state_mask=mask[0, 0], action_mask=mask)
+
+    def generate(session, c):
+        return session.generate_chunk(observations[c] if observation else None,
+                                      generator=torch.Generator().manual_seed(40 + c), **kwargs)
+
+    def run():
+        session = _session(model, caption, null)
+        assert session.first_chunk == 0
+        if observation:
+            outs = [generate(session, 0)]            # reads nothing
+            session.commit_sink(sink)
+        else:
+            session.commit_sink(sink)
+            outs = [generate(session, 0)]            # reads the sink
+        for c in range(4):
+            session.commit_chunk(clean[c], outs[c][0], **kwargs)
+            if c < 3:
+                assert session.chunk_idx == c + 1 and session.read_chunk_ids() == list(range(max(0, c - 1), c + 1))
+                outs.append(generate(session, c + 1))
+        return outs
+
+    first, second = run(), run()
+    for (a1, v1), (a2, v2) in zip(first, second):
+        assert torch.equal(a1, a2) and torch.equal(v1, v2)
+    wrong = _session(model, caption, null)
+    if observation:
+        wrong.commit_sink(sink)
+        with pytest.raises(RuntimeError, match="generate it before commit_sink"):
+            generate(wrong, 0)
+    else:
+        with pytest.raises(RuntimeError, match="commit_sink first"):
+            generate(wrong, 0)

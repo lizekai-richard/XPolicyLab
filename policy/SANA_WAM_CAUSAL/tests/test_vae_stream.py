@@ -101,6 +101,39 @@ def test_the_streams_are_the_phase_windows_one_shot_encode(bundle, views, chunks
     assert torch.equal(pack_multiview_latents([encode_window(bundle, [first]) for first, _ in episode])[0], sink)
 
 
+@pytest.mark.parametrize("views", [1, 3])
+def test_a_first_frame_stream_opens_on_the_sink_alone(bundle, views):
+    """A first-frame window's streams (Sana 9fca24879) open on the sink alone and stream chunk 0 on, bit for bit the
+    one-shot encode of the window from the first frame. The causal encoder pads with the first frame, so the chunk
+    latents equal the padded stream's (the frozen chunk encoded after the sink; the phase store serves the first-frame
+    window as the wholly frozen phase's member less its chunk 0) up to float32 round-off: NSC measured the two encodes
+    bit-identical, this CPU stream differs by <= 4e-7 on O(1) latents."""
+
+    chunks = 3
+    episode = _episode(views, chunks, seed=21)
+    firsts = [first for first, _ in episode]
+
+    def chunk_frames(j):
+        return [later[FRAMES_PER_CHUNK * j : FRAMES_PER_CHUNK * (j + 1)] for _, later in episode]
+
+    streams = ViewStreams(bundle, frames_per_chunk=FRAMES_PER_CHUNK, frozen_first_chunk=False)
+    sink, frozen = streams.start(firsts)
+    assert frozen is None and streams.chunks == 0
+    got = [streams.encode_chunk(chunk_frames(j)) for j in range(chunks)]
+    assert streams.chunks == chunks
+    padded = ViewStreams(bundle, frames_per_chunk=FRAMES_PER_CHUNK)
+    padded_sink, _ = padded.start(firsts)
+    reference = [padded.encode_chunk(chunk_frames(j)) for j in range(chunks)]
+    assert torch.equal(sink, padded_sink)
+    for j, (a, b) in enumerate(zip(got, reference)):
+        torch.testing.assert_close(a, b, rtol=0.0, atol=2e-6, msg=lambda m: f"chunk {j} vs the padded stream: {m}")
+    one_shot = [encode_window(bundle, [first] + list(later)) for first, later in episode]
+    expected = [pack_multiview_latents([latent[:, :, i : i + 1] for latent in one_shot])[0] for i in range(1 + chunks)]
+    assert torch.equal(sink, expected[0])
+    for j in range(chunks):
+        assert torch.equal(got[j], expected[1 + j]), f"chunk {j} vs the one-shot encode"
+
+
 def test_streams_and_one_shot_encodes_interleave_without_crosstalk(bundle):
     """The episode's streams live across decisions while the single-frame observation encodes run in between."""
 

@@ -4,10 +4,13 @@ The policy runs in-process through the vendored, Sana-free ``sana_wam_causal`` p
 ``sana_wam_min`` runtime) and is deployed teacher-forced, exactly as it trains (two-stream teacher forcing, the episode
 protocol of Sana ``d37817788`` / ``4bd1b674c``):
 
-* the first ``get_action`` of an episode opens one causal VAE stream per view at the first frame and the memory with two
-  commits: the sink (the first frame encoded alone) and the frozen first chunk (the first frame repeated over one
-  chunk's frames, encoded on after it; under ``memory_content`` video_and_action its rows hold the robot at its first
-  state). It then generates chunk 1 from the first frame -- the training's phase window whose head is one whole chunk;
+* the first ``get_action`` of an episode opens one causal VAE stream per view at the first frame (the sink: the first
+  frame encoded alone) and the memory as the training's phase window aligned on the first frame
+  (``data.extra.aligned_phase_window``). ``padded``: the streams encode the first frame repeated over one chunk's
+  frames after the sink, and two commits follow, the sink and that frozen first chunk (under ``memory_content``
+  video_and_action its rows hold the robot at its first state); chunk 1 is generated from the first frame.
+  ``first_frame`` (Sana ``04c8acbee`` / deploy ``9fca24879``): no frozen chunk; chunk 0 is generated from the first
+  frame -- reading the sink without chunk observations, nothing with them (the sink is committed right after);
 * every ``get_action`` denoises its chunk as the window [observation | targets] + [state | actions] ([targets] + rows
   for a model trained without chunk observations) against the memory: the GDN state of everything committed, and on
   the softmax side the sink plus the newest ``sliding_window_chunks`` committed chunks (the training forward's rule);
@@ -84,8 +87,9 @@ CHECKPOINT_EXPLICIT_KEYS = ("checkpoint_dir", "checkpoint_path", "ckpt_dir", "mo
 # the previous command)
 COMMIT_ACTIONS = ("executed", "predicted", "reached")
 # full = the deployment (memory of the whole episode); none = the memory ablation: every chunk reopens the memory at
-# its own start frame (the sink and the frozen first chunk of that frame) and is generated as chunk 1, i.e. as the
-# first emission of an episode starting there -- the episode protocol trains no memoryless window
+# its own start frame (the sink, and the frozen first chunk of a padded window, of that frame) and is generated as the
+# first emission of an episode starting there (chunk 1, chunk 0 on a first-frame window) -- the episode protocol
+# trains no memoryless window
 MEMORY_MODES = ("full", "none")
 SEED_DOMAIN = "sana_wam_causal_xpolicylab.diffusion_seed.v1"
 MAX_JSON_SAFE_INTEGER = 2**53 - 1
@@ -293,6 +297,7 @@ class Model(ModelTemplate):
         self.frame_stride = int(contract.video_frame_stride)
         self.memory_content = str(contract.memory_content)
         self.chunk_observation = bool(contract.chunk_observation)
+        self.first_chunk = int(contract.first_chunk)   # the episode's first emission: 1 (padded window) or 0 (first frame)
         check_commit_actions(self.commit_actions, self.memory_content)
 
         # diagnostics: per-chunk memory-read aggregates of every generation forward (attention_probe.py)
@@ -455,8 +460,10 @@ class Model(ModelTemplate):
 
     def _open_memory(self, views: list[torch.Tensor], anchor_raw: np.ndarray, anchor_norm: torch.Tensor,
                      action_mask: torch.Tensor, timings: dict) -> torch.Tensor:
-        """(Re)open the streams and the memory at this frame: the sink, then the frozen first chunk (its rows hold the
-        robot at this state under video_and_action); returns the sink, which is chunk 1's observation."""
+        """(Re)open the streams and the memory at this frame; returns the sink, the first emitted chunk's observation.
+        Padded window: the sink, then the frozen first chunk (its rows hold the robot at this state under
+        video_and_action). First-frame window: the streams open on the sink alone, which is committed only without
+        chunk observations (with them chunk 0 reads nothing and ``get_action`` commits the sink after generating it)."""
 
         device = self.runtime.device
         self._streams = self.runtime.new_streams()
@@ -465,6 +472,10 @@ class Model(ModelTemplate):
             raise RuntimeError(f"{TAG} no session to open")
         self._session.reset_memory()
         self._session.view_shapes = self._streams.view_shapes if self.runtime.strip else None
+        if self.first_chunk == 0:
+            if not self.chunk_observation:
+                _, timings["open_commit_s"] = timed(self._session.commit_sink, sink)
+            return sink
         mask_cpu = action_mask[0].detach().cpu()
         hold_raw = torch.from_numpy(np.repeat(anchor_raw[None].astype(np.float32), self.chunk_actions, axis=0))
         hold = normalize_action(hold_raw, mask_cpu, self.normalization).masked_fill(~mask_cpu, 0)
@@ -511,15 +522,15 @@ class Model(ModelTemplate):
         action_mask = anchor_mask_t.reshape(1, 1, -1).expand(1, self.chunk_actions, -1).contiguous()
         views = self.runtime.view_frames(frames)
         if first or self.memory_mode == "none":
-            # the episode opens here (memory none: every chunk reopens it at its own start frame); chunk 1's
-            # observation is the first frame encoded alone, i.e. the sink
+            # the episode opens here (memory none: every chunk reopens it at its own start frame); the first emitted
+            # chunk's observation is the first frame encoded alone, i.e. the sink
             observation_latent = self._open_memory(views, anchor_raw, anchor_norm, action_mask, timings)
         elif self.chunk_observation:
             (observation_latent, _), timings["obs_encode_s"] = timed(self.runtime.encode_observation, views)
         else:
             observation_latent = None   # the chunk reads its current frame from the memory
-        chunk = self._session.chunk_idx   # the training chunk this window is (1 at an episode's first frame)
-        expected = 1 if self.memory_mode == "none" else decision + 1
+        chunk = self._session.chunk_idx   # the training chunk this window is (the first emitted one at the first frame)
+        expected = self.first_chunk if self.memory_mode == "none" else decision + self.first_chunk
         if chunk != expected:
             raise RuntimeError(f"{TAG} the session is at chunk {chunk} for decision {decision} (expected {expected})")
         read_ids = self._session.read_chunk_ids()
@@ -535,6 +546,10 @@ class Model(ModelTemplate):
             generator=generator,
             gripper_bounds=self.gripper_bounds,
         )
+        if not self._session.has_sink:
+            # a first-frame window's chunk 0 with chunk observations read nothing; its observation, the sink, opens the
+            # memory now (before the commit of chunk 0, as the training's clean stream is [sink | chunk 0 | ..])
+            _, timings["sink_commit_s"] = timed(self._session.commit_sink, observation_latent)
         if self._probe is not None:
             self._probe.write(
                 self.attention_dump_dir, self._episode_index,
