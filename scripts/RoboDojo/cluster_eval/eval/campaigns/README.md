@@ -13,6 +13,7 @@ below:
 |---|---|
 | `pantheon14k_openwam_allgpu_seeds.sh` | `../defs/pantheon14k_openwam.env` |
 | `pantheon14k_nocfg_allgpu_seeds.sh` | `../defs/pantheon14k_nocfg.env` |
+| `pantheon33k_latent_nocfg_allgpu_seeds.sh` | `../defs/pantheon33k_latent_nocfg.env` |
 | `pantheon14k_pixel_allgpu_seeds.sh` | `../defs/pantheon14k_pixel.env` |
 | `pantheon14k_nas24_allgpu_seeds.sh` | `../defs/pantheon14k_pixel_nas24.env` |
 | `pantheon14k_videoaug_allgpu_seeds.sh` | `../defs/pantheon14k_pixel_videoaug.env` |

@@ -14,7 +14,8 @@ reports line up.
 | `pantheon14k_pixel_nas24.env` | the same checkpoint | n_action_steps 24 | 15.39 / 21.95, 984 |
 | `pantheon14k_pixel_videoaug.env` | Pantheon14k sana pixel trained with video augmentation | whole chunks | 13.15 / 19.82, 852 |
 | `pantheon14k_nocfg.env` | Pantheon14k sana pixel trained without condition dropout | guidance off (video CFG 1, action CFG 1) | 15.23 / 21.76, 979 |
-| `pantheon14k_openwam.env` | Pantheon14k OpenWAM canvas (384x320) | whole chunks | in progress (2026-10-13) |
+| `pantheon14k_openwam.env` | Pantheon14k OpenWAM canvas (384x320) | whole chunks | 15.12 / 21.19, 976 |
+| `pantheon33k_latent_nocfg.env` | Pantheon33k sana latent trained without condition dropout | guidance off (video CFG 1, action CFG 1) | in progress (2026-10-15) |
 | `pantheon2k_latent_pair.env` | the two Pantheon2k sana latents (fixed resize, video augmentation), in parallel | whole chunks | 14.31 / 20.99, 929; 15.46 / 21.62, 1018 |
 
 Everything not listed in a definition follows the defaults of `eval/run.sh`: 10 steps, video CFG 6 / action CFG 1, flow

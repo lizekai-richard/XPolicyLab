@@ -32,7 +32,7 @@ _nocfg=eefabs_sana_pixel_320x512_vanilla_pantheon14k_aligned_f33fps8_nocfg_xpl_v
 WAIT_RUNS=${WAIT_RUNS-official_seed0_$_nocfg official_seed1_$_nocfg official_seed2_$_nocfg}   # the whole no-CFG series (not-started = pending)
 WAIT_INTERVAL=${WAIT_INTERVAL:-300}; CONFIRM_INTERVAL=${CONFIRM_INTERVAL:-120}; CONFIRM_CHECKS=${CONFIRM_CHECKS:-1}
 TICK=${TICK:-90}
-NODES_ALL=${NODES_ALL:-l1 l3 l6 l7 l8 l26 l27 l5 l0}   # 2026-10-13: l2 l9 l25 l30 OUT (policy servers hung 50 min -> server_timeout on every
+NODES_ALL=${NODES_ALL:-l7 l0 l25 l1 l5 l6 l2 l9 l8 l30 l3 l26 l27}   # 2026-10-14 18:45 PDT (seeds 1-2, after the 46 h NFS outage): every reachable node, lowest load first (master pull order), l27 last (slowest NFS); l4 still unreachable; page cache prewarmed per node. Before: # 2026-10-13: l2 l9 l25 l30 OUT (policy servers hung 50 min -> server_timeout on every
 # slot; raw NFS reads 13-14 MB/s), l4 OUT (unreachable since 10-12 14:30 PDT, its 8 units went stale)   # l5 / l0 LAST: their NFS clients are degraded (2026-10-12, load ~700,
 # hundreds of D-state processes of another user); the master pulls through its nodes in this order, 300 s per timed-out node
 RPC_BASE=63200; WS_BASE=65200     # the vanilla34k driver's slot ports: base + 50 + g
