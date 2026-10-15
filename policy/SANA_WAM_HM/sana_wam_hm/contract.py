@@ -1,10 +1,12 @@
 """The deploy contract of a hierarchical-memory checkpoint, read from its training ``config.yaml``.
 
 A hierarchical-memory recipe (Sana rwm/sparse-memory, ``configs/causal/robot_pretrain/
-causal_robodojo_pantheon14k_eefabs_f33fps8_sana_pixel_aligned_hm_{dense_sparse,sparse_sparse}_videoonly.yaml``) is
-its parent SFT recipe plus the causal blocks: ``model.model`` names the causal class, ``model.extra.chunk_causal_policy``
-sets the chunk size, ``memory_content: video_only`` and the ``hierarchical_memory`` block (which memory each block kind
-reads), ``data.type`` is the causal dataset and the frame-anchor rung ladder replaces the SFT tier. Everything else keeps
+causal_robodojo_pantheon14k_eefabs_f33fps8_sana_pixel_aligned_hm_{dense_sparse,sparse_sparse}_videoonly[_noobs].yaml``)
+is its parent SFT recipe plus the causal blocks: ``model.model`` names the causal class,
+``model.extra.chunk_causal_policy`` sets the chunk size, ``memory_content: video_only``, the ``hierarchical_memory``
+block (which memory each block kind reads) and, from Sana 6564adc38, ``chunk_observation`` (false: the noisy chunk is the
+target alone, the ``_noobs`` recipe), ``data.type`` is the causal dataset and the frame-anchor rung ladder replaces the
+SFT tier. Everything else keeps
 its SFT meaning, so the shared ``sana_wam_min`` resolvers read it from a *bidirectional view* of the yaml (the SFT policy
 class and the one-chunk tier put back), exactly as for the causal line.
 
@@ -13,6 +15,11 @@ What this adapter implements, refused otherwise at start-up with the reason (bef
 * ``hierarchical_memory`` present (a causal checkpoint without it is the per-chunk observation protocol of
   SANA_WAM_CAUSAL), ``memory_content: video_only`` (the memory latents carry no robot rows), no
   ``sliding_window_chunks`` (a softmax block reads its whole memory), no ``obs_in_first_chunk`` (a retired layout);
+  the pre-rename ``memory_uniform: {sparse_frames: m}`` of the checkpoints trained before Sana 3e7435754 (e.g. the
+  pin 5736eebad) is read as ``{gdn: sparse, softmax: sparse, sparse_frames: m}`` (``resolve_memory``), its
+  ``memory_split`` sibling is refused;
+* ``chunk_observation`` true (absent) or false (Sana reads it for the hierarchical memory from 6564adc38 on; any other
+  value is refused, and so is false next to a pre-rename ``memory_uniform`` block, whose trainer never read the key);
 * one chunk = 32 rows = one latent frame (``actions_per_chunk`` 32 at 25 fps, VAE stride 8, video frame stride 4), the
   one-view ``sana_pixel`` 320 x 512 canvas (10 x 16 = 160 tokens per latent frame), ``rope: aligned``, unmasked canvas
   pad, no AttnRes time conditioning (the memory latents' hidden states must not depend on the noisy chunk's t), the
@@ -49,6 +56,10 @@ ACTION_TEMPORAL_COMPRESSION = 8
 DEFAULT_DT_BIAS_INIT = -5.0
 DEFAULT_A_LOG_INIT = 0.0
 MEMORY_VIDEO_ONLY = "video_only"
+# the memory keys of Sana rwm/sparse-memory before 3e7435754 renamed them to hierarchical_memory
+LEGACY_MEMORY_UNIFORM = "memory_uniform"
+LEGACY_MEMORY_SPLIT = "memory_split"
+MEMORY_KEYS = (hm.MEMORY_KEY, LEGACY_MEMORY_UNIFORM, LEGACY_MEMORY_SPLIT)
 # the 320 x 512 sana_pixel canvas: 10 x 16 latent tokens per frame at the VAE's spatial stride 32
 CANVAS_LATENT_HW = (10, 16)
 
@@ -74,12 +85,19 @@ class HMContract:
     dt_bias_init: float
     a_log_init: float
     reset_legacy_beta: bool
+    memory_key: str = hm.MEMORY_KEY  # the yaml key the memory was read from (memory_uniform: a pre-rename checkpoint)
+    chunk_observation: bool = True   # the noisy chunk opens with the observation latent (False: the target alone)
 
     @property
     def memory(self) -> dict:
-        """The parsed ``hierarchical_memory`` block (``memory.parse_memory`` form)."""
+        """The parsed ``hierarchical_memory`` block with ``chunk_observation`` (``memory.parse_memory`` form)."""
 
-        return {hm.GDN: self.gdn_memory, hm.SOFTMAX: self.softmax_memory, "sparse_frames": self.sparse_frames}
+        return {
+            hm.GDN: self.gdn_memory,
+            hm.SOFTMAX: self.softmax_memory,
+            "sparse_frames": self.sparse_frames,
+            hm.CHUNK_OBSERVATION: self.chunk_observation,
+        }
 
     @property
     def streams(self) -> tuple:
@@ -102,9 +120,9 @@ class HMContract:
     def describe(self) -> str:
         return (
             f"protocol=hierarchical_memory gdn={self.gdn_memory} softmax={self.softmax_memory} "
-            f"sparse_frames={self.sparse_frames} actions_per_chunk={self.actions_per_chunk} "
-            f"video_frame_stride={self.video_frame_stride} memory_content={MEMORY_VIDEO_ONLY} multiview={self.multiview} "
-            f"rope={self.rope}"
+            f"sparse_frames={self.sparse_frames} memory_key={self.memory_key} "
+            f"chunk_observation={self.chunk_observation} actions_per_chunk={self.actions_per_chunk} video_frame_stride={self.video_frame_stride} "
+            f"memory_content={MEMORY_VIDEO_ONLY} multiview={self.multiview} rope={self.rope}"
         )
 
 
@@ -140,9 +158,55 @@ def resolve_actions_per_chunk(spec: Any, fps: float, vae_stride: int = ACTION_TE
 
 def is_hierarchical_memory_config(cfg: Mapping[str, Any]) -> bool:
     try:
-        return hm.MEMORY_KEY in chunk_causal_options(cfg)
+        options = chunk_causal_options(cfg)
     except ValueError:
         return False
+    return any(key in options for key in MEMORY_KEYS)
+
+
+def resolve_memory(options: Mapping[str, Any]) -> tuple[str, dict]:
+    """The key that declares the checkpoint's memory and its ``memory.parse_memory`` form (with ``chunk_observation``).
+
+    ``hierarchical_memory``, or its pre-rename form (Sana rwm/sparse-memory before 3e7435754): ``memory_uniform:
+    {sparse_frames: m}``, one uniformly sampled memory read by every block, i.e. ``{gdn: sparse, softmax: sparse,
+    sparse_frames: m}`` (the rename kept the rows, offsets, layouts and token subsets bit for bit, and the
+    hm_sparse_sparse smokes reproduce the memory_uniform smoke's step-1 loss, Sana ledger sections 24-25). Its sibling
+    ``memory_split`` (GDN dense, softmax sparse) read a dense memory encoded online, which the rename retired for a
+    prebuilt store; no checkpoint of it was checked against this adapter, so it is refused. ``chunk_observation`` false
+    next to ``memory_uniform`` is refused too: Sana's hierarchical memory reads the key from 6564adc38 on, after the
+    rename, so such a run trained every noisy chunk with its observation whatever the yaml says."""
+
+    keys = [key for key in MEMORY_KEYS if key in options]
+    if not keys:
+        raise ValueError(
+            f"model.extra.chunk_causal_policy carries no {hm.MEMORY_KEY} block: this is a causal checkpoint of the per-chunk "
+            "observation protocol (serve it with SANA_WAM_CAUSAL), not a hierarchical-memory one"
+        )
+    if len(keys) > 1:
+        raise ValueError(f"model.extra.chunk_causal_policy declares {keys}; a run has one memory design")
+    key = keys[0]
+    if key == LEGACY_MEMORY_SPLIT:
+        raise NotImplementedError(
+            f"model.extra.chunk_causal_policy.{LEGACY_MEMORY_SPLIT} (Sana before 3e7435754: a dense GDN memory encoded "
+            "online) is not served by this adapter; only its memory_uniform sibling was checked against the renamed form"
+        )
+    if key == LEGACY_MEMORY_UNIFORM:
+        block = options[key]
+        items = dict(block) if isinstance(block, Mapping) else dict(vars(block))
+        if set(items) != {"sparse_frames"}:
+            raise ValueError(
+                f"model.extra.chunk_causal_policy.{key} must declare exactly ['sparse_frames'], got {sorted(items)}"
+            )
+        observation = options.get(hm.CHUNK_OBSERVATION)
+        if observation not in (None, True):
+            raise ValueError(
+                f"model.extra.chunk_causal_policy.{hm.CHUNK_OBSERVATION}={observation!r} next to the pre-rename {key} "
+                f"block: Sana's hierarchical memory reads {hm.CHUNK_OBSERVATION} from 6564adc38 on, so a {key} run "
+                "trained every noisy chunk with its observation"
+            )
+        block = {hm.GDN: hm.SPARSE, hm.SOFTMAX: hm.SPARSE, "sparse_frames": items["sparse_frames"]}
+        return key, hm.parse_memory(block, observation)
+    return key, hm.parse_memory(options[key], options.get(hm.CHUNK_OBSERVATION))
 
 
 def bidirectional_view(cfg: Mapping[str, Any]) -> dict[str, Any]:
@@ -174,12 +238,7 @@ def resolve_hm_contract(cfg: Mapping[str, Any]) -> HMContract:
     if data_type not in CAUSAL_DATASET_TYPES:
         raise ValueError(f"data.type {data_type!r} is not the causal dataset {CAUSAL_DATASET_TYPES}")
     options = chunk_causal_options(cfg)
-    if hm.MEMORY_KEY not in options:
-        raise ValueError(
-            f"model.extra.chunk_causal_policy carries no {hm.MEMORY_KEY} block: this is a causal checkpoint of the per-chunk "
-            "observation protocol (serve it with SANA_WAM_CAUSAL), not a hierarchical-memory one"
-        )
-    memory = hm.parse_memory(options[hm.MEMORY_KEY])
+    memory_key, memory = resolve_memory(options)
     memory_content = options.get("memory_content")
     if memory_content != MEMORY_VIDEO_ONLY:
         raise ValueError(
@@ -254,6 +313,8 @@ def resolve_hm_contract(cfg: Mapping[str, Any]) -> HMContract:
         dt_bias_init=float(options.get("dt_bias_init", DEFAULT_DT_BIAS_INIT)),
         a_log_init=float(options.get("a_log_init", DEFAULT_A_LOG_INIT)),
         reset_legacy_beta=bool(options.get("reset_legacy_beta", False)),
+        memory_key=memory_key,
+        chunk_observation=memory[hm.CHUNK_OBSERVATION],
     )
 
 
@@ -266,10 +327,14 @@ __all__ = [
     "DEPLOY_FULL",
     "DEPLOY_STREAMING",
     "HMContract",
+    "LEGACY_MEMORY_SPLIT",
+    "LEGACY_MEMORY_UNIFORM",
+    "MEMORY_KEYS",
     "MEMORY_VIDEO_ONLY",
     "bidirectional_view",
     "chunk_causal_options",
     "is_hierarchical_memory_config",
     "resolve_actions_per_chunk",
     "resolve_hm_contract",
+    "resolve_memory",
 ]

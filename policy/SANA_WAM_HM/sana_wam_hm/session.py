@@ -2,7 +2,8 @@
 
 Sana keeps no deploy session for this mode yet (``causal_sparse_memory_plan.md`` sections 5, 12, 14 list the inference
 side as requirements); this session implements them. Decision c anchors at row t = r0 + 32c (r0 = the episode's first
-observation, tick 0) and denoises the noisy chunk [obs | target] + [state | 32 actions] with:
+observation, tick 0) and denoises the noisy chunk [obs | target] + [state | 32 actions] -- the target alone + the rows
+under ``chunk_observation: false`` (Sana 6564adc38), where the current frame enters through the memory only -- with:
 
 * the sparse memory of decision c (when a block kind reads it): ``memory.sparse_rows(t, r0, m)`` encoded as one causal
   sequence [A_0, A_1..] -- new every decision, since the sampled rows move with t;
@@ -18,11 +19,12 @@ Two ways to evaluate a decision (the ``deploy_form`` knob):
   V. This is exact because a memory token never reads the noisy chunk (the GDN scan reads it first, the softmax window
   is prefix-causal), its t is 0, and without AttnRes time conditioning its depth mixing is its own. With a dense memory
   the positions sit on the episode clock (rows from r0: L_j at 32j, decision c's sparse latents at their sampled rows,
-  obs at 32c, the robot rows from step 32c) -- the training geometry shifted by t - r0 for every token, so equal to
-  training up to floating-point round-off; without one, on the training clock (offsets from t) exactly;
+  obs at 32c, the target at 32c + 32, the robot rows from step 32c) -- the training geometry shifted by t - r0 for every
+  token, so equal to training up to floating-point round-off; without one, on the training clock (offsets from t)
+  exactly;
 * ``full`` (reference): every denoising step runs the TRAINING forward of the decision's sample [L_0..L_c | A_0.. | obs |
-  target] + rows on the training clock -- the training computation itself, at a cost that grows with c when a dense
-  memory is read.
+  target] + rows (no obs without ``chunk_observation``) on the training clock -- the training computation itself, at a
+  cost that grows with c when a dense memory is read.
 
 Conditional and unconditional text streams hold separate memories (the caption reaches every block through
 cross-attention, so a memory token's hidden states depend on it). Latents are ``[1, C_lat, F, H, W]`` canvas grids;
@@ -87,6 +89,7 @@ class HMSession:
         self.memory = dict(model.memory)
         self.m = int(self.memory["sparse_frames"])
         self.streams = hm.memory_streams(self.memory)
+        self.chunk_observation = hm.observes(self.memory)
         if deploy_form not in DEPLOY_FORMS:
             raise ValueError(f"deploy_form must be one of {DEPLOY_FORMS}, got {deploy_form!r}")
         self.deploy_form = deploy_form
@@ -118,6 +121,7 @@ class HMSession:
         self.dense_count = 0
         self.decision = 0
         self._grid: Optional[tuple[int, int]] = None
+        self._last_dense: Optional[torch.Tensor] = None
 
     # -- helpers -----------------------------------------------------------------------------------------------------
 
@@ -204,6 +208,7 @@ class HMSession:
             self._commit(hm.DENSE, latent, [hm.commit_rows(j)], fresh=j == 0)
         else:
             self.dense_latents.append(latent)
+        self._last_dense = latent
         self.dense_count += 1
 
     # -- one decision -------------------------------------------------------------------------------------------------
@@ -211,7 +216,7 @@ class HMSession:
     @torch.inference_mode()
     def generate(
         self,
-        observation_latent: torch.Tensor,
+        observation_latent: Optional[torch.Tensor],
         sparse_latents: Optional[torch.Tensor] = None,
         *,
         anchor_state: torch.Tensor,
@@ -222,12 +227,20 @@ class HMSession:
         action_noise: Optional[torch.Tensor] = None,
         gripper_bounds: Optional[tuple[tuple[float, float], tuple[float, float]]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Denoise decision ``self.decision``'s chunk from its observation ``[1, C, 1, H, W]`` and (when read) its sparse
-        memory ``[1, C, 1 + m/8, H, W]``; returns (normalized actions [1, C, 80], target latent [1, C, 1, H, W]) and
-        advances to the next decision."""
+        """Denoise decision ``self.decision``'s chunk from its observation ``[1, C, 1, H, W]`` (None without
+        ``chunk_observation``: the noisy chunk is the target alone) and (when read) its sparse memory
+        ``[1, C, 1 + m/8, H, W]``; returns (normalized actions [1, C, 80], target latent [1, C, 1, H, W]) and advances to
+        the next decision."""
 
         c = self.decision
-        self._check_latent(observation_latent, 1, "observation_latent")
+        if self.chunk_observation:
+            if observation_latent is None:
+                raise ValueError(f"decision {c} opens its noisy chunk with the observation latent (chunk_observation)")
+            self._check_latent(observation_latent, 1, "observation_latent")
+        elif observation_latent is not None:
+            raise ValueError(
+                "this checkpoint's noisy chunk is the target alone (chunk_observation false); got an observation latent"
+            )
         if self.reads_sparse:
             if sparse_latents is None:
                 raise ValueError(f"decision {c} needs its sparse memory (the blocks read {self.memory})")
@@ -240,7 +253,8 @@ class HMSession:
         action_mask = action_mask.to(dtype=torch.bool)
         if action_mask.ndim != 3 or action_mask.shape[:2] != (1, chunk):
             raise ValueError(f"action_mask must be [1, {chunk}, D], got {tuple(action_mask.shape)}")
-        like = observation_latent
+        # the latent the noise follows (device, dtype, shape): the observation, else the sparse memory, else L_c
+        like = next(latent for latent in (observation_latent, sparse_latents, self._last_dense) if latent is not None)
         device = like.device
         if video_noise is None:
             video_noise = torch.randn((1, like.shape[1], 1, *like.shape[3:]), generator=generator, device=device, dtype=like.dtype)
@@ -252,20 +266,22 @@ class HMSession:
         if self.deploy_form == DEPLOY_STREAMING:
             if self.reads_sparse:
                 self._commit(hm.SPARSE, sparse_latents.to(dtype=video.dtype), hm.sparse_memory_rows(c, self.m, self.episode_clock), fresh=True)
-            context = observation_latent.to(dtype=video.dtype)
+            prefix = []
             form, k = hm.FORM_NOISY, 0
-            rows = hm.noisy_rows(c, self.episode_clock)
+            rows = hm.noisy_rows(c, self.episode_clock, self.chunk_observation)
             step_offset = hm.noisy_step_offset(c, self.episode_clock)
         else:
             prefix = list(self.dense_latents) if self.reads_dense else []
             if self.reads_sparse:
                 prefix.append(sparse_latents)
-            context = torch.cat([p.to(dtype=video.dtype) for p in prefix] + [observation_latent.to(dtype=video.dtype)], dim=2)
             form, k = hm.FORM_TRAIN, c
-            rows = hm.train_rows(c, self.m, self.streams)
+            rows = hm.train_rows(c, self.m, self.streams, self.chunk_observation)
             step_offset = 0
+        if observation_latent is not None:
+            prefix.append(observation_latent)
+        context = torch.cat([p.to(dtype=video.dtype) for p in prefix], dim=2) if prefix else None
         offsets = hm.offsets_tensor(rows).to(device)
-        frames = context.shape[2] + 1
+        frames = (0 if context is None else context.shape[2]) + 1
         if offsets.shape[1] != frames:
             raise RuntimeError(f"decision {c}: {frames} latent frames but {offsets.shape[1]} frame rows")
         video_scheduler = make_scheduler(self.steps, self.flow_shift, device)
@@ -277,7 +293,7 @@ class HMSession:
                 action_timestep = action_scheduler.timesteps[step_index]
                 video_t = timestep.reshape(1, 1).to(torch.float32)
                 action_t = action_timestep.reshape(1, 1).expand(1, chunk).to(torch.float32)
-                latent = torch.cat((context, video), dim=2)
+                latent = video if context is None else torch.cat((context, video), dim=2)
                 window_t = torch.cat((video_t.new_zeros(1, frames - 1), video_t), dim=1)
                 robot = {
                     "state80": state,

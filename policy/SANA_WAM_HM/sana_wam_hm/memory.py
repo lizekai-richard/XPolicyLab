@@ -1,5 +1,7 @@
 """Geometry of the hierarchical memory (Sana rwm/sparse-memory ``dev/rwm/diffusion/model/utils/hierarchical_memory.py``
-and ``sana_qwennext_policy_causal.memory_layout``, checked against e8dde6b56), plus the deploy clock.
+and ``sana_qwennext_policy_causal.memory_layout``, checked against e8dde6b56; ``chunk_observation`` from 6564adc38, where
+the same functions are named ``memory_types_read`` / ``frame_indices`` / ``offset_eighths`` / ``train_layout`` /
+``commit_layout`` / ``generate_layout``), plus the deploy clock.
 
 Rows are 25 Hz control steps counted from the episode's first paired row r0 (the deploy's first observation, tick 0);
 a chunk is 32 rows and one latent frame (VAE stride 8 x video frame stride 4). A sample anchored at row t carries:
@@ -9,13 +11,16 @@ a chunk is 32 rows and one latent frame (VAE stride 8 x video frame stride 4). A
 * the sparse stream (read by the blocks configured ``sparse``): [r0, s_0..s_{m-1}] with the m rows sampled uniformly over
   [r0 + 1, t] (s_{m-1} = t; fewer than m candidates are padded with copies of r0 ahead of them) encoded as one causal
   sequence -> [A_0 (the first frame), A_1.. (one summary latent per 8 sampled rows)];
-* the noisy chunk [obs (row t, encoded alone) | target] + 33 robot rows (state, 32 actions).
+* the noisy chunk [obs (row t, encoded alone) | target] + 33 robot rows (state, 32 actions); under
+  ``chunk_causal_policy.chunk_observation: false`` (Sana 6564adc38) the target alone + the rows, so the current frame
+  reaches it through the memory only (the sparse stream's last sampled row is t, the dense stream's last latent ends at t).
 
 The training sequence is [dense latents | sparse latents | obs | target] + rows, each stream present only when a block
-kind reads it; every GDN block computes on (its memory + the noisy chunk) as a chunk scan, every softmax block on the
-same kind of subset as a prefix-causal window; the other tokens pass the block unchanged. Positions are row offsets on
-the aligned clock (one latent frame = 32 rows): L_0 and A_0 at the first frame's row, L_j at the end of its chunk, a
-sparse summary latent at the mean of its 8 sampled rows, obs at t, the target at t + 32.
+kind reads it (and obs only under ``chunk_observation``); every GDN block computes on (its memory + the noisy chunk) as a
+chunk scan, every softmax block on the same kind of subset as a prefix-causal window; the other tokens pass the block
+unchanged. Positions are row offsets on the aligned clock (one latent frame = 32 rows): L_0 and A_0 at the first frame's
+row, L_j at the end of its chunk, a sparse summary latent at the mean of its 8 sampled rows, obs at t, the target at
+t + 32; the state row stays at t with or without the obs frame.
 
 The functions here are pure and Sana's names are kept so the live-parity tests can compare them one to one.
 """
@@ -42,6 +47,8 @@ SOFTMAX = "softmax"
 BLOCK_KINDS = (GDN, SOFTMAX)
 MEMORY_KEY = "hierarchical_memory"
 MEMORY_FIELDS = (GDN, SOFTMAX, "sparse_frames")
+# chunk_causal_policy.chunk_observation, next to the hierarchical_memory block (Sana 6564adc38; absent = true)
+CHUNK_OBSERVATION = "chunk_observation"
 
 FORM_TRAIN = "train"
 FORM_COMMIT = "commit"
@@ -55,15 +62,22 @@ STREAM_FORMS = (FORM_MEMORY, FORM_NOISY)
 STREAMING_MEMORY = (DENSE, SPARSE)
 
 
-def parse_memory(block) -> dict:
-    """``{gdn, softmax, sparse_frames}`` of ``model.extra.chunk_causal_policy.hierarchical_memory`` (Sana
-    ``parse_memory``): exactly the three keys, each block kind reading ``dense`` or ``sparse``, a positive multiple of
-    8 sparse images (the causal VAE folds 8 frames into one latent)."""
+def parse_memory(block, chunk_observation=None) -> dict:
+    """``{gdn, softmax, sparse_frames, chunk_observation}`` of ``model.extra.chunk_causal_policy`` (Sana
+    ``parse_memory``): the ``hierarchical_memory`` block declares exactly the three keys, each block kind reading
+    ``dense`` or ``sparse``, a positive multiple of 8 sparse images (the causal VAE folds 8 frames into one latent);
+    ``chunk_observation`` (the key next to the block) is true (None reads as true: the noisy chunk opens with the
+    observation latent) or false (the noisy chunk is the target alone), any other value refused (a string "false" would
+    read as true)."""
 
     items = dict(block) if isinstance(block, Mapping) else dict(vars(block))
     if set(items) != set(MEMORY_FIELDS):
+        hint = (
+            f" ({CHUNK_OBSERVATION} sits in chunk_causal_policy next to the block)" if CHUNK_OBSERVATION in items else ""
+        )
         raise ValueError(
-            f"model.extra.chunk_causal_policy.{MEMORY_KEY} must declare exactly {list(MEMORY_FIELDS)}, got {sorted(items)}"
+            f"model.extra.chunk_causal_policy.{MEMORY_KEY} must declare exactly {list(MEMORY_FIELDS)}, got "
+            f"{sorted(items)}{hint}"
         )
     choices = {kind: str(items[kind]) for kind in BLOCK_KINDS}
     wrong = {kind: choice for kind, choice in choices.items() if choice not in MEMORY_KINDS}
@@ -75,13 +89,35 @@ def parse_memory(block) -> dict:
             f"{MEMORY_KEY}.sparse_frames must be a positive multiple of {FRAMES_PER_LATENT} (the causal VAE folds "
             f"{FRAMES_PER_LATENT} sampled frames into one latent), got {m!r}"
         )
-    return {**choices, "sparse_frames": int(m)}
+    observation = True if chunk_observation is None else chunk_observation
+    if not isinstance(observation, bool):
+        raise ValueError(f"model.extra.chunk_causal_policy.{CHUNK_OBSERVATION}={chunk_observation!r}: must be true or false")
+    return {**choices, "sparse_frames": int(m), CHUNK_OBSERVATION: observation}
 
 
 def memory_streams(memory: Mapping) -> tuple:
     """The memory kinds the two block kinds read, dense first."""
 
     return tuple(kind for kind in MEMORY_KINDS if kind in (memory[GDN], memory[SOFTMAX]))
+
+
+def observes(memory: Mapping) -> bool:
+    """Whether the noisy chunk opens with the observation latent (a memory parsed before Sana 6564adc38 has no
+    ``chunk_observation``: it does)."""
+
+    return bool(memory.get(CHUNK_OBSERVATION, True))
+
+
+def noisy_frames(chunk_observation: bool = True) -> int:
+    """Latent frames of the noisy chunk: [obs | target], or the target alone."""
+
+    return 2 if chunk_observation else 1
+
+
+def noisy_tokens(chunk_observation: bool = True) -> int:
+    """Tokens of the noisy chunk with its robot rows: 353, or 193 without the observation."""
+
+    return LATENT_TOKENS * noisy_frames(chunk_observation) + ROBOT_ROWS
 
 
 def sparse_latents(m: int) -> int:
@@ -146,8 +182,10 @@ def stream_rows(t: int, r0: int, m: int, streams) -> dict:
     return rows
 
 
-def frame_layout(k: int, m: int, streams) -> dict:
-    """The latent-frame layout [L_0..L_K (dense) | A_0.. (sparse) | obs | target] + rows of a training sample."""
+def frame_layout(k: int, m: int, streams, chunk_observation: bool = True) -> dict:
+    """The latent-frame layout [L_0..L_K (dense) | A_0.. (sparse) | obs | target] + rows of a training sample (Sana
+    ``frame_indices``); without ``chunk_observation`` there is no obs frame (``"obs"`` is None) and the target follows the
+    memory."""
 
     k = int(k)
     if k < 0:
@@ -155,19 +193,21 @@ def frame_layout(k: int, m: int, streams) -> dict:
     dense = list(range(k + 1)) if DENSE in streams else []
     first = len(dense)
     sparse = list(range(first, first + sparse_latents(m))) if SPARSE in streams else []
-    obs = len(dense) + len(sparse)
+    noisy = len(dense) + len(sparse)
+    target = noisy + 1 if chunk_observation else noisy
     return {
         DENSE: dense,
         SPARSE: sparse,
-        "obs": obs,
-        "target": obs + 1,
-        "frames": obs + 2,
-        "tokens": LATENT_TOKENS * (obs + 2) + ROBOT_ROWS,
+        "obs": noisy if chunk_observation else None,
+        "target": target,
+        "frames": target + 1,
+        "tokens": LATENT_TOKENS * (target + 1) + ROBOT_ROWS,
     }
 
 
-def frame_offsets(t: int, r0: int, m: int, streams) -> list[float]:
-    """The row offset from t of every latent frame in ``frame_layout`` order (the training clock)."""
+def frame_offsets(t: int, r0: int, m: int, streams, chunk_observation: bool = True) -> list[float]:
+    """The row offset from t of every latent frame in ``frame_layout`` order (the training clock): obs at 0 under
+    ``chunk_observation``, the target at +32."""
 
     k = memory_k(t, r0)
     offsets = []
@@ -179,7 +219,7 @@ def frame_offsets(t: int, r0: int, m: int, streams) -> list[float]:
             sum(sampled[u : u + FRAMES_PER_LATENT]) / FRAMES_PER_LATENT - t
             for u in range(0, len(sampled), FRAMES_PER_LATENT)
         ]
-    return offsets + [0.0, float(CHUNK_ROWS)]
+    return offsets + ([0.0] if chunk_observation else []) + [float(CHUNK_ROWS)]
 
 
 def offsets_x8(offsets) -> list[int]:
@@ -192,9 +232,11 @@ def offsets_x8(offsets) -> list[int]:
 
 
 def block_frames(layout: Mapping, choice: str) -> list[int]:
-    """The frames a block reading memory ``choice`` computes on: that memory's latents, then obs and target."""
+    """The frames a block reading memory ``choice`` computes on: that memory's latents, then the noisy chunk's frames
+    (obs when the layout has one, target)."""
 
-    return list(layout[choice]) + [layout["obs"], layout["target"]]
+    noisy = [layout["target"]] if layout["obs"] is None else [layout["obs"], layout["target"]]
+    return list(layout[choice]) + noisy
 
 
 def block_tokens(layout: Mapping, choice: str) -> torch.Tensor:
@@ -207,15 +249,17 @@ def block_tokens(layout: Mapping, choice: str) -> torch.Tensor:
 
 
 def block_bounds(layout: Mapping, choice: str) -> list[int]:
-    """The chunk bounds inside a block's subset: one 160-token chunk per memory latent, then the 353-token noisy chunk."""
+    """The chunk bounds inside a block's subset: one 160-token chunk per memory latent, then the noisy chunk (353
+    tokens, 193 without obs)."""
 
     memory = len(layout[choice])
     bounds = [LATENT_TOKENS * i for i in range(memory + 1)]
-    return bounds + [bounds[-1] + 2 * LATENT_TOKENS + ROBOT_ROWS]
+    return bounds + [bounds[-1] + noisy_tokens(layout["obs"] is not None)]
 
 
 def memory_layout(form: str, k: int, memory: Mapping) -> dict:
-    """The token layout of a forward of ``form`` (Sana ``memory_layout``).
+    """The token layout of a forward of ``form`` (Sana ``memory_layout``; ``train_layout`` / ``commit_layout`` /
+    ``generate_layout`` from 6564adc38, which drop obs without ``chunk_observation``).
 
     ``train``: [L_0..L_K | A_0.. | obs | target] + rows, each block kind on its memory + the noisy chunk.
     ``generate`` / ``commit`` exist for {gdn: dense, softmax: sparse} alone: generate is [A_0.. | obs | target] + rows
@@ -226,9 +270,9 @@ def memory_layout(form: str, k: int, memory: Mapping) -> dict:
         ``{"frames": F, "rows": R, "subsets": {block kind: (token index LongTensor, chunk bounds) or None}}``.
     """
 
-    m, streams = memory["sparse_frames"], memory_streams(memory)
+    m, streams, observed = memory["sparse_frames"], memory_streams(memory), observes(memory)
     if form == FORM_TRAIN:
-        layout = frame_layout(k, m, streams)
+        layout = frame_layout(k, m, streams, observed)
         subsets = {kind: (block_tokens(layout, memory[kind]), block_bounds(layout, memory[kind])) for kind in BLOCK_KINDS}
         return {"frames": layout["frames"], "rows": ROBOT_ROWS, "subsets": subsets}
     if form not in FORMS:
@@ -238,7 +282,7 @@ def memory_layout(form: str, k: int, memory: Mapping) -> dict:
             f"the streaming {form} form exists for {{gdn: dense, softmax: sparse}} alone; got gdn={memory[GDN]}, "
             f"softmax={memory[SOFTMAX]}"
         )
-    anchor = frame_layout(0, m, streams)
+    anchor = frame_layout(0, m, streams, observed)
     dense_index, dense_bounds = block_tokens(anchor, DENSE), block_bounds(anchor, DENSE)
     if form == FORM_COMMIT:
         return {"frames": 1, "rows": 0, "subsets": {GDN: (dense_index[:LATENT_TOKENS], dense_bounds[:2]), SOFTMAX: None}}
@@ -262,8 +306,9 @@ def stream_layout(form: str, memory: Mapping, *, kind: str | None = None, latent
     ``memory``: ``latents`` clean latents of memory ``kind`` (``dense`` / ``sparse``) without robot rows, one 160-token
     chunk each, through the block kinds that read ``kind`` (a GDN block continues that memory's scan, a softmax block
     its prefix-causal window); the other block kind is skipped.
-    ``noisy``: the noisy chunk [obs | target] + rows alone, one 353-token chunk, in every block: a GDN block reads its
-    memory's committed state, a softmax block attends to its memory's committed K / V and then to itself.
+    ``noisy``: the noisy chunk [obs | target] + rows alone (the target + rows without ``chunk_observation``), one
+    353-token (193-token) chunk, in every block: a GDN block reads its memory's committed state, a softmax block attends
+    to its memory's committed K / V and then to itself.
     """
 
     if form == FORM_MEMORY:
@@ -279,9 +324,11 @@ def stream_layout(form: str, memory: Mapping, *, kind: str | None = None, latent
         subsets = {block: ((index, bounds) if memory[block] == kind else None) for block in BLOCK_KINDS}
         return {"frames": int(latents), "rows": 0, "subsets": subsets}
     if form == FORM_NOISY:
-        tokens = 2 * LATENT_TOKENS + ROBOT_ROWS
+        observed = observes(memory)
+        tokens = noisy_tokens(observed)
         index = torch.arange(tokens)
-        return {"frames": 2, "rows": ROBOT_ROWS, "subsets": {block: (index, [0, tokens]) for block in BLOCK_KINDS}}
+        subsets = {block: (index, [0, tokens]) for block in BLOCK_KINDS}
+        return {"frames": noisy_frames(observed), "rows": ROBOT_ROWS, "subsets": subsets}
     raise ValueError(f"commit-once form={form!r} is not one of {STREAM_FORMS}")
 
 
@@ -310,18 +357,18 @@ def commit_rows(j: int) -> float:
     return float(CHUNK_ROWS * int(j))
 
 
-def generate_rows(c: int, m: int) -> list[float]:
+def generate_rows(c: int, m: int, chunk_observation: bool = True) -> list[float]:
     """Episode-clock rows of decision c's generate window [A_0, A_1.. | obs | target] (the sparse layout of
-    ``frame_offsets`` shifted by t - r0 = 32c)."""
+    ``frame_offsets`` shifted by t - r0 = 32c; no obs without ``chunk_observation``)."""
 
     t = decision_row(c)
-    return [value + float(t) for value in frame_offsets(t, 0, m, (SPARSE,))]
+    return [value + float(t) for value in frame_offsets(t, 0, m, (SPARSE,), chunk_observation)]
 
 
-def train_rows(c: int, m: int, streams) -> list[float]:
+def train_rows(c: int, m: int, streams, chunk_observation: bool = True) -> list[float]:
     """Training-clock rows (offsets from t) of decision c's full sequence: exactly ``frame_offsets`` at t = r0 + 32c."""
 
-    return frame_offsets(decision_row(c), 0, m, streams)
+    return frame_offsets(decision_row(c), 0, m, streams, chunk_observation)
 
 
 def sparse_ticks(c: int, m: int) -> list[int]:
@@ -353,11 +400,12 @@ def sparse_memory_rows(c: int, m: int, episode: bool) -> list[float]:
     return [value + float(t) for value in rows] if episode else rows
 
 
-def noisy_rows(c: int, episode: bool) -> list[float]:
-    """Rows of decision c's [obs, target]: 32c, 32c + 32 on the episode clock, 0, 32 on the training clock."""
+def noisy_rows(c: int, episode: bool, chunk_observation: bool = True) -> list[float]:
+    """Rows of decision c's [obs, target]: 32c, 32c + 32 on the episode clock, 0, 32 on the training clock (the target's
+    alone without ``chunk_observation``)."""
 
     t = float(decision_row(c)) if episode else 0.0
-    return [t, t + CHUNK_ROWS]
+    return ([t] if chunk_observation else []) + [t + CHUNK_ROWS]
 
 
 def noisy_step_offset(c: int, episode: bool) -> int:
@@ -374,6 +422,7 @@ def offsets_tensor(rows: Sequence[float]) -> torch.Tensor:
 
 __all__ = [
     "BLOCK_KINDS",
+    "CHUNK_OBSERVATION",
     "CHUNK_ROWS",
     "DENSE",
     "FORMS",
@@ -411,8 +460,11 @@ __all__ = [
     "memory_k",
     "memory_layout",
     "memory_streams",
+    "noisy_frames",
     "noisy_rows",
     "noisy_step_offset",
+    "noisy_tokens",
+    "observes",
     "offsets_x8",
     "parse_memory",
     "sparse_latents",

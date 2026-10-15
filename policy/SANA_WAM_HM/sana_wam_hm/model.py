@@ -7,13 +7,14 @@ One call evaluates one forward of Sana's three forms (``memory.memory_layout``) 
 forms (``memory.stream_layout``: ``memory`` commits one memory's latents through the blocks that read it, ``noisy`` runs
 the noisy chunk alone against every block's committed memory -- the deploy's default). Sana's forms:
 
-* ``train``: [dense latents | sparse latents | obs | target] + 33 robot rows, each block kind computing on (the memory it
-  reads + the noisy chunk) and every other token passing it unchanged; the deploy's ``full`` form (and the parity
-  reference of the streaming one);
+* ``train``: [dense latents | sparse latents | obs | target] + 33 robot rows (no obs under ``chunk_observation: false``),
+  each block kind computing on (the memory it reads + the noisy chunk) and every other token passing it unchanged; the
+  deploy's ``full`` form (and the parity reference of the streaming one);
 * ``commit`` ({gdn: dense, softmax: sparse}): one dense latent without robot rows through the GDN blocks alone, which
   read the carried state and keep the new one;
-* ``generate`` ({gdn: dense, softmax: sparse}): [A_0.. | obs | target] + rows; the GDN blocks run the noisy chunk alone
-  against the carried state (nothing kept), the softmax blocks the whole window prefix-causally.
+* ``generate`` ({gdn: dense, softmax: sparse}): [A_0.. | obs | target] + rows (no obs without ``chunk_observation``);
+  the GDN blocks run the noisy chunk alone against the carried state (nothing kept), the softmax blocks the whole window
+  prefix-causally.
 
 Routing (Sana ``_layer_step``): the AttnRes depth attention runs per token over the whole sequence; a block computes on
 its subset's tokens (``index_select``) with the subset's modulation, RoPE rows, chunk bounds and one text span, and its
@@ -290,8 +291,9 @@ class HMPolicyModel(PolicyModel):
 
         Args:
             latent: ``[B, C, F, H, W]`` canvas latent frames in the form's layout.
-            video_timesteps: ``[B, F]`` raw per-frame timesteps: 0 on every memory latent and the observation, the step's
-                t on the target (the last frame of a train / generate forward); all 0 for a commit.
+            video_timesteps: ``[B, F]`` raw per-frame timesteps: 0 on every memory latent and the observation (when the
+                noisy chunk has one), the step's t on the target (the last frame of a train / generate / noisy forward);
+                all 0 for a commit.
             y / mask: ``[B, 1, 1, L, C_text]`` caption embeddings and ``[B, 1, L]`` key mask (G = 1).
             form: ``train`` | ``commit`` | ``generate`` (Sana) | ``memory`` | ``noisy`` (the adapter's commit-once forms).
             k: K of a train forward with a dense memory (the dense latents are L_0..L_K); ignored otherwise.

@@ -13,10 +13,11 @@ The policy runs in-process through the vendored, Sana-free ``sana_wam_hm`` packa
 * the sparse memory (read by blocks configured ``sparse``): every decision encodes [tick 0, s_0..s_{m-1}] (m ticks
   sampled uniformly over [1, t], ``memory.sparse_rows``) as one causal sequence -> [A_0, A_1..];
 * every ``get_action``: (decision c >= 1) the executed chunk's dense latent is absorbed and the previous prediction is
-  scored against the chunk it executed; the row-t canvas is encoded alone as the observation; the chunk
-  [obs | target] + [state | 32 actions] is denoised against the memory (``deploy_form`` streaming: the GDN state of
-  the committed dense latents + the sparse memory riding every step; full: the training forward of the decision's
-  sample) and returned;
+  scored against the chunk it executed; the row-t canvas is encoded alone as the observation (not under
+  ``chunk_observation: false``, whose noisy chunk is the target alone: the row-t canvas then enters through the memory
+  only, as the sparse stream's last sampled row or the end of L_c); the chunk [obs | target] + [state | 32 actions] is
+  denoised against the memory (``deploy_form`` streaming: every memory latent committed once, the noisy chunk alone per
+  step; full: the training forward of the decision's sample) and returned;
 * ``reset`` (RoboDojo sends it twice per episode) drops the memory and the canvases; the episode counter advances on the
   first ``update_obs`` of the next episode.
 
@@ -456,7 +457,9 @@ class Model(ModelTemplate):
             warnings.warn(f"decision {c} is past the trained K <= {TRAINED_MAX_K}", stacklevel=2)
             self._k_warned = True
 
-        observation_latent, timings["obs_encode_s"] = timed(self.runtime.encode_observation, self._canvases[t])
+        observation_latent = None
+        if self.contract.chunk_observation:
+            observation_latent, timings["obs_encode_s"] = timed(self.runtime.encode_observation, self._canvases[t])
         sparse_latents, sparse_stream, ticks = None, None, None
         if session.reads_sparse:
             ticks = hm.sparse_ticks(c, self.contract.sparse_frames)

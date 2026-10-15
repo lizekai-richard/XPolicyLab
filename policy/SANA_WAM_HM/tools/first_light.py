@@ -2,8 +2,8 @@
 (bf16, the deploy's autocast), driven by the session for a few decisions in every deploy form the recipe allows, plus
 (with ``--vae-path``) the causal-VAE streams on synthetic 320 x 512 canvases.
 
-Checks: the forwards run on the real geometry (32 blocks, 160-token latent frames, 833-token generate windows, K + 1
-dense chunks) under bf16 autocast; per-decision latencies (commit, generate) and peak memory; finite outputs; the
+Checks: the forwards run on the real geometry (32 blocks, 160-token latent frames, 833-token generate windows -- 673
+without ``chunk_observation`` --, K + 1 dense chunks) under bf16 autocast; per-decision latencies (commit, generate) and peak memory; finite outputs; the
 streaming vs full forms on the same decision (equal up to bf16 round-off); the dense / sparse streams equal the one-shot
 encode on this GPU and dtype (Sana plan section 1: "maxdiff 0 on one device / dtype / kernel path").
 
@@ -97,7 +97,8 @@ def run_model(args, report: dict) -> None:
                 _, commit_s = synced(session.add_dense, dense[c])
             gen = torch.Generator(device=device).manual_seed(100 + c)
             (action, video), generate_s = synced(
-                session.generate, obs[c], sparse[c] if session.reads_sparse else None, anchor_state=state,
+                session.generate, obs[c] if contract.chunk_observation else None,
+                sparse[c] if session.reads_sparse else None, anchor_state=state,
                 anchor_state_mask=mask[0, 0], action_mask=mask, generator=gen,
             )
             finite = bool(torch.isfinite(action).all() and torch.isfinite(video).all())

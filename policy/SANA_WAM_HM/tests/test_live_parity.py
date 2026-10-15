@@ -2,7 +2,9 @@
 
 The live class and the mirror get identical random weights (tiny dims, fp64, CPU, xformers off, ``flash_attn`` bound to an
 fp64 reference varlen as Sana's own tests do; softmax attention in fp64 on both sides). Checked, for the two recipe
-memories ({gdn: dense, softmax: sparse} and {gdn: sparse, softmax: sparse}) and the two other legal ones:
+memories ({gdn: dense, softmax: sparse} and {gdn: sparse, softmax: sparse}) and the two other legal ones, with the noisy
+chunk [obs | target] and (``noobs``, ``chunk_causal_policy.chunk_observation: false``, against a checkout at or after
+Sana 6564adc38) the target alone:
 
 * the training forward (``model(x, t, y, data_info)``) == ``forward_hm(form='train')``, K = 0..3, every token;
 * Sana's deploy forms (``forward_chunk`` commit / generate) == ``forward_hm(form='commit' / 'generate')`` on the episode
@@ -64,13 +66,19 @@ class _Cfg(SimpleNamespace):
         return None
 
 
+OBSERVATIONS = [True, False]
+OBSERVATION_IDS = ["obs", "noobs"]
+
+
 class Twins:
     """A tiny live hierarchical-memory policy and the mirror with the same weights (fp64)."""
 
-    def __init__(self, memory, *, separate=True, depth=4, seed=7, softmax_layer_indices=None):
+    def __init__(self, memory, *, chunk_observation=True, separate=True, depth=4, seed=7, softmax_layer_indices=None):
         net = _live.live_causal()
+        _live.require_chunk_observation(chunk_observation)
         Live = net.SanaRWMVideoQwenNextSubAttnResV2SelfFlowWorldModelCameraConditionMultiViewCausal
-        self.memory = dict(memory)
+        self.observed = bool(chunk_observation)
+        self.memory = hm.parse_memory(memory, chunk_observation)
         self.streams = hm.memory_streams(self.memory)
         self.separate = separate
         torch.manual_seed(seed)
@@ -82,7 +90,9 @@ class Twins:
         if softmax_layer_indices is not None:
             kwargs["softmax_layer_indices"] = list(softmax_layer_indices)
         policy = {"actions_per_chunk": {str(int(FPS)): hm.CHUNK_ROWS}, "memory_content": "video_only",
-                  hm.MEMORY_KEY: dict(self.memory)}
+                  hm.MEMORY_KEY: dict(memory)}
+        if not self.observed:
+            policy[hm.CHUNK_OBSERVATION] = False
         config = _Cfg(
             model=_Cfg(extra={"chunk_causal_policy": policy, "rope": "aligned"}),
             scheduler=_Cfg(action_flow_shift=1.0 if separate else None),
@@ -90,7 +100,10 @@ class Twins:
             vae=_Cfg(vae_stride=[8, 32, 32]),
         )
         self.live = Live(config=config, **kwargs)
-        assert self.live.hierarchical_memory == self.memory
+        parsed = dict(self.memory)
+        if not _live.has_chunk_observation():
+            parsed.pop(hm.CHUNK_OBSERVATION)     # e8dde6b56 parses the block alone
+        assert self.live.hierarchical_memory == parsed
         with torch.no_grad():
             for parameter in self.live.parameters():
                 parameter.uniform_(-0.05, 0.05)
@@ -99,7 +112,7 @@ class Twins:
             actions_per_chunk=hm.CHUNK_ROWS, video_frame_stride=4, gdn_memory=self.memory["gdn"],
             softmax_memory=self.memory["softmax"], sparse_frames=M, model_fps=FPS, tier_num_frames=33,
             multiview="sana_pixel", visual_layout="sana_pixel_canvas", rope="aligned", dt_bias_init=-5.0,
-            a_log_init=0.0, reset_legacy_beta=False,
+            a_log_init=0.0, reset_legacy_beta=False, chunk_observation=self.observed,
         )
         self.mirror = HMPolicyModel(PolicyConfig.from_sana_kwargs(config=config, **kwargs), contract)
         state = {k: v for k, v in self.live.state_dict().items()
@@ -139,7 +152,7 @@ class Twins:
             "view_count": torch.tensor([1]),
             "view_latent_shape": torch.tensor([[list(GRID)]]),
             "video_frame_stride": torch.tensor([4]),
-            hm.MEMORY_KEY: {"k": k, "sparse_frames": M, "frame_offsets_x8": hm.offsets_tensor(rows)},
+            hm.MEMORY_KEY: {"k": k, "sparse_frames": M, _live.offsets_key(): hm.offsets_tensor(rows)},
         }
         if robot:
             info.update(
@@ -161,14 +174,26 @@ class Twins:
         }
 
     def training_x(self, c, target=None):
-        """Decision c's training sequence [L_0..L_c | A_0.. | obs | target] (t = r0 + 32c, r0 = 0)."""
+        """Decision c's training sequence [L_0..L_c | A_0.. | obs | target] (t = r0 + 32c, r0 = 0; no obs under noobs)."""
 
         parts = []
         if hm.DENSE in self.streams:
             parts += self.dense[: c + 1]
         if hm.SPARSE in self.streams:
             parts.append(self.sparse[c])
-        return torch.cat(parts + [self.obs[c], self.target if target is None else target], dim=2)
+        return torch.cat(parts + self.noisy(c, target), dim=2)
+
+    def noisy(self, c, target=None):
+        """Decision c's noisy chunk frames: [obs, target], or [target] under noobs."""
+
+        return ([self.obs[c]] if self.observed else []) + [self.target if target is None else target]
+
+    @property
+    def noisy_frames(self):
+        return hm.noisy_frames(self.observed)
+
+    def train_rows(self, c):
+        return hm.train_rows(c, M, self.streams, self.observed)
 
     def timesteps(self, frames, t=None):
         out = torch.zeros(1, frames, dtype=torch.float64)
@@ -177,7 +202,7 @@ class Twins:
 
     def live_train(self, c, target=None, t_video=None, t_action=None):
         x = self.training_x(c, target)
-        rows = hm.train_rows(c, M, self.streams)
+        rows = self.train_rows(c)
         with torch.no_grad():
             return self.live(
                 x, self.timesteps(x.shape[2], t_video), self.y, mask=self.mask,
@@ -188,7 +213,7 @@ class Twins:
         x = self.training_x(c, target)
         return self.mirror.forward_hm(
             x, self.timesteps(x.shape[2]), self.y, self.mask, form=hm.FORM_TRAIN, k=c,
-            frame_offsets_x8=hm.offsets_tensor(hm.train_rows(c, M, self.streams)), model_fps=FPS, robot=self.robot(),
+            frame_offsets_x8=hm.offsets_tensor(self.train_rows(c)), model_fps=FPS, robot=self.robot(),
         )
 
     # -- the episode clock (deploy forms) -------------------------------------------------------------------------------
@@ -205,11 +230,11 @@ class Twins:
                 save_kv_cache=True, chunk_offset=j, cached_past_tokens=hm.LATENT_TOKENS * j,
                 data_info=self.info([hm.commit_rows(j)], k=j, robot=False),
             ))
-        window = torch.cat([self.sparse[c], self.obs[c], self.target], dim=2)
+        window = torch.cat([self.sparse[c]] + self.noisy(c), dim=2)
         generate = self.live.forward_chunk(
-            window.flatten(3).unsqueeze(3), self.timesteps(5)[:, None], self.y, mask=self.mask, kv_caches=caches,
-            save_kv_cache=False, chunk_offset=c, cached_past_tokens=hm.LATENT_TOKENS * (c + 1),
-            data_info=self.info(hm.generate_rows(c, M), k=c),
+            window.flatten(3).unsqueeze(3), self.timesteps(window.shape[2])[:, None], self.y, mask=self.mask,
+            kv_caches=caches, save_kv_cache=False, chunk_offset=c, cached_past_tokens=hm.LATENT_TOKENS * (c + 1),
+            data_info=self.info(hm.generate_rows(c, M, self.observed), k=c),
         )
         return commits, generate, caches
 
@@ -225,10 +250,10 @@ class Twins:
             assert out == {}
             states = {i: caches[i].out for i in gdn}
         caches = [GDNCache(seed=states.get(i)) if i in gdn else None for i in range(len(self.mirror.blocks))]
-        window = torch.cat([self.sparse[c], self.obs[c], self.target], dim=2)
+        window = torch.cat([self.sparse[c]] + self.noisy(c), dim=2)
         generate = self.mirror.forward_hm(
-            window, self.timesteps(5), self.y, self.mask, form=hm.FORM_GENERATE, k=c,
-            frame_offsets_x8=hm.offsets_tensor(hm.generate_rows(c, M)), model_fps=FPS,
+            window, self.timesteps(window.shape[2]), self.y, self.mask, form=hm.FORM_GENERATE, k=c,
+            frame_offsets_x8=hm.offsets_tensor(hm.generate_rows(c, M, self.observed)), model_fps=FPS,
             step_offset=hm.CHUNK_ROWS * c, robot=self.robot(), caches=caches,
         )
         return generate, states
@@ -242,7 +267,7 @@ def commit_once(twins, c, clock="deploy"):
 
     mirror, memory = twins.mirror, twins.memory
     episode = hm.episode_clock(twins.streams)
-    training = hm.train_rows(c, M, twins.streams)
+    training = twins.train_rows(c)
     dense_count = c + 1 if hm.DENSE in twins.streams else 0
     kinds = [hm.GDN if block.attn_type == GDN_KIND else hm.SOFTMAX for block in mirror.blocks]
     held = {kind: {"gdn": {}, "kv": {}} for kind in twins.streams}
@@ -281,8 +306,8 @@ def commit_once(twins, c, clock="deploy"):
         for i, block in enumerate(kinds)
     ]
     return mirror.forward_hm(
-        torch.cat([twins.obs[c], twins.target], dim=2), twins.timesteps(2), twins.y, twins.mask, form=hm.FORM_NOISY,
-        k=0, frame_offsets_x8=hm.offsets_tensor(hm.noisy_rows(c, episode)), model_fps=FPS,
+        torch.cat(twins.noisy(c), dim=2), twins.timesteps(twins.noisy_frames), twins.y, twins.mask, form=hm.FORM_NOISY,
+        k=0, frame_offsets_x8=hm.offsets_tensor(hm.noisy_rows(c, episode, twins.observed)), model_fps=FPS,
         step_offset=hm.noisy_step_offset(c, episode), robot=twins.robot(), caches=caches,
     )
 
@@ -294,10 +319,11 @@ def _frames(out, lo, hi):
 # -- the training form ----------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("observed", OBSERVATIONS, ids=OBSERVATION_IDS)
 @pytest.mark.parametrize("memory", [SPLIT, SPARSE, DENSE_DENSE, SPARSE_DENSE], ids=["dense_sparse", "sparse_sparse", "dense_dense", "sparse_dense"])
 @pytest.mark.parametrize("c", [0, 1, 3])
-def test_the_training_forward_is_the_live_one(memory, c):
-    twins = Twins(memory)
+def test_the_training_forward_is_the_live_one(memory, c, observed):
+    twins = Twins(memory, chunk_observation=observed)
     live = twins.live_train(c)
     ours = twins.mirror_train(c)
     torch.testing.assert_close(ours["x"], live["x"].reshape(ours["x"].shape), **CLOSE)
@@ -314,9 +340,10 @@ def test_a_shared_schedule_runs_too():
 # -- the streaming forms ----------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("observed", OBSERVATIONS, ids=OBSERVATION_IDS)
 @pytest.mark.parametrize("c", [0, 1, 3])
-def test_commit_and_generate_are_the_live_forward_chunk_on_the_episode_clock(c):
-    twins = Twins(SPLIT)
+def test_commit_and_generate_are_the_live_forward_chunk_on_the_episode_clock(c, observed):
+    twins = Twins(SPLIT, chunk_observation=observed)
     _commits, live, live_caches = twins.live_deploy(c)
     ours, states = twins.mirror_deploy(c)
     torch.testing.assert_close(ours["x"].flatten(3), live["x"].flatten(3), **CLOSE)
@@ -329,35 +356,37 @@ def test_commit_and_generate_are_the_live_forward_chunk_on_the_episode_clock(c):
             assert cache == {}
 
 
+@pytest.mark.parametrize("observed", OBSERVATIONS, ids=OBSERVATION_IDS)
 @pytest.mark.parametrize("c", [0, 1, 2, 4])
-def test_the_episode_clock_reproduces_the_training_forward_up_to_round_off(c):
+def test_the_episode_clock_reproduces_the_training_forward_up_to_round_off(c, observed):
     """Streaming decision c (commits L_0..L_c at 32j, generate at 32c) == the training forward of the same sample."""
 
-    twins = Twins(SPLIT)
+    twins = Twins(SPLIT, chunk_observation=observed)
     training = twins.live_train(c)
     ours, _ = twins.mirror_deploy(c)
-    layout = hm.frame_layout(c, M, twins.streams)
+    layout = hm.frame_layout(c, M, twins.streams, observed)
     torch.testing.assert_close(ours["x"], _frames(training, layout[hm.SPARSE][0], layout["frames"]).reshape(ours["x"].shape), **EPISODE_CLOCK)
     torch.testing.assert_close(ours["action_pred"], training["action_pred"], **EPISODE_CLOCK)
 
 
+@pytest.mark.parametrize("observed", OBSERVATIONS, ids=OBSERVATION_IDS)
 @pytest.mark.parametrize(
     "memory,tolerance",
     [(SPLIT, "episode"), (SPARSE, "exact"), (DENSE_DENSE, "episode"), (SPARSE_DENSE, "episode")],
     ids=["dense_sparse", "sparse_sparse", "dense_dense", "sparse_dense"],
 )
 @pytest.mark.parametrize("c", [0, 1, 3])
-def test_commit_once_is_the_training_forward(memory, tolerance, c):
+def test_commit_once_is_the_training_forward(memory, tolerance, c, observed):
     """Every memory latent committed once, then the noisy chunk alone == the training forward's noisy chunk (exactly on
     the training clock, up to the episode clock's round-off with a dense memory)."""
 
-    twins = Twins(memory)
+    twins = Twins(memory, chunk_observation=observed)
     training = twins.live_train(c)
     ours = commit_once(twins, c)
     close = CLOSE if tolerance == "exact" else EPISODE_CLOCK
-    frames = training["x"].shape[2]
-    torch.testing.assert_close(ours["x"][:, :, -1:], training["x"][:, :, frames - 1 :].reshape(ours["x"][:, :, -1:].shape), **close)
-    torch.testing.assert_close(ours["x"][:, :, :1], training["x"][:, :, frames - 2 : frames - 1].reshape(ours["x"][:, :, :1].shape), **close)
+    frames, noisy = training["x"].shape[2], twins.noisy_frames
+    assert ours["x"].shape[2] == noisy
+    torch.testing.assert_close(ours["x"], training["x"][:, :, frames - noisy :].reshape(ours["x"].shape), **close)
     torch.testing.assert_close(ours["action_pred"], training["action_pred"], **close)
 
 
@@ -385,11 +414,12 @@ def _record_block_inputs(mirror, run):
     return records, out
 
 
+@pytest.mark.parametrize("observed", OBSERVATIONS, ids=OBSERVATION_IDS)
 @pytest.mark.parametrize("layout", [GDN_LED, SOFTMAX_LED], ids=["gdn-led-groups", "softmax-led-groups"])
 @pytest.mark.parametrize(
     "memory", [SPLIT, SPARSE_DENSE, SPARSE, DENSE_DENSE], ids=["dense_sparse", "sparse_dense", "sparse_sparse", "dense_dense"]
 )
-def test_memory_tokens_see_zero_deltas_in_the_blocks_that_do_not_read_them(memory, layout):
+def test_memory_tokens_see_zero_deltas_in_the_blocks_that_do_not_read_them(memory, layout, observed):
     """Training's routing semantics, block by block: a memory token passes a block that does not read its memory with a
     ZERO delta (dense_sparse: the GDN blocks see A with zero deltas, the softmax blocks see L with zero deltas;
     sparse_dense the mirror image; sparse_sparse / dense_dense: every memory token is in every block). The commits must
@@ -397,7 +427,7 @@ def test_memory_tokens_see_zero_deltas_in_the_blocks_that_do_not_read_them(memor
     where a softmax block opens an AttnRes group, so a zero-delta L must open the group's partial."""
 
     c = 2
-    twins = Twins(memory, softmax_layer_indices=layout)
+    twins = Twins(memory, chunk_observation=observed, softmax_layer_indices=layout)
     mirror = twins.mirror
     train_inputs, _ = _record_block_inputs(mirror, lambda: twins.mirror_train(c))
     commit_inputs, ours = _record_block_inputs(mirror, lambda: commit_once(twins, c, clock="training"))
@@ -417,14 +447,15 @@ def test_memory_tokens_see_zero_deltas_in_the_blocks_that_do_not_read_them(memor
     torch.testing.assert_close(ours["x"][:, :, -1:], live["x"][:, :, -1:].reshape(ours["x"][:, :, -1:].shape), **CLOSE)
 
 
+@pytest.mark.parametrize("observed", OBSERVATIONS, ids=OBSERVATION_IDS)
 @pytest.mark.parametrize("c", [0, 2])
-def test_commit_once_is_sanas_generate_form_on_the_same_clock(c):
+def test_commit_once_is_sanas_generate_form_on_the_same_clock(c, observed):
     """The sparse memory committed once == Sana's generate window, where it rides the forward (same episode clock)."""
 
-    twins = Twins(SPLIT)
+    twins = Twins(SPLIT, chunk_observation=observed)
     generate, _ = twins.mirror_deploy(c)
     ours = commit_once(twins, c)
-    torch.testing.assert_close(ours["x"], generate["x"][:, :, -2:], **CLOSE)
+    torch.testing.assert_close(ours["x"], generate["x"][:, :, -twins.noisy_frames :], **CLOSE)
     torch.testing.assert_close(ours["action_pred"], generate["action_pred"], **CLOSE)
 
 
@@ -500,6 +531,7 @@ def _live_loop(twins, c, video_noise, action_noise, steps=3, video_cfg=6.0):
     return action, video
 
 
+@pytest.mark.parametrize("observed", OBSERVATIONS, ids=OBSERVATION_IDS)
 @pytest.mark.parametrize(
     "memory,form,tolerance",
     [
@@ -516,8 +548,8 @@ def _live_loop(twins, c, video_noise, action_noise, steps=3, video_cfg=6.0):
         "dense_dense-streaming", "dense_dense-full", "sparse_dense-streaming",
     ],
 )
-def test_the_session_is_the_live_training_loop(memory, form, tolerance):
-    twins = Twins(memory)
+def test_the_session_is_the_live_training_loop(memory, form, tolerance, observed):
+    twins = Twins(memory, chunk_observation=observed)
     session = _session(twins, form)
     mask = torch.ones(1, hm.CHUNK_ROWS, 80, dtype=torch.bool)
     g = torch.Generator().manual_seed(5)
@@ -527,7 +559,7 @@ def test_the_session_is_the_live_training_loop(memory, form, tolerance):
         video_noise = torch.randn(1, C_LAT, 1, *GRID, generator=g, dtype=torch.float64)
         action_noise = torch.randn(1, hm.CHUNK_ROWS, 80, generator=g, dtype=torch.float64)
         ours = session.generate(
-            twins.obs[c], twins.sparse[c] if session.reads_sparse else None, anchor_state=twins.state,
+            twins.obs[c] if observed else None, twins.sparse[c] if session.reads_sparse else None, anchor_state=twins.state,
             anchor_state_mask=torch.ones(80, dtype=torch.bool), action_mask=mask, video_noise=video_noise,
             action_noise=action_noise,
         )
@@ -551,3 +583,16 @@ def test_the_session_refuses_a_broken_cycle():
         session.add_dense(twins.dense[1])
     with pytest.raises(RuntimeError, match="no dense memory"):
         _session(Twins(SPARSE), DEPLOY_STREAMING).add_dense(twins.dense[0])
+
+
+def test_the_session_refuses_an_observation_the_checkpoint_does_not_take():
+    """chunk_observation false: the noisy chunk is the target alone, so a handed observation is a wiring error (and the
+    reverse)."""
+
+    mask = torch.ones(1, hm.CHUNK_ROWS, 80, dtype=torch.bool)
+    noobs = Twins(SPARSE, chunk_observation=False)
+    kwargs = dict(anchor_state=noobs.state, anchor_state_mask=torch.ones(80, dtype=torch.bool), action_mask=mask)
+    with pytest.raises(ValueError, match="target alone"):
+        _session(noobs, DEPLOY_STREAMING).generate(noobs.obs[0], noobs.sparse[0], **kwargs)
+    with pytest.raises(ValueError, match="opens its noisy chunk with the observation"):
+        _session(Twins(SPARSE), DEPLOY_STREAMING).generate(None, noobs.sparse[0], **kwargs)

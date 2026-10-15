@@ -2,7 +2,8 @@
 ``policy/<POLICY>/deploy.py`` (update_obs -> get_action, then update_obs after every executed action but the last,
 whose observation arrives right before the next get_action), one canvas per tick, the ticks the dense stream, the
 sparse memory and the world-model reference encode at every decision, the order dense absorb -> observation -> sparse
-memory -> generate, the double reset of every RoboDojo episode, and the refusals."""
+memory -> generate (no observation encode under ``chunk_observation: false``), the double reset of every RoboDojo
+episode, and the refusals."""
 
 from __future__ import annotations
 
@@ -68,7 +69,8 @@ class FakeSession:
         self.dense_count += 1
 
     def generate(self, observation_latent, sparse_latents, *, anchor_state, anchor_state_mask, action_mask, generator, gripper_bounds):
-        self.log.append(("generate", self.decision, float(observation_latent.flatten()[0])))
+        observation = None if observation_latent is None else float(observation_latent.flatten()[0])
+        self.log.append(("generate", self.decision, observation))
         if self.reads_dense:
             assert self.dense_count == self.decision + 1
         action = torch.zeros(1, C, 80)
@@ -84,10 +86,10 @@ class FakeSession:
 class FakeRuntime:
     """Canvases carry the tick of their frame (the frames are filled with tick % 256)."""
 
-    def __init__(self, log, streams):
+    def __init__(self, log, streams, chunk_observation=True):
         self.log, self.streams = log, streams
         self.device = torch.device("cpu")
-        self.contract = SimpleNamespace(actions_per_chunk=C, sparse_frames=M)
+        self.contract = SimpleNamespace(actions_per_chunk=C, sparse_frames=M, chunk_observation=chunk_observation)
 
     def new_session(self, instruction):
         self.log.append(("new_session", instruction))
@@ -124,7 +126,7 @@ def _obs(tick: int, instruction: str = "cover the blocks") -> dict:
     }
 
 
-def _model(streams):
+def _model(streams, chunk_observation=True):
     with open(os.path.join(_paths.FIXTURES, "recipe_hm_dense_sparse_videoonly_e8dde6b56.yaml")) as handle:
         view = bidirectional_view(yaml.safe_load(handle))
     normalization = load_checked_normalization(
@@ -132,7 +134,7 @@ def _model(streams):
     )
     log: list = []
     m = adapter.Model.__new__(adapter.Model)
-    m.runtime = FakeRuntime(log, streams)
+    m.runtime = FakeRuntime(log, streams, chunk_observation)
     m.contract = m.runtime.contract
     m.normalization = normalization
     m.gripper_bounds = normalized_gripper_bounds(normalization)
@@ -195,6 +197,22 @@ def test_the_sparse_sparse_cycle_scores_against_the_target_after_the_sparse_rows
                      ("encode_sparse", hm.sparse_ticks(c, M)), ("generate", c, float(C * c))]
     assert m.log == expected
     assert "world_model_rel_rmse(decision 1)=" in capsys.readouterr().out
+
+
+def test_a_noobs_cycle_encodes_no_observation(capsys):
+    """chunk_observation false: the row-t canvas reaches the model through the sparse memory alone (its last sampled
+    tick is t), so no observation is encoded and the session gets None."""
+
+    m = _model((hm.SPARSE,), chunk_observation=False)
+    _episode(m, 3)
+    expected = [("new_session", "cover the blocks"), ("encode_sparse", hm.sparse_ticks(0, M)), ("generate", 0, None)]
+    for c in range(1, 3):
+        assert hm.sparse_ticks(c, M)[-1] == C * c
+        expected += [("sparse.extend", hm.target_rows(C * (c - 1))), ("encode_sparse", hm.sparse_ticks(c, M)),
+                     ("generate", c, None)]
+    assert m.log == expected
+    out = capsys.readouterr().out
+    assert "obs_encode_s" not in out and "world_model_rel_rmse(decision 1)=" in out
 
 
 def test_a_second_episode_starts_over_after_the_double_reset():
