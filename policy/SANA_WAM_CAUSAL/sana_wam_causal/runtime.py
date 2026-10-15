@@ -44,7 +44,14 @@ from sana_wam_min.text import load_text_encoder  # noqa: E402
 from sana_wam_min.vae import load_vae  # noqa: E402
 
 from .checkpoint import load_causal_weights  # noqa: E402
-from .contract import CausalContract, bidirectional_view, resolve_causal_contract  # noqa: E402
+from .contract import (  # noqa: E402
+    CausalContract,
+    bidirectional_view,
+    check_run_record,
+    describe_run_records,
+    load_run_records,
+    resolve_causal_contract,
+)
 from .model import CausalPolicyModel, build_causal_policy  # noqa: E402
 from .session import Caption, CausalPolicySession  # noqa: E402
 from .vae_stream import ViewStreams, encode_window  # noqa: E402
@@ -79,12 +86,16 @@ class CausalRuntime:
         view_resize: Optional[str] = None,
         allow_donor_checkpoint: bool = False,
     ) -> "CausalRuntime":
-        """Load in the validated order: yaml -> contract (refusals before any weight) -> normalization -> bf16 causal
-        model + weights -> VAE -> Gemma -> the shared front-end."""
+        """Load in the validated order: yaml -> contract and the run record next to the yaml (refusals before any
+        weight) -> normalization -> bf16 causal model + weights -> VAE -> Gemma -> the shared front-end."""
 
         device = torch.device(device)
-        train_cfg = load_train_config(str(find_train_config(checkpoint_dir)))
+        config_path = find_train_config(checkpoint_dir)
+        train_cfg = load_train_config(str(config_path))
         contract = resolve_causal_contract(train_cfg)
+        records = load_run_records(config_path.parent)
+        for source, record in records:
+            check_run_record(record, contract, source=str(source))
         view = bidirectional_view(train_cfg)
         rope, legacy_origin, rope_label = resolve_rope_contract(view, None)
         policy_config = policy_config_from_train_config(view, rope=rope, legacy_origin=legacy_origin)
@@ -98,6 +109,7 @@ class CausalRuntime:
         load_report = load_causal_weights(
             model, str(checkpoint_dir), allow_missing_recurrence=allow_donor_checkpoint, device=device
         )
+        load_report["run_record"] = describe_run_records(records, config_path)
         vae = load_vae(vae_path, device=device, dtype=torch.bfloat16)
         tokenizer, text_encoder = load_text_encoder(text_encoder_path, device=device)
         frontend = PolicyInferenceSession(

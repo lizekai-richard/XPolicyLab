@@ -17,9 +17,12 @@ chunk c -- and a memory chunk holds its target latents (plus its anchor state an
 video_and_action``, the value of a config without the key). ``model.extra.chunk_causal_policy.chunk_observation`` is
 accepted absent or false (Sana ``refuse_chunk_observation``); a checkpoint trained with chunk observations (``true``)
 is refused: its protocol needs Sana 404c9bf0e or earlier, served by this adapter up to XPolicyLab ``d57a617``. Like
-Sana, the adapter cannot tell a config from before 2026-10-14 that trained chunk observations without declaring the
-key (absent meant true then). Front-ends: the three-view ``sana_latent`` strip and the one-view ``sana_pixel`` canvas,
-``rope: aligned``, no AttnRes time conditioning, unmasked canvas pad.
+Sana, the config alone cannot tell a run from before 2026-10-14 that trained chunk observations without declaring the
+key (absent meant true then; e.g. the episode VO run). The Hub upload of a causal checkpoint records the run's protocol
+next to its ``config.yaml`` (``RUN_ID.json``, copied into ``upload_manifest.json``): ``check_run_record`` refuses a
+record of chunk observations and a record that contradicts the config, before the weights are read. Front-ends: the
+three-view ``sana_latent`` strip and the one-view ``sana_pixel`` canvas, ``rope: aligned``, no AttnRes time
+conditioning, unmasked canvas pad.
 
 ``data.extra.aligned_phase_window`` (Sana ``04c8acbee``; ``padded`` when absent) decides how a deployed episode opens. The
 phase window whose chunk grid lands on the first frame is ``padded`` (h = C: its chunk 0 the first frame frozen over
@@ -37,7 +40,10 @@ outside the contract.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from .shared import SANA_WAM_POLICY_DIR  # noqa: F401  (sys.path bridge first)
@@ -75,6 +81,9 @@ PROTOCOL_EPISODE = "episode"
 ALIGNED_PHASE_PADDED = "padded"
 ALIGNED_PHASE_FIRST_FRAME = "first_frame"
 ALIGNED_PHASE_WINDOWS = (ALIGNED_PHASE_PADDED, ALIGNED_PHASE_FIRST_FRAME)
+# the run record a Hub upload of the causal line writes next to config.yaml (RUN_ID.json; upload_manifest.json carries
+# the same keys): the run's protocol switches, which a config from before Sana 4bd6eca83 need not declare
+RUN_RECORD_NAMES = ("RUN_ID.json", "upload_manifest.json")
 
 
 @dataclass(frozen=True)
@@ -178,6 +187,69 @@ def refuse_chunk_observation(value: Any) -> None:
             "4bd6eca83), every noisy chunk reads its observation from the memory. A checkpoint trained with chunk "
             "observations needs Sana 404c9bf0e or earlier; it is served by SANA_WAM_CAUSAL up to XPolicyLab d57a617"
         )
+
+
+def load_run_records(directory: str | Path) -> list[tuple[Path, Mapping[str, Any]]]:
+    """The run records (``RUN_RECORD_NAMES``) in ``directory``, the one holding the checkpoint's ``config.yaml``; an
+    unreadable record is refused rather than skipped."""
+
+    records = []
+    for name in RUN_RECORD_NAMES:
+        path = Path(directory) / name
+        if not path.is_file():
+            continue
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            raise ValueError(f"cannot read the run record {path}: {error}") from error
+        if not isinstance(record, Mapping):
+            raise ValueError(f"the run record {path} is not a JSON object")
+        records.append((path, record))
+    return records
+
+
+def check_run_record(record: Mapping[str, Any], contract: CausalContract, source: str = "the run record") -> None:
+    """Refuse a checkpoint whose run record contradicts the contract its config resolves to: a run that trained chunk
+    observations (``chunk_observation`` anything but false: its config may lack the key, which the single form reads
+    as false) and a recorded ``aligned_phase_window`` / ``memory_content`` other than the config's. Keys the record
+    does not carry are not checked."""
+
+    observation = record.get("chunk_observation")
+    if observation is not None and observation is not False:
+        raise ValueError(
+            f"{source} records chunk_observation={observation!r} (source_commit {record.get('source_commit')!r}): the "
+            "run trained chunk observations, which a config from before Sana 4bd6eca83 need not declare and this adapter "
+            "would serve as the single form without them; it is served by SANA_WAM_CAUSAL up to XPolicyLab d57a617"
+        )
+    for key, resolved in (
+        ("aligned_phase_window", contract.aligned_phase_window),
+        ("memory_content", contract.memory_content),
+    ):
+        recorded = record.get(key)
+        if recorded is not None and recorded != resolved:
+            raise ValueError(
+                f"{source} records {key}={recorded!r} but config.yaml resolves to {resolved!r}: the record and the "
+                "config describe different runs"
+            )
+
+
+def describe_run_records(records: list[tuple[Path, Mapping[str, Any]]], config_path: str | Path) -> str:
+    """One line for the ready report: the records read, the protocol they declare and whether the config is the one
+    they recorded (``config_sha256``)."""
+
+    if not records:
+        return "none"
+    config_sha = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+    names = "+".join(path.name for path, _ in records)
+    record = records[0][1]
+    shas = {str(r["config_sha256"]) for _, r in records if r.get("config_sha256")}
+    match = "unrecorded" if not shas else ("match" if shas == {config_sha} else "differs")
+    commit = str(record.get("source_commit") or "")[:9] or None
+    return (
+        f"{names}(chunk_observation={record.get('chunk_observation')} "
+        f"aligned_phase_window={record.get('aligned_phase_window')} memory_content={record.get('memory_content')} "
+        f"step={record.get('step')} source_commit={commit} config_sha256={match})"
+    )
 
 
 def is_causal_policy_config(cfg: Mapping[str, Any]) -> bool:
@@ -328,10 +400,14 @@ __all__ = [
     "MEMORY_VIDEO_AND_ACTION",
     "MEMORY_VIDEO_ONLY",
     "PROTOCOL_EPISODE",
+    "RUN_RECORD_NAMES",
     "SERVED_VISUAL_LAYOUTS",
     "bidirectional_view",
+    "check_run_record",
     "chunk_causal_options",
+    "describe_run_records",
     "is_causal_policy_config",
+    "load_run_records",
     "resolve_actions_per_chunk",
     "resolve_aligned_phase_window",
     "refuse_chunk_observation",

@@ -1,0 +1,15 @@
+{
+  "hf_repo": "logits/causal_robodojo_eefabs_sana_latent_256x320_p33k_aligned_f33fps8_episode_n24_nsc_videoonly",
+  "run_name": "causal_robodojo_eefabs_sana_latent_256x320_pantheon33k_aligned_f33fps8_episode_n24_nsc_videoonly",
+  "step": 1000,
+  "epoch": 2,
+  "chunk_observation": true,
+  "aligned_phase_window": "padded",
+  "memory_content": "video_only",
+  "source_commit": "215385e9cc87145c6ab8a855e034e914b959d9e9",
+  "config_sha256": "7dbccbc9a4c1a5a65bb248909c451ccc65d0aa8419d7d6c544112198f7a1c0ad",
+  "weights_sha256": "aac8d80766ef1a2b53f1f0a78319e0badc4fd370447c248de77195818b20a1da",
+  "normalization_sha256": "9f8b98ede445f554cafef99974a0ef67ce4d59292578ccbdeaba704c9cedd5ba",
+  "phase_store": "v2-f33-vs4-phase-stretch-ae44f4a5961380ab",
+  "training_array": "194929"
+}

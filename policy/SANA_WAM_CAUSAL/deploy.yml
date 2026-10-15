@@ -18,12 +18,15 @@ eval_batch: false
 request_timeout_s: 600.0
 
 # --- SANA_WAM_CAUSAL keys (see README "Configuration") ---
-# HF-style checkpoint dir of a CAUSAL run of the episode protocol (Sana d37817788 on, e.g. the pantheon33k sana_latent
-# episode runs): config.yaml (model.model ...MultiViewCausal_5B_P1_D36; model.extra.chunk_causal_policy.memory_content
-# video_and_action | video_only, absent = video_and_action; chunk_observation true | false, absent = true) +
-# model/pytorch_model_fsdp.bin [+ normalization/*.json]. A config with data.extra.window_repeats (the sink-less
-# pantheon14k m48n24 runs) or obs_in_first_chunk (vanilla52k) is a retired protocol and is refused.
-# null -> XPolicyLab resolution of ckpt_name.
+# HF-style checkpoint dir of a CAUSAL run of the episode protocol in its single form (Sana 4bd6eca83 on, e.g. the
+# pantheon33k sana_latent no-observation run, the pantheon14k sana_pixel N1 / N2 / N4 runs): config.yaml (model.model
+# ...MultiViewCausal_5B_P1_D36; model.extra.chunk_causal_policy.memory_content video_and_action | video_only, absent =
+# video_and_action; chunk_observation absent or false; data.extra.aligned_phase_window padded (absent) | first_frame) +
+# model/pytorch_model_fsdp.bin [+ normalization/*.json] [+ RUN_ID.json / upload_manifest.json, the Hub upload's run
+# record, checked against the config]. Refused before any weight: chunk_observation true, in the config or in the run
+# record (a run trained with chunk observations: serve it from XPolicyLab d57a617), a run record contradicting the
+# config, data.extra.window_repeats (the sink-less pantheon14k m48n24 runs), obs_in_first_chunk (vanilla52k), and the
+# sparse / hierarchical memory keys (SANA_WAM_SM). null -> XPolicyLab resolution of ckpt_name.
 checkpoint_dir: null
 # An SFT (bidirectional) checkpoint has no GDN recurrence parameters; true serves it as the causal policy's step-0 model
 # (recurrence initialized as the causal trainer does on its first load). Pipeline checks only, never an evaluation.

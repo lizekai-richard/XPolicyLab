@@ -4,6 +4,8 @@ no Sana)."""
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 import os
 from types import SimpleNamespace
@@ -21,6 +23,9 @@ from sana_wam_causal.contract import (
     MEMORY_VIDEO_ONLY,
     CausalContract,
     bidirectional_view,
+    check_run_record,
+    describe_run_records,
+    load_run_records,
     resolve_causal_contract,
 )
 from sana_wam_causal.layers import LayerCache
@@ -40,6 +45,12 @@ RECIPE_PIXEL_N2 = os.path.join(_paths.FIXTURES, "recipe_causal_pantheon14k_sana_
 RECIPE_OBSERVATION = os.path.join(_paths.FIXTURES, "recipe_causal_pantheon33k_sana_latent_episode_n24_nsc_videoonly_7de7711c2.yaml")
 # the released no-observation checkpoint, trained on the first-frame window (data.extra.aligned_phase_window first_frame)
 FIRST_FRAME_NOOBS = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoonly_noobs_first_frame_s3324.yaml")
+# the episode VO run at step 1000 (trained WITH chunk observations on the padded window; its config.yaml declares
+# neither key) and the run records of two Hub uploads (RUN_ID.json, trimmed to identity and protocol): that VO
+# checkpoint and the released no-observation one (FIRST_FRAME_NOOBS)
+OBSERVATION_S1000 = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoonly_s1000.yaml")
+RECORD_S1000 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_s1000.json")
+RECORD_NOOBS_S3324 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_noobs_s3324.json")
 SINKLESS_VA = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
 SINKLESS_VO = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoonly_s5000.yaml")
 RETIRED_CHUNK0 = os.path.join(_paths.FIXTURES, "config_causal_vanilla52k_m48n24_s7646.yaml")
@@ -104,6 +115,71 @@ def test_the_first_frame_checkpoint_emits_chunk_0():
     assert contract.memory_content == MEMORY_VIDEO_ONLY
     assert (contract.sliding_window_chunks, contract.multiview, contract.visual_layout) == (24, "sana_latent", "three_view_strip")
     assert "aligned_phase_window=first_frame first_chunk=0" in contract.describe()
+
+
+def _record(path):
+    with open(path) as handle:
+        return json.load(handle)
+
+
+def test_a_run_record_of_chunk_observations_is_refused():
+    """The VO run's config resolves on its own (the pre-2026-10-14 ambiguity: no key, read as the single form); its run
+    record names chunk observations and refuses it, pointing at the adapter that serves it."""
+
+    contract = resolve_causal_contract(_load(OBSERVATION_S1000))
+    assert (contract.aligned_phase_window, contract.memory_content) == (ALIGNED_PHASE_PADDED, MEMORY_VIDEO_ONLY)
+    with pytest.raises(ValueError, match=r"RUN_ID.json records chunk_observation=True .*215385e9c.*d57a617"):
+        check_run_record(_record(RECORD_S1000), contract, source="RUN_ID.json")
+
+
+def test_the_released_no_observation_record_is_accepted():
+    check_run_record(_record(RECORD_NOOBS_S3324), resolve_causal_contract(_load(FIRST_FRAME_NOOBS)))
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [("aligned_phase_window", "padded"), ("memory_content", "video_and_action"), ("chunk_observation", "false")],
+)
+def test_a_run_record_contradicting_the_config_is_refused(key, value):
+    contract = resolve_causal_contract(_load(FIRST_FRAME_NOOBS))
+    with pytest.raises(ValueError, match=f"records {key}="):
+        check_run_record({**_record(RECORD_NOOBS_S3324), key: value}, contract)
+
+
+def test_a_record_without_protocol_keys_checks_nothing():
+    check_run_record({"step": 3324}, resolve_causal_contract(_load(FIRST_FRAME_NOOBS)))
+
+
+def test_the_run_records_are_read_next_to_the_config(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_bytes(open(OBSERVATION_S1000, "rb").read())
+    assert load_run_records(tmp_path) == [] and describe_run_records([], config) == "none"
+    record = _record(RECORD_S1000)
+    (tmp_path / "RUN_ID.json").write_text(json.dumps(record))
+    (tmp_path / "upload_manifest.json").write_text(json.dumps({**record, "files": []}))
+    records = load_run_records(tmp_path)
+    assert [path.name for path, _ in records] == ["RUN_ID.json", "upload_manifest.json"]
+    line = describe_run_records(records, config)
+    assert line.startswith("RUN_ID.json+upload_manifest.json(chunk_observation=True aligned_phase_window=padded ")
+    assert "step=1000 source_commit=215385e9c" in line
+    assert line.endswith("config_sha256=differs)")   # the fixture carries a provenance header
+    sha = hashlib.sha256(config.read_bytes()).hexdigest()
+    assert describe_run_records([(p, {**r, "config_sha256": sha}) for p, r in records], config).endswith("=match)")
+    (tmp_path / "upload_manifest.json").write_text("{not json")
+    with pytest.raises(ValueError, match="cannot read the run record"):
+        load_run_records(tmp_path)
+
+
+def test_the_runtime_refuses_the_record_before_any_weight(tmp_path):
+    """``CausalRuntime.from_paths`` reads the record next to the config before the normalization and the weights (the
+    directory holds neither, so any later step would fail differently)."""
+
+    from sana_wam_causal.runtime import CausalRuntime
+
+    (tmp_path / "config.yaml").write_bytes(open(OBSERVATION_S1000, "rb").read())
+    (tmp_path / "RUN_ID.json").write_text(open(RECORD_S1000).read())
+    with pytest.raises(ValueError, match="records chunk_observation=True"):
+        CausalRuntime.from_paths(str(tmp_path), text_encoder_path="unused", vae_path="unused", device="cpu")
 
 
 def test_a_sana_pixel_canvas_resolves_on_the_episode_protocol():

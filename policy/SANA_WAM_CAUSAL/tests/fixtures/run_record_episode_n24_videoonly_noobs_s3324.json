@@ -1,0 +1,11 @@
+{
+  "hf_repo": "logits/causal_robodojo_eefabs_sana_latent_256x320_p33k_aligned_f33fps8_episode_n24_nsc_videoonly_noobs",
+  "step": 3324,
+  "epoch": 4,
+  "chunk_observation": false,
+  "aligned_phase_window": "first_frame",
+  "memory_content": "video_only",
+  "source_commit": "04c8acbee86d02a7f540ac216045a5f874326085",
+  "config_sha256": "54d67abd41f12871d3f032ac450fbc458174300f2a18889565788d7d6955444e",
+  "training_array": "194930 (steps 0-2074), 205995 (from step 2074)"
+}

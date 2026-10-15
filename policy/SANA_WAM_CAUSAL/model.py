@@ -322,7 +322,7 @@ class Model(ModelTemplate):
             f"view_resize={frontend.view_resize} ({frontend.view_resize_source}) commit_actions={self.commit_actions} "
             f"memory_mode={self.memory_mode} attention_dump_dir={self.attention_dump_dir} "
             f"gdn_recurrence={report.get('gdn_recurrence')} normalization_sha256={self.normalization.sha256} "
-            f"device={self.device} action_type={self.action_type}",
+            f"run_record={report.get('run_record')} device={self.device} action_type={self.action_type}",
             flush=True,
         )
         print(f"{TAG} prompt Action Mode sentence (from the training yaml): {frontend.action_mode_text!r}", flush=True)
