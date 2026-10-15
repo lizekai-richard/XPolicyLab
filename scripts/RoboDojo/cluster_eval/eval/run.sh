@@ -5,15 +5,18 @@
 # dispatched one capability category at a time, finished with the tail template and summarized with the official
 # summarize_result.py. Everything that defines a run comes from the environment -- eval/campaign.sh exports it from a
 # campaign definition (eval/defs/*.env); by hand, export the variables below:
-#   ADAPTER      SANA_WAM (default) | SANA_MOT | SANA_WAM_CAUSAL   (ports, worker env, synced adapter dirs: lib/adapters.sh)
+#   ADAPTER      SANA_WAM (default) | SANA_MOT | SANA_WAM_CAUSAL | SANA_WAM_SM   (ports, worker env, synced adapter dirs:
+#                lib/adapters.sh)
 #   CKPT_LABEL   the checkpoint snapshot <CE_CKPT_ROOT>/<label> (REQUIRED); CKPT overrides the directory
 #   NORM_SHA     sha256 of the normalization artifact the snapshot's training yaml pins (REQUIRED to launch: the adapter refuses
 #                a snapshot whose normalization differs; read it from <snapshot>/config.yaml normalization_sha256)
 #   SEED         eval seed (0)
 #   NFE (10) VIDEO_CFG (6) ACTION_CFG (1)           sampling steps and the per-stream guidance (VIDEO_CFG=1 ACTION_CFG=1 = guidance
 #                                                   off, no unconditional pass: checkpoints trained without condition dropout)
-#   VIDEO_FS ACTION_FS                              flow shifts (SANA_WAM / SANA_WAM_CAUSAL 5 / 1; SANA_MOT 8 / shared)
-#   NAS          n_action_steps: execute the first NAS of the 32 predicted targets, then replan (unset = the whole chunk)
+#   VIDEO_FS ACTION_FS                              flow shifts (SANA_WAM / SANA_WAM_CAUSAL / SANA_WAM_SM 5 / 1; SANA_MOT 8 /
+#                                                   shared)
+#   NAS          n_action_steps: execute the first NAS of the 32 predicted targets, then replan (unset = the whole chunk;
+#                refused for SANA_WAM_CAUSAL / SANA_WAM_SM, whose memory clock advances by whole 32-action chunks)
 #   ACTION_TYPE  ee (default: end-effector poses through the evaluator's IK) | joint
 #   VIDEO_LAYOUT SANA_MOT only (default sana_pixel_canvas): asserts the checkpoint's video layout
 #   VIEW_RESIZE  crop | stretch: ONLY to force a view resize against the checkpoint's own (an A/B; run name _eval<mode>). By
@@ -61,6 +64,8 @@ SEED=${SEED:-0}; [[ $SEED =~ ^[0-9]+$ ]] || { echo "SEED must be an integer, got
 NFE=${NFE:-10}; VIDEO_CFG=${VIDEO_CFG:-6}; ACTION_CFG=${ACTION_CFG:-1}
 VIDEO_FS=${VIDEO_FS:-$VIDEO_FS_DEFAULT}; ACTION_FS=${ACTION_FS-$ACTION_FS_DEFAULT}
 NAS=${NAS:-}; [[ -z $NAS || $NAS =~ ^[0-9]+$ ]] || { echo "NAS must be an integer, got '$NAS'"; exit 2; }
+[[ -n $NAS && ( $ADAPTER == SANA_WAM_CAUSAL || $ADAPTER == SANA_WAM_SM ) ]] && {
+  echo "NAS: $ADAPTER executes whole 32-action chunks (its memory clock; the adapter has no n_action_steps): unset NAS"; exit 2; }
 ACTION_TYPE=${ACTION_TYPE:-ee}; [[ $ACTION_TYPE == ee || $ACTION_TYPE == joint ]] || { echo "ACTION_TYPE must be ee or joint"; exit 2; }
 VIDEO_LAYOUT=${VIDEO_LAYOUT:-$VIDEO_LAYOUT_DEFAULT}
 # How each camera view reaches its bucket (adapter deploy key view_resize). The adapters stretch by default -- the only SFT resize
@@ -138,7 +143,7 @@ expect_ready(){ # the ready-line tokens these settings imply, one per line
       echo "flow_shift=$(pyfloat "$VIDEO_FS")"; if [[ -n $ACTION_FS ]]; then echo "action_flow_shift=$(pyfloat "$ACTION_FS")"; else echo "action_flow_shift=shared"; fi
       echo "n_action_steps=${NAS:-all}"
       [[ $ADAPTER == SANA_MOT && -n $VIDEO_LAYOUT ]] && echo "video_layout=$VIDEO_LAYOUT" ;;
-    SANA_WAM_CAUSAL)
+    SANA_WAM_CAUSAL|SANA_WAM_SM)
       echo "video_cfg_scale=$(pyfloat "$VIDEO_CFG")"; echo "action_cfg_scale=$(pyfloat "$ACTION_CFG")"
       echo "flow_shift=$(pyfloat "$VIDEO_FS")"; echo "action_flow_shift=$(pyfloat "${ACTION_FS:-$VIDEO_FS}")"
       echo "normalization_sha256=$NORM_SHA" ;;

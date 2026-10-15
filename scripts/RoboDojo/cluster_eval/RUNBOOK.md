@@ -58,7 +58,7 @@ Each node needs, under `CE_NODE_ROOT`:
 | file | exports | built by |
 |---|---|---|
 | `activate.sh` | `SANA_SIM_PY` (the Isaac Sim / RoboDojo python), `ROBODOJO_CHECKOUT` (RoboDojo at `726e9aa`, with its `Assets`) | `node/install_node.sh` (Isaac Sim 5.1 + IsaacLab + curobo, python 3.11; resumable steps, `--only <step>`), then `node/node_pin_726e9aa.sh` |
-| `activate_sana_wam.sh` | `SANA_PY` (the policy-server python) | `node/install_sana_wam.sh`, or by hand per `policy/SANA_WAM/INSTALLATION.md` section 1 (one env serves SANA_WAM, SANA_MOT and SANA_WAM_CAUSAL) |
+| `activate_sana_wam.sh` | `SANA_PY` (the policy-server python) | `node/install_sana_wam.sh`, or by hand per `policy/SANA_WAM/INSTALLATION.md` section 1 (one env serves SANA_WAM, SANA_MOT, SANA_WAM_CAUSAL and SANA_WAM_SM) |
 
 Never run two conda installers concurrently on one node. One single-GPU slot needs ~25 of 48 GB (policy server ~17 GB +
 Isaac client ~8 GB); the reference site uses RTX A6000 48 GB boards.

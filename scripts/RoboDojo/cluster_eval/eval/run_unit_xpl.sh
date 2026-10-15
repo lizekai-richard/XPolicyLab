@@ -13,8 +13,9 @@
 #
 #   RPC_PORT   the slot port used for the websocket policy server (WS_PORT is unused but reclaimed)
 # Env (from master.py or the operator):
-#   SANA_EVAL_XPL_POLICY         the adapter under policy/: SANA_WAM (default) | SANA_MOT | OpenWAM. SANA_WAM and SANA_MOT
-#                                share the sana-wam env and the Sana snapshot layout + text encoder / VAE keys below
+#   SANA_EVAL_XPL_POLICY         the adapter under policy/: SANA_WAM (default) | SANA_MOT | SANA_WAM_CAUSAL | SANA_WAM_SM |
+#                                OpenWAM. The four SANA adapters share the sana-wam env and the Sana snapshot layout + text
+#                                encoder / VAE keys below
 #   SANA_EVAL_CHECKPOINT_ROOT    HF-style snapshot (config.yaml + model/pytorch_model_fsdp.bin [+ normalization/])
 #   SANA_EVAL_XPL_ROOT           the XPolicyLab checkout carrying policy/<POLICY> (default CE_REMOTE_XPL)
 #   SANA_EVAL_XPL_WS             node-local RoboDojo workspace built from symlinks to the pinned checkout with
@@ -66,12 +67,13 @@ case $XPL_ACTION_TYPE in joint|ee) ;; *) echo "SANA_EVAL_XPL_ACTION_TYPE must be
 LAYOUT_IDS=${SANA_EVAL_LAYOUT_IDS:-}
 LAYOUT_TOTAL=${SANA_EVAL_LAYOUT_TOTAL:-}
 read -r -a XPL_EXTRA_OVERRIDE_ARGS <<<"$XPL_EXTRA_OVERRIDES"
-POLICY_NAME=${SANA_EVAL_XPL_POLICY:-SANA_WAM}          # SANA_WAM (default) | SANA_MOT | SANA_WAM_CAUSAL | OpenWAM
+POLICY_NAME=${SANA_EVAL_XPL_POLICY:-SANA_WAM}          # SANA_WAM (default) | SANA_MOT | SANA_WAM_CAUSAL | SANA_WAM_SM | OpenWAM
 # pydeps only exist to patch the sana-wam env's missing websockets/msgpack/h5py, and it is PREPENDED to the
 # server's PYTHONPATH -- for a policy whose own env already ships them it would shadow the correct versions.
-# Hence: the two policies served from the sana-wam env (SANA_WAM, SANA_MOT) get the historical default, any other none.
+# Hence: the policies served from the sana-wam env (SANA_WAM, SANA_MOT, SANA_WAM_CAUSAL, SANA_WAM_SM) get the historical
+# default, any other none.
 case $POLICY_NAME in
-  SANA_WAM|SANA_MOT|SANA_WAM_CAUSAL) XPL_PYDEPS=${SANA_EVAL_XPL_PYDEPS:-${CE_REMOTE_PYDEPS:-}} ;;
+  SANA_WAM|SANA_MOT|SANA_WAM_CAUSAL|SANA_WAM_SM) XPL_PYDEPS=${SANA_EVAL_XPL_PYDEPS:-${CE_REMOTE_PYDEPS:-}} ;;
   *)                 XPL_PYDEPS=${SANA_EVAL_XPL_PYDEPS:-} ;;
 esac
 ENV_CFG_TYPE=arx_x5
@@ -158,7 +160,7 @@ if [[ $DRY != 1 ]]; then
   if (( ${#xmissing[@]} )); then
     trap - ERR; write_result prologue_fail 0 0 0 "XPolicyLab lane inputs missing under $XPL_ROOT: ${xmissing[*]}"; stop_heartbeat; exit 78
   fi
-  # Per-policy deploy.yml keys. SANA_WAM and SANA_MOT point at the shared Sana encoders; OpenWAM's bundle is
+  # Per-policy deploy.yml keys. The SANA adapters point at the shared Sana encoders; OpenWAM's bundle is
   # self-contained (its Wan2.2 DiT/VAE/text-encoder weights are all inside the one safetensors) and
   # takes `ckpt_dir` + the vendored source root instead.
   POLICY_OVERRIDE_ARGS=()

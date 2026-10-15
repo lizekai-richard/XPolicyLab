@@ -1,6 +1,7 @@
 # shellcheck shell=bash
-# Adapter profiles of the per-run driver (eval/run.sh): what differs between serving policy/SANA_WAM, policy/SANA_MOT and
-# policy/SANA_WAM_CAUSAL through the XPolicyLab lane (eval/run_unit_xpl.sh). `ce_adapter_profile ADAPTER` sets
+# Adapter profiles of the per-run driver (eval/run.sh): what differs between serving policy/SANA_WAM, policy/SANA_MOT,
+# policy/SANA_WAM_CAUSAL and policy/SANA_WAM_SM through the XPolicyLab lane (eval/run_unit_xpl.sh). `ce_adapter_profile
+# ADAPTER` sets
 #   POLICY              the adapter directory under policy/ = the policy segment of the official eval_result layout
 #                       (eval_result/RoboDojo/<task>/<POLICY>/arx_x5/...) and the row name of the official summary
 #   RPC_BASE WS_BASE    master --rpc-port-base / --ws-port-base: single-GPU slot g binds base + 50 + g on its node. The ranges
@@ -24,11 +25,18 @@ ce_adapter_profile(){
       WORKER_ENV="SANA_EVAL_XPL_POLICY=SANA_MOT"; SYNC_POLICIES="SANA_MOT SANA_WAM"
       DIM_ORDER_DEFAULT=precision,memory,long-horizon,generalization,open
       VIDEO_FS_DEFAULT=8; ACTION_FS_DEFAULT=""; VIDEO_LAYOUT_DEFAULT=sana_pixel_canvas ;;
-    SANA_WAM_CAUSAL)   # the chunk-causal policy (per-chunk observation protocol); imports policy/SANA_WAM/sana_wam_min
+    SANA_WAM_CAUSAL)   # the chunk-causal policy (episode protocol, single form: sink + memory chunks, no chunk observation);
+                       # imports policy/SANA_WAM/sana_wam_min
       POLICY=SANA_WAM_CAUSAL; RPC_BASE=63600; WS_BASE=65300; SMOKE_RPC=63690; SMOKE_WS=65390
       WORKER_ENV="SANA_EVAL_XPL_POLICY=SANA_WAM_CAUSAL"; SYNC_POLICIES="SANA_WAM SANA_WAM_CAUSAL"
       DIM_ORDER_DEFAULT=memory,long-horizon,precision,generalization,open    # memory + long-horizon first (user 2026-10-06)
       VIDEO_FS_DEFAULT=5; ACTION_FS_DEFAULT=1; VIDEO_LAYOUT_DEFAULT="" ;;
-    *) echo "unknown ADAPTER '$1' (SANA_WAM | SANA_MOT | SANA_WAM_CAUSAL)" >&2; return 2 ;;
+    SANA_WAM_SM)       # the sparse-memory policy (one decision per chunk: [sink | memory | target], the prefix re-encoded
+                       # from the episode's frames); imports policy/SANA_WAM/sana_wam_min
+      POLICY=SANA_WAM_SM; RPC_BASE=63700; WS_BASE=65500; SMOKE_RPC=63790; SMOKE_WS=65590
+      WORKER_ENV="SANA_EVAL_XPL_POLICY=SANA_WAM_SM"; SYNC_POLICIES="SANA_WAM SANA_WAM_SM"
+      DIM_ORDER_DEFAULT=memory,long-horizon,precision,generalization,open    # as SANA_WAM_CAUSAL: the memory policies
+      VIDEO_FS_DEFAULT=5; ACTION_FS_DEFAULT=1; VIDEO_LAYOUT_DEFAULT="" ;;
+    *) echo "unknown ADAPTER '$1' (SANA_WAM | SANA_MOT | SANA_WAM_CAUSAL | SANA_WAM_SM)" >&2; return 2 ;;
   esac
 }

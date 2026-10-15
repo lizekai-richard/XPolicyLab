@@ -3,7 +3,8 @@
 The orchestration behind every RoboDojo number of the SANA adapters in this fork (`policy/SANA_WAM`, `policy/SANA_MOT`,
 `policy/SANA_WAM_CAUSAL`): the complete official protocol (42 tasks / 54 task configs / 2100 episodes per seed, seeds
 0-2) spread over a GPU cluster, one simulator + one policy server per GPU, scheduled from a control host over ssh, with
-the results written by RoboDojo's own `summarize_result.py`.
+the results written by RoboDojo's own `summarize_result.py`. The sparse-memory adapter `policy/SANA_WAM_SM` has a profile
+too (`ADAPTER=SANA_WAM_SM`, `lib/adapters.sh`); no campaign has run it yet.
 
 Everything site-specific lives in one file (`sites/<site>.env`). With a site configured, a campaign is one definition file
 plus a few commands:
