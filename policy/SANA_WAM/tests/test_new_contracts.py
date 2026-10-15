@@ -849,6 +849,29 @@ def test_the_pantheon14k_sana_pixel_nocfg_serves_like_the_pantheon14k_pixel():
     assert tuple(session.sana_pixel_canvas_hw) == (320, 512)
 
 
+# logits/sft_robodojo_eefabs_sana_latent_256x320_vanilla_pantheon33k_aligned_f33fps8_nocfg (Sana 9da55937e): the Pantheon33k sana
+# latent recipe (donor e8s33139) trained WITHOUT condition dropout, served with guidance off (cfg_scale 1, action_cfg_scale 1).
+# Against its twin only the two dropout probabilities, the yaml's inference CFG (6 -> 1, new inference_action_cfg_scale 1) and the
+# training-only names differ; the adapter resolves the same strip contract (stretch by default, norm 9f8b98e)
+PANTHEON33K_LATENT_NOCFG = os.path.join(os.path.dirname(__file__), "fixtures", "config_pantheon33k_sana_latent_nocfg_9da55937e.yaml")
+
+
+def test_the_pantheon33k_sana_latent_nocfg_serves_like_the_pantheon33k_sana_latent():
+    cfg, twin = legacy(PANTHEON33K_LATENT_NOCFG), legacy(PANTHEON33K_LATENT)
+    flat, twin_flat = _flat(cfg), _flat(twin)
+    differ = {key for key in flat.keys() | twin_flat.keys() if flat.get(key) != twin_flat.get(key)}
+    training_only = {"name", "work_dir", "train.valid_prompt_embed_root"}
+    assert differ - training_only == {"model.class_dropout_prob", "train.extra.instruction_dropout_probability",
+                                      "scheduler.inference_cfg_scale", "scheduler.inference_action_cfg_scale"}
+    assert flat["model.class_dropout_prob"] == 0.0 and flat["train.extra.instruction_dropout_probability"] == 0.0
+    assert flat["model.load_from"] == twin_flat["model.load_from"] and "sanalatent_pantheon_e8s33139" in flat["model.load_from"]
+    _assert_serves_like_the_vanilla34k_strip(cfg, legacy(VANILLA34K_LATENT))
+    assert cfg["data"]["extra"]["robot_sft"]["normalization_sha256"].startswith("9f8b98ed")
+    assert not ((cfg.get("train") or {}).get("extra") or {}).get("video_augmentation")
+    session = _session(cfg)
+    assert (session.view_resize, session.view_resize_source) == ("stretch", "default")
+
+
 # logits/sft_robodojo_eefabs_openwam_384x320_vanilla_pantheon14k_aligned_f33fps8 (Sana 9da55937e): the OpenWAM L-shaped
 # 384x320 canvas on the ONE policy class, warm-started from the Pantheon14k sana_pixel donor e4s14173 (the donor of the
 # Pantheon14k pixel), condition dropout 0.1, norm 9f8b98e. The newer trainer dumps every default, so the yaml is compared with the
