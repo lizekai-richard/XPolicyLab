@@ -9,7 +9,7 @@ round-off); the prefix encoded alone == the first n + 1 latents of the whole sam
 ``test_sparse_memory_vae.py`` asserts maxdiff 0 with deterministic cuDNN, which this tool sets).
 
 Usage (from policy/SANA_WAM_SM, PYTHONPATH=<XPolicyLab parent>):
-  python tools/first_light.py --recipe tests/fixtures/recipe_sm_fixed_m16_3fa3e9689.yaml [--vae-path P]
+  python tools/first_light.py --recipe tests/fixtures/recipe_sm_global_343c60b4d.yaml [--vae-path P]
          [--decisions 4] [--first-decision 0] [--steps 10] [--device cuda]
 """
 
@@ -76,7 +76,7 @@ def run_model(args, report: dict) -> None:
     caption = Caption(randn(1, 1, 1, length, channels), torch.ones(1, 1, length, dtype=torch.int16, device=device))
     null = Caption(randn(1, 1, 1, length, channels), torch.ones(1, 1, length, dtype=torch.int16, device=device))
     decisions = range(args.first_decision, args.first_decision + args.decisions)
-    latents = {c: sm.memory_latents(sm.decision_row(c), 0, contract.memory) for c in decisions}
+    latents = {c: sm.memory_latents(contract.memory) for c in decisions}
     prefixes = {c: randn(1, config.in_channels, 1 + latents[c], 10, 16) for c in decisions}
     state = randn(80)
     mask = torch.zeros(1, 32, 80, dtype=torch.bool, device=device)
@@ -129,7 +129,7 @@ def run_vae(args, report: dict) -> None:
         prefix_rows = sm.prefix_rows(t, 0, memory)
         sequence, sequence_s = synced(encode_causal, bundle, [canvas(row) for row in sequence_rows])
         prefix, prefix_s = synced(encode_causal, bundle, [canvas(row) for row in prefix_rows])
-        n = sm.memory_latents(t, 0, memory)
+        n = sm.memory_latents(memory)
         rows_out.append({
             "decision": c, "memory_latents": n, "prefix_frames": len(prefix_rows),
             "prefix_maxdiff_vs_sequence": float((prefix.float() - sequence[:, :, : n + 1].float()).abs().max()),

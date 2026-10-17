@@ -1,6 +1,6 @@
 """Chunk-causal attention shells and block of the sparse-memory policy (inference subset).
 
-Ports of Sana rwm/sparse-memory (3fa3e9689) over one forward's tokens with explicit token-space chunk bounds (the
+Ports of Sana rwm/sparse-memory (checked against cc18ad78f) over one forward's tokens with explicit token-space chunk bounds (the
 bounds come from ``sparse_memory.form_layout``: one chunk per sink / memory latent, the target chunk last):
 
 * ``SMGDNAttention`` <- ``layers/chunk_causal_gdn.py`` ``CachedChunkCausalPolicyGDNAttention`` / ``gdn_scan`` over ALL
@@ -297,9 +297,16 @@ class SMPolicyBlock(PolicyBlock):
         prompt_group_spans=None,
         bounds: Optional[Sequence[int]] = None,
         cache: Optional[GDNCache | SoftmaxCache] = None,
+        text_order: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Self-attention delta (the shell over ``bounds``, reading / writing ``cache``: a GDN's ``GDNCache``, a softmax
-        layer's ``SoftmaxCache``) plus the text cross-attention delta."""
+        layer's ``SoftmaxCache``) plus the text cross-attention delta.
+
+        ``text_order`` = (to_groups, from_groups): token gathers into the order ``prompt_group_spans`` tiles (one
+        contiguous span per prompt group) and back. The sana_latent strip runs its tokens in strip order (one chunk per
+        latent, its views in order), where a view's tokens recur in every chunk; every query reads its own group alone,
+        so the cross-attention is per token and the view-major order gives Sana's per-(chunk, group) spans
+        (``_build_grouped_text_ctx``) one span per group."""
 
         batch, tokens, channels = hidden_states.shape
         token_count = modulation.shape[2]
@@ -315,12 +322,12 @@ class SMPolicyBlock(PolicyBlock):
         attention = self.attn(attention_input, rotary_emb=rotary_emb, bounds=bounds, cache=cache)
         self_attention = attention.reshape(batch, token_count, -1, channels)
         self_delta = (gate * self_attention).reshape(batch, tokens, channels)
-        cross_delta = self.cross_attn(
-            hidden_states + self_delta,
-            text,
-            mask=text_mask,
-            prompt_group_spans=prompt_group_spans,
-        )
+        query = hidden_states + self_delta
+        if text_order is not None:
+            query = query.index_select(1, text_order[0])
+        cross_delta = self.cross_attn(query, text, mask=text_mask, prompt_group_spans=prompt_group_spans)
+        if text_order is not None:
+            cross_delta = cross_delta.index_select(1, text_order[1])
         return self_delta + cross_delta
 
 

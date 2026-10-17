@@ -1,5 +1,5 @@
 """The live Sana checkout the parity tests compare against (``SANA_SM_REPO``, default the pinned rwm/sparse-memory tree
-~/zekail/Sana_sparse_memory_3fa3e9689, e.g. ``git -C <Sana-sparse-memory clone> archive 3fa3e9689 | tar -x -C <dir>``):
+~/zekail/Sana_sparse_memory_cc18ad78f, e.g. ``git -C <Sana-sparse-memory clone> worktree add --detach <dir> cc18ad78f``):
 its sparse-memory module, its causal policy class and its sparse-memory deploy session. A test module that imports this
 one owns the ``dev`` package for its pytest session (run the live files apart from other Sana checkouts).
 """
@@ -12,7 +12,7 @@ import types
 
 import pytest
 
-SANA_SM_REPO = os.path.expanduser(os.environ.get("SANA_SM_REPO", "~/zekail/Sana_sparse_memory_3fa3e9689"))
+SANA_SM_REPO = os.path.expanduser(os.environ.get("SANA_SM_REPO", "~/zekail/Sana_sparse_memory_cc18ad78f"))
 
 
 def reference_varlen(q, k, v, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None, dropout_p=0.0):
@@ -47,8 +47,8 @@ def live_sparse_memory():
         pytest.skip(f"{SANA_SM_REPO} predates the sparse memory (rwm/sparse-memory 3f6f8daa5)")
     if not os.path.abspath(module.__file__).startswith(os.path.abspath(SANA_SM_REPO)):
         pytest.skip(f"dev is already imported from another checkout ({module.__file__}); run the live files on their own")
-    if not hasattr(module, "fixed_rows"):
-        pytest.skip(f"{SANA_SM_REPO} predates memory_type fixed (rwm/sparse-memory 2a5cfbcd9)")
+    if not hasattr(module, "global_rows"):
+        pytest.skip(f"{SANA_SM_REPO} predates memory_type global (rwm/sparse-memory eef7beeab)")
     return module
 
 

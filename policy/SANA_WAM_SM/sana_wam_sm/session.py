@@ -1,6 +1,6 @@
 """The per-episode decisions of the sparse-memory policy on a loaded ``SMPolicyModel`` (batch 1).
 
-Sana's deploy is ``dev/rwm/deploy/causal/sparse_memory_session.py`` (3fa3e9689): ``SparseMemoryPolicySession.decide``
+Sana's deploy is ``dev/rwm/deploy/causal/sparse_memory_session.py`` (cc18ad78f): ``SparseMemoryPolicySession.decide``
 samples one decision from the prefix latents [S | M_1..M_n] of its observation row (``vae_encode.encode_causal`` of
 ``sparse_memory.prefix_rows``): the prefix runs ONCE per text stream into per-layer caches (``forward_memory_prefix``),
 then every Euler step runs the target chunk [T | state | 32 actions] alone against them (``forward_memory_target``), the
@@ -13,7 +13,9 @@ normalized range of the training data.
 Two decisions share nothing: the memory grid moves with the observation row, so every decision brings its own prefix
 and its caches die with it. Conditional and unconditional text streams run separate prefixes (the caption reaches every
 block through cross-attention, so a prefix token's hidden states depend on it). Latents are ``[1, C_lat, F, H, W]``
-canvas grids; actions and states are in the normalized space.
+canvas grids or the sana_latent views' ``[1, C_lat, F, 1, sum(h_v * w_v)]`` strip (Sana ``encode_prefix``: the views
+packed, their latent shapes passed with every decision as ``view_shapes``, their RoPE slots fixed per episode);
+actions and states are in the normalized space.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from sana_wam_min.sampler import _action_step, _video_step, make_scheduler  # no
 from . import sparse_memory as sm  # noqa: E402
 from .contract import DEPLOY_CACHED, DEPLOY_FORMS  # noqa: E402
 from .layers import GDN_KIND, GDNCache, SoftmaxCache  # noqa: E402
-from .model import SMPolicyModel  # noqa: E402
+from .model import SMPolicyModel, ViewShapes  # noqa: E402
 
 LEFT_GRIPPER, RIGHT_GRIPPER = 16, 45
 
@@ -59,6 +61,7 @@ class SMSession:
         model_fps: float,
         deploy_form: str,
         autocast_dtype: Optional[torch.dtype] = torch.bfloat16,
+        view_slot_ids: tuple[int, ...] = (0,),
     ) -> None:
         self.model = model
         self.memory = dict(model.memory)
@@ -85,8 +88,9 @@ class SMSession:
         self.model_fps = float(model_fps)
         self.autocast_dtype = autocast_dtype
         self.captions = [caption] + ([unconditional_caption] if self.guided else [])
+        self.view_slot_ids = tuple(int(slot) for slot in view_slot_ids)
         self.decision = 0
-        self._grid: Optional[tuple[int, int]] = None
+        self._grid: Optional[tuple] = None
 
     # -- helpers -----------------------------------------------------------------------------------------------------
 
@@ -95,21 +99,24 @@ class SMSession:
             return torch.autocast(device_type=device.type, enabled=False)
         return torch.autocast(device_type=device.type, dtype=self.autocast_dtype)
 
-    def _check_prefix(self, prefix_latents: torch.Tensor) -> int:
+    def _check_prefix(self, prefix_latents: torch.Tensor, view_shapes: Optional[ViewShapes]) -> int:
         if prefix_latents.ndim != 5 or prefix_latents.shape[0] != 1 or prefix_latents.shape[2] < 1:
             raise ValueError(f"prefix_latents must be [1, C, 1 + n, H, W], got {tuple(prefix_latents.shape)}")
-        grid = (int(prefix_latents.shape[-2]), int(prefix_latents.shape[-1]))
+        views = None if view_shapes is None else tuple((int(h), int(w)) for h, w in view_shapes)
+        if views is not None and len(views) > 1 and len(views) != len(self.view_slot_ids):
+            raise ValueError(f"{len(views)} views, the session holds the RoPE slots {self.view_slot_ids}")
+        grid = (int(prefix_latents.shape[-2]), int(prefix_latents.shape[-1]), views)
         if self._grid is None:
             self._grid = grid
         elif grid != self._grid:
-            raise ValueError(f"prefix_latents has the latent grid {grid}, the session runs {self._grid}")
+            raise ValueError(f"prefix_latents has the latent layout {grid}, the session runs {self._grid}")
         n = int(prefix_latents.shape[2]) - 1
-        if self.memory[sm.MEMORY_TYPE] == sm.FIXED and n != int(self.memory[sm.MEMORY_FRAMES]) // sm.FRAMES_PER_LATENT:
-            raise ValueError(f"a fixed memory of {self.memory[sm.MEMORY_FRAMES]} rows holds "
-                             f"{int(self.memory[sm.MEMORY_FRAMES]) // sm.FRAMES_PER_LATENT} latents, the prefix {n}")
+        if n != sm.memory_latents(self.memory):
+            raise ValueError(f"a memory of {self.memory[sm.MEMORY_FRAMES]} rows holds {sm.memory_latents(self.memory)} "
+                             f"latents, the prefix {n}")
         return n
 
-    def _prefix_caches(self, prefix: torch.Tensor) -> list[list]:
+    def _prefix_caches(self, prefix: torch.Tensor, views: dict) -> list[list]:
         """Run the prefix once per text stream (Sana ``forward_memory_prefix``) and return, per stream, the caches every
         target step reads: each GDN layer's state after M_n, each softmax layer's rotated K and V."""
 
@@ -121,7 +128,8 @@ class SMSession:
                 for block in self.model.blocks
             ]
             self.model.forward_sm(
-                prefix, zeros, caption.y, caption.mask, form=sm.FORM_PREFIX, model_fps=self.model_fps, caches=caches
+                prefix, zeros, caption.y, caption.mask, form=sm.FORM_PREFIX, model_fps=self.model_fps, caches=caches,
+                **views,
             )
             for index, cache in enumerate(caches):
                 if cache.out is None:
@@ -136,6 +144,7 @@ class SMSession:
         self,
         prefix_latents: torch.Tensor,
         *,
+        view_shapes: Optional[ViewShapes] = None,
         anchor_state: torch.Tensor,
         anchor_state_mask: torch.Tensor,
         action_mask: torch.Tensor,
@@ -144,11 +153,13 @@ class SMSession:
         action_noise: Optional[torch.Tensor] = None,
         gripper_bounds: Optional[tuple[tuple[float, float], tuple[float, float]]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample decision ``self.decision`` from its prefix latents ``[1, C, 1 + n, H, W]`` ([S | M_1..M_n]); returns
-        (normalized actions [1, C, 80], the target latent [1, C, 1, H, W]) and advances to the next decision. The noise
-        not supplied is drawn from ``generator`` as Sana draws it: the target latent's first, then the actions'."""
+        """Sample decision ``self.decision`` from its prefix latents ``[1, C, 1 + n, H, W]`` ([S | M_1..M_n]; the strip
+        ``[1, C, 1 + n, 1, S]`` with its ``view_shapes``); returns (normalized actions [1, C, 80], the target latent in the
+        prefix's layout) and advances to the next decision. The noise not supplied is drawn from ``generator`` as Sana
+        draws it: the target latent's first, then the actions'."""
 
-        n = self._check_prefix(prefix_latents)
+        n = self._check_prefix(prefix_latents, view_shapes)
+        views = {"view_shapes": view_shapes, "view_slot_ids": self.view_slot_ids}
         chunk = self.chunk_actions
         action_mask = action_mask.to(dtype=torch.bool)
         if action_mask.ndim != 3 or action_mask.shape[:2] != (1, chunk):
@@ -168,7 +179,7 @@ class SMSession:
         state_mask = anchor_state_mask.reshape(1, -1).to(torch.bool)
         cached = self.deploy_form == DEPLOY_CACHED
         with self._autocast(device):
-            caches = self._prefix_caches(prefix_latents) if cached else None
+            caches = self._prefix_caches(prefix_latents, views) if cached else None
             for step_index, timestep in enumerate(video_scheduler.timesteps):
                 action_timestep = action_scheduler.timesteps[step_index]
                 video_t = timestep.reshape(1, 1).to(torch.float32)
@@ -185,13 +196,14 @@ class SMSession:
                     if cached:
                         out = self.model.forward_sm(
                             video, video_t, caption.y, caption.mask, form=sm.FORM_TARGET, model_fps=self.model_fps,
-                            robot=robot, caches=caches[stream], memory_latents=n,
+                            robot=robot, caches=caches[stream], memory_latents=n, **views,
                         )
                     else:
                         out = self.model.forward_sm(
                             torch.cat((prefix_latents, video), dim=2),
                             torch.cat((video_t.new_zeros(1, n + 1), video_t), dim=1),
                             caption.y, caption.mask, form=sm.FORM_SEQUENCE, model_fps=self.model_fps, robot=robot,
+                            **views,
                         )
                     outputs.append({"x": out["x"][:, :, -1:], "action_pred": out["action_pred"]})
                 cond = outputs[0]

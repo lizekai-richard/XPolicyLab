@@ -1,20 +1,21 @@
 """XPolicyLab adapter of the SANA sparse-memory policy (RoboDojo ARX-X5, EEF-only absolute targets, EE-pose actions).
 
 The policy runs in-process through the vendored, Sana-free ``sana_wam_sm`` package (on top of SANA_WAM's
-``sana_wam_min`` runtime). Its memory is the episode's own camera canvases, re-encoded at every decision (Sana
-rwm/sparse-memory, ``chunk_causal_policy.memory_type`` fixed with ``memory_frames`` or strided with ``memory_stride``):
+``sana_wam_min`` runtime). Its memory is the episode's own camera frames -- the one sana_pixel canvas or the three
+sana_latent views --, re-encoded at every decision (Sana rwm/sparse-memory, ``chunk_causal_policy.memory_type`` global
+(``fixed`` before Sana eef7beeab) or strided, each with ``memory_frames``):
 
 * decision c anchors at tick t = 32c (tick 0 = the episode's first observation, training's first row r_0 of the span);
   every ``update_obs`` advances the tick (RoboDojo calls it once after every executed action, the last one right before
-  the next ``get_action``) and keeps that tick's canvas, quantized to uint8 as the training payload -- every tick,
+  the next ``get_action``) and keeps that tick's frames, quantized to uint8 as the training payload -- every tick,
   since the memory grid moves with t and a decision may read any earlier frame (Sana ``SparseMemoryEpisode``);
 * every ``get_action``: (decision c >= 1) the previous prediction is scored against the chunk it executed (the target
   latent of its training sample, encoded now that its frames exist); the prefix [sink | memory rows]
-  (``sparse_memory.prefix_rows``: tick 0, then the fixed or strided rows, the last one t) is encoded in one causal pass
-  into [S | M_1..M_n]; the target chunk [T | state | 32 actions] is denoised against it (``deploy_form`` cached: the
+  (``sparse_memory.prefix_rows``: tick 0, then the global or strided rows, the last one t) is encoded in one causal pass
+  into [S | M_1..M_n] (every view on its own, packed into the strip); the target chunk [T | state | 32 actions] is denoised against it (``deploy_form`` cached: the
   prefix runs once into per-layer caches, the target alone per step; uncached: the training sequence per step) and
   returned;
-* ``reset`` (RoboDojo sends it twice per episode) drops the canvases; the episode counter advances on the first
+* ``reset`` (RoboDojo sends it twice per episode) drops the frames; the episode counter advances on the first
   ``update_obs`` of the next episode.
 
 Returned actions: C dicts ``{left,right}_ee_pose`` (link6 in the env-relative world frame, xyz + wxyz) and
@@ -266,6 +267,7 @@ class Model(ModelTemplate):
             view_resize=cfg.get("view_resize"),
             deploy_form=_optional_str(cfg.get("deploy_form")),
             allow_donor_checkpoint=self.allow_donor_checkpoint,
+            action_mode_text=_optional_str(cfg.get("action_mode_text")),
         )
         frontend = self.runtime.frontend
         if frontend.action_mode != "robot_base_eef" or frontend.robot_base_eef_layout != ROBOT_BASE_EEF_ONLY:
@@ -288,24 +290,30 @@ class Model(ModelTemplate):
         self._latest_obs: Optional[Mapping[str, Any]] = None
         self._tau: Optional[int] = None
         self._tick = 0
-        self._canvases: list[torch.Tensor] = []
+        self._frames: list[torch.Tensor] = []
         self._reached: dict[int, np.ndarray] = {}
         self._pending: Optional[dict[str, Any]] = None
         self._instruction: Optional[str] = None
         self._size_warned = False
-        self._n_warned = False
         report = self.runtime.load_report
         print(
             f"{TAG} ready: ckpt={self.ckpt_dir} {contract.describe()} deploy_form={self.runtime.deploy_form} "
             f"steps={frontend.steps} video_cfg_scale={frontend.video_cfg_scale} action_cfg_scale={frontend.action_cfg_scale} "
             f"flow_shift={frontend.flow_shift} action_flow_shift={frontend.action_flow_shift} "
             f"view_resize={frontend.view_resize} ({frontend.view_resize_source}) "
-            f"gdn_recurrence={report.get('gdn_recurrence')} normalization_sha256={self.normalization.sha256} "
+            f"gdn_recurrence={report.get('gdn_recurrence')} condition_dropout={report.get('condition_dropout')} "
+            f"normalization_sha256={self.normalization.sha256} "
             f"device={self.device} action_type={self.action_type}",
             flush=True,
         )
-        print(f"{TAG} prompt Action Mode sentence (from the training yaml): {frontend.action_mode_text!r}", flush=True)
-        print(f"{TAG} text contract: {frontend.text_contract}; canvas Observation View: {frontend.canvas_view_text!r}", flush=True)
+        source = "deploy.yml action_mode_text" if report.get("action_mode_text_source") == "deploy" else "the training yaml's modes"
+        print(f"{TAG} prompt Action Mode sentence (from {source}): {frontend.action_mode_text!r}", flush=True)
+        if self.runtime.strip:
+            print(f"{TAG} text contract: {frontend.text_contract}; views {frontend.view_order} at RoPE slots "
+                  f"{self.runtime.view_slot_ids}, G={frontend.text_groups} prompt groups", flush=True)
+        else:
+            print(f"{TAG} text contract: {frontend.text_contract}; canvas Observation View: {frontend.canvas_view_text!r}",
+                  flush=True)
 
     # -- observations ------------------------------------------------------------------------------------------------
 
@@ -340,9 +348,9 @@ class Model(ModelTemplate):
                 "the next chunk after executing the last one"
             )
         self._tick += 1
-        if len(self._canvases) != self._tick:
-            raise RuntimeError(f"{TAG} tick {self._tick} arrives with {len(self._canvases)} canvases kept")
-        self._canvases.append(self.runtime.canvas(self._frames_from_obs(obs)))
+        if len(self._frames) != self._tick:
+            raise RuntimeError(f"{TAG} tick {self._tick} arrives with {len(self._frames)} rows of frames kept")
+        self._frames.append(self.runtime.frames(self._frames_from_obs(obs)))
         self._reached[self._tau] = self._measured_row(obs)
 
     def update_obs_batch(self, obs_list) -> None:
@@ -405,7 +413,7 @@ class Model(ModelTemplate):
         wm_error = None
         if self.log_world_model_error and pending.get("predicted_latent") is not None:
             rows = sm.sequence_rows(pending["t"], 0, self.memory)
-            sequence, timings["target_encode_s"] = timed(self.runtime.encode, [self._canvases[row] for row in rows])
+            (sequence, _), timings["target_encode_s"] = timed(self.runtime.encode, [self._frames[row] for row in rows])
             wm_error = relative_rmse(pending["predicted_latent"], sequence[:, :, -1:])
         return wm_error, gap
 
@@ -423,7 +431,7 @@ class Model(ModelTemplate):
             self._session = self.runtime.new_session(instruction)
             self._instruction = instruction
             self._tick = 0
-            self._canvases = [self.runtime.canvas(self._frames_from_obs(obs))]
+            self._frames = [self.runtime.frames(self._frames_from_obs(obs))]
             print(f"{TAG} episode {self._episode_index} instruction: {instruction!r}", flush=True)
         else:
             if instruction != self._instruction:
@@ -440,15 +448,8 @@ class Model(ModelTemplate):
         if self.max_chunks_per_episode is not None and c >= self.max_chunks_per_episode:
             raise RuntimeError(f"{TAG} episode {self._episode_index} reached max_chunks_per_episode={self.max_chunks_per_episode}")
         rows = sm.prefix_rows(t, 0, self.memory)
-        n = sm.memory_latents(t, 0, self.memory)
-        if n > self.contract.trained_memory_latents and not self._n_warned:
-            warnings.warn(
-                f"decision {c} (t={t}) reads {n} memory latents, past the {self.contract.trained_memory_latents} the "
-                "recipe trains (its top rung)",
-                stacklevel=2,
-            )
-            self._n_warned = True
-        prefix, timings["prefix_encode_s"] = timed(self.runtime.encode, [self._canvases[row] for row in rows])
+        n = sm.memory_latents(self.memory)
+        (prefix, view_shapes), timings["prefix_encode_s"] = timed(self.runtime.encode, [self._frames[row] for row in rows])
         if int(prefix.shape[2]) != n + 1:
             raise RuntimeError(f"{TAG} decision {c}: the prefix of {len(rows)} rows encoded into {prefix.shape[2]} latents")
 
@@ -461,6 +462,7 @@ class Model(ModelTemplate):
         (action_norm, predicted_latent), timings["decide_s"] = timed(
             session.decide,
             prefix,
+            view_shapes=view_shapes,
             anchor_state=anchor_norm.to(device),
             anchor_state_mask=anchor_mask_t,
             action_mask=action_mask,
@@ -506,14 +508,14 @@ class Model(ModelTemplate):
         return [self.get_action()]
 
     def reset(self) -> None:
-        """Drop the episode's canvases; idempotent (RoboDojo sends two resets per episode)."""
+        """Drop the episode's frames; idempotent (RoboDojo sends two resets per episode)."""
 
         self._session = None
         self._episode_open = False
         self._latest_obs = None
         self._tau = None
         self._tick = 0
-        self._canvases = []
+        self._frames = []
         self._reached = {}
         self._pending = None
         self._instruction = None

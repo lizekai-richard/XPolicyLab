@@ -1,7 +1,7 @@
 """The XPolicyLab adapter's decision cycle against a fake runtime (CPU, no weights): the RoboDojo call order of
 ``policy/<POLICY>/deploy.py`` (update_obs -> get_action, then update_obs after every executed action but the last, whose
-observation arrives right before the next get_action), one canvas per tick, the ticks every decision's prefix encode
-reads (``sparse_memory.prefix_rows`` for both memory types) and the world-model reference encode (the previous
+observation arrives right before the next get_action), one row of frames per tick (the canvas, or the three sana_latent
+views whose view shapes reach every decision), the ticks every decision's prefix encode reads (``sparse_memory.prefix_rows`` for both memory types) and the world-model reference encode (the previous
 decision's ``sequence_rows``), the double reset of every RoboDojo episode, and the refusals."""
 
 from __future__ import annotations
@@ -25,18 +25,20 @@ from sana_wam_min.session import load_checked_normalization
 
 C = 32
 CAMERAS = ("cam_head", "cam_left_wrist", "cam_right_wrist")
-FIXED = {"memory_type": "fixed", "memory_frames": 16}
-STRIDED = {"memory_type": "strided", "memory_stride": 25}
+GLOBAL = {"memory_type": "global", "memory_frames": 16}
+STRIDED = {"memory_type": "strided", "memory_frames": 8, "memory_stride": 25}
 
 
 class FakeSession:
-    def __init__(self, log):
+    def __init__(self, log, views_seen):
         self.log = log
+        self.views_seen = views_seen
         self.decision = 0
         self.deploy_form = "cached"
 
-    def decide(self, prefix_latents, *, anchor_state, anchor_state_mask, action_mask, generator, gripper_bounds):
+    def decide(self, prefix_latents, *, view_shapes, anchor_state, anchor_state_mask, action_mask, generator, gripper_bounds):
         self.log.append(("decide", self.decision, int(prefix_latents.shape[2])))
+        self.views_seen.append(view_shapes)
         action = torch.zeros(1, C, 80)
         action[..., 10] = 1.0   # rot6d column 1 = x axis
         action[..., 14] = 1.0   # column 2 = y axis
@@ -48,26 +50,31 @@ class FakeSession:
 
 
 class FakeRuntime:
-    """Canvases carry the tick of their frame (the frames are filled with tick % 256); an encode of 1 + 8k canvases
-    returns 1 + k latents."""
+    """A row's frames carry the tick of their frame (the frames are filled with tick % 256), one view (the canvas) or
+    three (the sana_latent views); an encode of 1 + 8k rows returns 1 + k latents (the strip's with its view shapes)."""
 
-    def __init__(self, log, memory, trained=8):
+    def __init__(self, log, memory, trained=2, views=1):
         self.log = log
+        self.views = views
+        self.views_seen: list = []
         self.device = torch.device("cpu")
+        self.strip = views > 1
         self.contract = SimpleNamespace(actions_per_chunk=C, memory=memory, trained_memory_latents=trained)
 
     def new_session(self, instruction):
         self.log.append(("new_session", instruction))
-        return FakeSession(self.log)
+        return FakeSession(self.log, self.views_seen)
 
-    def canvas(self, frames):
-        return torch.full((3, 1, 1), int(frames[0][0, 0, 0]), dtype=torch.uint8)
+    def frames(self, frames):
+        return torch.full((self.views, 3, 1, 1), int(frames[0][0, 0, 0]), dtype=torch.uint8)
 
-    def encode(self, canvases):
-        ticks = [int(c.flatten()[0]) for c in canvases]
+    def encode(self, rows):
+        assert all(tuple(row.shape) == (self.views, 3, 1, 1) for row in rows)
+        ticks = [int(row.flatten()[0]) for row in rows]
         self.log.append(("encode", ticks))
         assert (len(ticks) - 1) % 8 == 0
-        return torch.full((1, 4, 1 + (len(ticks) - 1) // 8, 1, 1), float(sum(ticks)))
+        latent = torch.full((1, 4, 1 + (len(ticks) - 1) // 8, 1, self.views), float(sum(ticks)))
+        return latent, (((1, 1),) * self.views if self.strip else None)
 
 
 def _obs(tick: int, instruction: str = "cover the blocks") -> dict:
@@ -84,15 +91,15 @@ def _obs(tick: int, instruction: str = "cover the blocks") -> dict:
     }
 
 
-def _model(memory, trained=8, log_world_model_error=True):
-    with open(os.path.join(_paths.FIXTURES, "recipe_sm_fixed_m16_3fa3e9689.yaml")) as handle:
+def _model(memory, trained=2, log_world_model_error=True, views=1):
+    with open(os.path.join(_paths.FIXTURES, "recipe_sm_global_343c60b4d.yaml")) as handle:
         view = bidirectional_view(yaml.safe_load(handle))
     normalization = load_checked_normalization(
         "/nonexistent", view, os.path.join(_paths.FIXTURES, "normalization_causal_f33_1fe3b7e7.json")
     )
     log: list = []
     m = adapter.Model.__new__(adapter.Model)
-    m.runtime = FakeRuntime(log, memory, trained)
+    m.runtime = FakeRuntime(log, memory, trained, views)
     m.contract = m.runtime.contract
     m.memory = memory
     m.normalization = normalization
@@ -128,9 +135,10 @@ def _episode(m, decisions: int, first_tick: int = 0):
     return outputs
 
 
-@pytest.mark.parametrize("memory", [FIXED, STRIDED], ids=["fixed", "strided"])
-def test_the_decision_cycle(memory, capsys):
-    m = _model(memory)
+@pytest.mark.parametrize("views", [1, 3], ids=["canvas", "sana_latent"])
+@pytest.mark.parametrize("memory", [GLOBAL, STRIDED], ids=["global", "strided_m8s25"])
+def test_the_decision_cycle(memory, views, capsys):
+    m = _model(memory, views=views)
     actions = _episode(m, 5)
     assert all(len(chunk) == C for chunk in actions)
     assert set(actions[0][0]) == {"left_ee_pose", "right_ee_pose", "left_ee_joint_state", "right_ee_joint_state"}
@@ -140,35 +148,41 @@ def test_the_decision_cycle(memory, capsys):
         if c:
             expected.append(("encode", sm.sequence_rows(t - C, 0, memory)))     # the previous decision's reference
         rows = sm.prefix_rows(t, 0, memory)
-        expected += [("encode", rows), ("decide", c, 1 + sm.memory_latents(t, 0, memory))]
+        expected += [("encode", rows), ("decide", c, 1 + sm.memory_latents(memory))]
     assert m.log == expected
-    assert len(m._canvases) == 1 + 4 * C and [int(c.flatten()[0]) for c in m._canvases] == list(range(1 + 4 * C))
+    assert len(m._frames) == 1 + 4 * C and [int(row.flatten()[0]) for row in m._frames] == list(range(1 + 4 * C))
+    assert m.runtime.views_seen == [((1, 1),) * 3 if views == 3 else None] * 5
     out = capsys.readouterr().out
-    n = sm.memory_latents(C * 4, 0, memory)
+    n = sm.memory_latents(memory)
     assert f"decision 4 t=128: memory_latents={n} prefix_rows=" in out
     assert "world_model_rel_rmse(decision 3)=" in out and "cmd_vs_reached(decision 3)" in out
 
 
 def test_without_the_world_model_error_only_the_prefixes_are_encoded(capsys):
-    m = _model(FIXED, log_world_model_error=False)
+    m = _model(GLOBAL, log_world_model_error=False)
     _episode(m, 3)
-    assert [entry[1] for entry in m.log if entry[0] == "encode"] == [sm.prefix_rows(C * c, 0, FIXED) for c in range(3)]
+    assert [entry[1] for entry in m.log if entry[0] == "encode"] == [sm.prefix_rows(C * c, 0, GLOBAL) for c in range(3)]
     assert "world_model_rel_rmse" not in capsys.readouterr().out
 
 
-def test_a_strided_memory_past_the_trained_rung_warns_once():
+def test_a_strided_memory_reads_its_newest_rows_at_every_decision():
+    """Since Sana eef7beeab a strided memory holds memory_frames rows (the newest every memory_stride back from t): one
+    memory latent at every decision for m = 8, the decision's own frame last."""
+
     m = _model(STRIDED, trained=1)
-    with pytest.warns(UserWarning, match="past the 1 the recipe trains"):
-        _episode(m, 9)     # t = 224 reads ceil(ceil(224 / 25) / 8) = 2 memory latents
-    assert m._n_warned
+    _episode(m, 9)
+    decides = [entry for entry in m.log if entry[0] == "decide"]
+    assert [entry[2] for entry in decides] == [2] * 9
+    assert sm.prefix_rows(256, 0, STRIDED) == [0, 81, 106, 131, 156, 181, 206, 231, 256]
+    assert m.log[-2] == ("encode", [row % 256 for row in sm.prefix_rows(256, 0, STRIDED)])   # the fake frames are uint8 ticks
 
 
 def test_a_second_episode_starts_over_after_the_double_reset():
-    m = _model(FIXED)
+    m = _model(GLOBAL)
     _episode(m, 2)
     m.reset()
     m.reset()
-    assert m._canvases == [] and m._session is None and m._pending is None
+    assert m._frames == [] and m._session is None and m._pending is None
     m.log.clear()
     _episode(m, 2, first_tick=200)
     assert m._episode_index == 2
@@ -177,7 +191,7 @@ def test_a_second_episode_starts_over_after_the_double_reset():
 
 
 def test_an_incomplete_chunk_and_a_changed_instruction_are_refused():
-    m = _model(FIXED)
+    m = _model(GLOBAL)
     m.update_obs(_obs(0))
     m.get_action()
     _run_chunk(m, 0, ticks=C - 1)

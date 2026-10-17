@@ -1,6 +1,6 @@
 """Inference-only mirror of the sparse-memory policy (Sana rwm/sparse-memory ``sana_qwennext_policy_causal.py``:
 ``_forward_multiview`` -> ``_sparse_memory_layers`` -> ``_run_causal_layers`` / ``_layer_step``, and the deploy entries
-``forward_memory_prefix`` / ``forward_memory_target``, checked against 3fa3e9689).
+``forward_memory_prefix`` / ``forward_memory_target``, checked against cc18ad78f).
 
 The model is the bidirectional policy trunk (``sana_wam_min.policy_model.PolicyModel``: embedders, AdaLN table, Block
 AttnRes V2, text cross-attention, final layer, action head) with every block rebuilt around the shells of ``layers.py``.
@@ -17,6 +17,11 @@ The prefix never reads the target (the GDN scan reads its chunks in order, the s
 is 0 and without AttnRes time conditioning its depth mixing is its own, so prefix + target reproduce the sequence's last
 chunk (fp64 round-off: the matmuls run on fewer rows). Positions count latents: latent i at RoPE frame i (the target at
 n + 1), one latent frame = 32 rows on the aligned clock, the robot rows at action steps 32n + r.
+
+Two layouts: the one-view sana_pixel canvas (one 10 x 16 grid per latent, one caption group) and the sana_latent strip
+(Sana a881daf7a / ebc25b98e: three 8 x 10 views per latent packed as [1, sum(h_v * w_v)], the semantic 2x2 RoPE tiles,
+G = V + 1 caption groups, one per view and the robot group). A chunk holds one latent of every view, so the strip runs
+its trunk in strip order (Sana ``_strip_order``) and the views' prompt groups in view-major order.
 """
 
 from __future__ import annotations
@@ -42,17 +47,29 @@ from sana_wam_min.policy_model.embeddings import (  # noqa: E402
 )
 from sana_wam_min.policy_model.geometry import strip_to_view_tokens, view_to_strip_tokens  # noqa: E402
 from sana_wam_min.policy_model.model import PolicyModel  # noqa: E402
-from sana_wam_min.policy_model.rope import PhysicalTimeWanRotaryPosEmbed, WanRotaryPosEmbed  # noqa: E402
+from sana_wam_min.policy_model.rope import (  # noqa: E402
+    PhysicalTimeWanRotaryPosEmbed,
+    WanRotaryPosEmbed,
+    semantic_2x2_position_ids,
+)
 
 from . import sparse_memory as sm  # noqa: E402
 from .contract import ACTION_TEMPORAL_COMPRESSION, SMContract  # noqa: E402
 from .layers import GDN_KIND, GDNCache, SMPolicyBlock, SoftmaxCache  # noqa: E402
 
 GDN_RECURRENCE_KEYS = ("gate_proj.weight", "gate_proj.bias", "A_log", "dt_bias", "recall_gate")
+ViewShapes = tuple[tuple[int, int], ...]
+
+
+def view_token_counts(frames: int, view_shapes: ViewShapes) -> list[int]:
+    """Tokens of every view's run in view-major order: ``frames * h_v * w_v``."""
+
+    return [int(frames) * int(height) * int(width) for height, width in view_shapes]
 
 
 class SMPolicyModel(PolicyModel):
-    """The sparse-memory policy's forwards on the bidirectional trunk (single view canvas, ``rope: aligned``)."""
+    """The sparse-memory policy's forwards on the bidirectional trunk (the one-view canvas or the sana_latent strip,
+    ``rope: aligned``)."""
 
     def __init__(self, config: PolicyConfig, contract: SMContract) -> None:
         nn.Module.__init__(self)
@@ -155,25 +172,40 @@ class SMPolicyModel(PolicyModel):
         rope: PhysicalTimeWanRotaryPosEmbed,
         fps: torch.Tensor,
         phi: Sequence[int],
-        height: int,
-        width: int,
+        view_shapes: ViewShapes,
+        view_slot_ids: Sequence[int],
         robot_rows: int,
         step_offset: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Rotary table ``[B, 1, F*H*W + robot_rows, D/2]`` of one sparse-memory forward.
+        """Rotary table ``[B, 1, sum_v F*H_v*W_v + robot_rows, D/2]`` of one sparse-memory forward, video tokens in
+        view-major order (Sana ``_causal_multiview_rope``).
 
-        Video token (latent f, y, x): time ``base_fps * phi_f / (fps / s)`` with phi_f the latent's RoPE frame (Sana
-        ``_physical_frame_ids`` with a ``video_frame_offset``: latent i at i, the target of a target forward at n + 1)
-        on the aligned clock (s = the video frame stride); robot row r: time ``base_fps * (step_offset + r) / (8 * fps)``
-        and spatial ids 0 (Sana ``_action_rope`` for one [state | C actions] chunk from ``chunk_step_offset``)."""
+        Video token (latent f, view v, y, x): the bidirectional policy's spatial ids (the plain grid for one view, the
+        semantic 2x2 tiles at ``view_slot_ids`` for several) and time ``base_fps * phi_f / (fps / s)`` with phi_f the
+        latent's RoPE frame (Sana ``_physical_frame_ids`` with a ``video_frame_offset``: latent i at i, the target of a
+        target forward at n + 1) on the aligned clock (s = the video frame stride); robot row r: time
+        ``base_fps * (step_offset + r) / (8 * fps)`` and spatial ids 0 (Sana ``_action_rope`` for one [state | C actions]
+        chunk from ``chunk_step_offset``)."""
 
         batch = fps.numel()
         frames = len(phi)
         fps_video = fps.to(device=device, dtype=torch.float64) / int(self.video_frame_stride)
-        ids = rope._position_ids(frames, height, width, fps_video, device)
+        if len(view_shapes) == 1:
+            (height, width), = view_shapes
+            ids = rope._position_ids(frames, int(height), int(width), fps_video, device)
+        else:
+            ids = semantic_2x2_position_ids(
+                frames, view_shapes, tuple(view_slot_ids), fps_video, rope.base_fps,
+                self.multiview_spatial_rope_tile_shape, device,
+            )
         frame_ids = torch.as_tensor([float(p) for p in phi], dtype=torch.float64, device=device)
-        frame_of_token = torch.arange(frames, device=device, dtype=torch.long).repeat_interleave(height * width)
+        frame_of_token = torch.cat(
+            [
+                torch.arange(frames, device=device, dtype=torch.long).repeat_interleave(int(height) * int(width))
+                for height, width in view_shapes
+            ]
+        )
         ids = ids.clone()
         ids[..., 0] = rope.base_fps * frame_ids[frame_of_token][None] / fps_video[:, None]
         if robot_rows:
@@ -195,10 +227,12 @@ class SMPolicyModel(PolicyModel):
         rope_softmax: torch.Tensor,
         bounds: Sequence[int],
         caches: Optional[Sequence[GDNCache | SoftmaxCache]],
+        prompt_group_spans: Sequence[tuple[int, int]],
+        text_order: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Sana ``_run_causal_layers``: Block AttnRes V2 over depth, every block on the whole forward over ``bounds`` (its
-        attention reading / writing its cache), one caption span for every token (G = 1: every chunk reads the same
-        window caption)."""
+        attention reading / writing its cache), every token reading its caption group (``prompt_group_spans`` in the
+        order ``text_order`` gathers; every chunk reads the same window caption)."""
 
         block_size = self.attn_res_block_size
         num_blocks = math.ceil(len(self.blocks) / block_size)
@@ -208,7 +242,7 @@ class SMPolicyModel(PolicyModel):
         key_buffer[0] = self.attn_res.key_norm(tokens.unsqueeze(0)).squeeze(0)
         n_active = 1
         partial = None
-        spans = ((0, int(tokens.shape[1])),)
+        spans = tuple((int(offset), int(length)) for offset, length in prompt_group_spans)
         bounds = [int(b) for b in bounds]
         for block_index in range(num_blocks):
             start = block_index * block_size
@@ -225,6 +259,7 @@ class SMPolicyModel(PolicyModel):
                     prompt_group_spans=spans,
                     bounds=bounds,
                     cache=None if caches is None else caches[layer_index],
+                    text_order=text_order,
                 )
                 partial = attn_delta if partial is None else partial + attn_delta
                 hidden = self.attn_res._attend_buffer(self.attn_res.mlp_proj, value_buffer, key_buffer, n_active, partial)
@@ -235,14 +270,14 @@ class SMPolicyModel(PolicyModel):
             partial = None
         return self.attn_res._attend_buffer(self.attn_res.final_proj, value_buffer, key_buffer, n_active, None)
 
-    def _check_caches(self, form: str, caches, memory_latents: int) -> None:
+    def _check_caches(self, form: str, caches, memory_latents: int, frame_tokens: int) -> None:
         if (caches is None) != (form == sm.FORM_SEQUENCE):
             raise ValueError(f"a {form} forward {'takes no' if form == sm.FORM_SEQUENCE else 'needs'} layer caches")
         if caches is None:
             return
         if len(caches) != len(self.blocks):
             raise ValueError(f"expected {len(self.blocks)} layer caches, got {len(caches)}")
-        prefix_tokens = sm.TOKENS_PER_FRAME * (memory_latents + 1)
+        prefix_tokens = int(frame_tokens) * (memory_latents + 1)
         for index, (block, cache) in enumerate(zip(self.blocks, caches)):
             expected = GDNCache if block.attn_type == GDN_KIND else SoftmaxCache
             if not isinstance(cache, expected):
@@ -261,6 +296,31 @@ class SMPolicyModel(PolicyModel):
 
     # -- one forward ----------------------------------------------------------------------------------------------------
 
+    @staticmethod
+    def _text_spans(text, text_mask, view_shapes: ViewShapes, frames: int, robot_rows: int):
+        """(text, mask, query spans in view-major order) of one forward: G = 1 is one span over every token; G = V + 1 is
+        one span per view run, then the robot rows, a forward without robot rows reading the V view groups alone (Sana
+        ``_grouped_query_sublens``: a video-only segment carries no robot entry)."""
+
+        groups = int(text.shape[1])
+        counts = view_token_counts(frames, view_shapes)
+        tokens = sum(counts) + int(robot_rows)
+        if groups == 1:
+            return text, text_mask, ((0, tokens),)
+        views = len(view_shapes)
+        if groups != views + 1:
+            raise ValueError(f"a {views}-view forward reads G = 1 or G = V + 1 = {views + 1} prompt rows, got G={groups}")
+        spans, offset = [], 0
+        for count in counts:
+            spans.append((offset, count))
+            offset += count
+        if robot_rows:
+            spans.append((offset, int(robot_rows)))
+        else:
+            text = text[:, :views]
+            text_mask = None if text_mask is None else text_mask[:, :views]
+        return text, text_mask, tuple(spans)
+
     @torch.no_grad()
     def forward_sm(
         self,
@@ -274,15 +334,18 @@ class SMPolicyModel(PolicyModel):
         robot: Optional[Mapping[str, torch.Tensor]] = None,
         caches: Optional[Sequence[GDNCache | SoftmaxCache]] = None,
         memory_latents: Optional[int] = None,
+        view_shapes: Optional[ViewShapes] = None,
+        view_slot_ids: Sequence[int] = (0,),
     ) -> dict[str, torch.Tensor]:
         """Evaluate one sparse-memory forward of ``form`` (``sparse_memory.form_layout``).
 
         Args:
-            latent: ``[B, C, F, H, W]`` canvas latents: [S | M_1..M_n | T] (sequence), [S | M_1..M_n] (prefix) or [T]
-                (target).
+            latent: ``[B, C, F, H, W]`` canvas latents or the ``[B, C, F, 1, sum(h_v * w_v)]`` strip of several views:
+                [S | M_1..M_n | T] (sequence), [S | M_1..M_n] (prefix) or [T] (target).
             video_timesteps: ``[B, F]`` raw per-frame timesteps: 0 on the sink and every memory latent, the step's t on
                 the target.
-            y / mask: ``[B, 1, 1, L, C_text]`` caption embeddings and ``[B, 1, L]`` key mask (G = 1).
+            y / mask: ``[B, G, 1, L, C_text]`` caption embeddings and ``[B, G, L]`` key mask: G = 1 on the canvas,
+                G = V + 1 on the strip (one prompt per view, then the robot group).
             form: ``sequence`` | ``prefix`` | ``target``.
             model_fps: the batch fps (25 for RoboDojo).
             robot: ``state80`` / ``state_mask80`` ``[B, 80]``, ``action80`` / ``action_mask80`` ``[B, C, 80]`` and
@@ -291,18 +354,23 @@ class SMPolicyModel(PolicyModel):
                 ``SoftmaxCache(commit=True)``) and the target (the prefix's: ``GDNCache(seed=...)`` /
                 ``SoftmaxCache(prefix=...)``); None for the sequence.
             memory_latents: n of a target forward (its frame n + 1, its rows from step 32n).
+            view_shapes / view_slot_ids: the strip's per-view latent (h, w) and semantic 2x2 slots (Sana
+                ``view_latent_shape`` / ``view_slot_ids``); None (or one view) reads the latent's own grid.
 
         Returns:
-            ``{}`` for the prefix; else ``{"x": [B, C, F, H, W] velocity, "action_pred": [B, C, 80] velocity}``.
+            ``{}`` for the prefix; else ``{"x": velocity in the latent's layout, "action_pred": [B, C, 80] velocity}``.
+
+        Several views run as Sana's ``_sparse_memory_layers`` runs them: embedded view-major, gathered into strip order
+        (latent by latent, its views in order, the robot rows last) so that one chunk holds one latent of every view,
+        and gathered back after the trunk; the per-token cross-attention reads its prompt group in view-major order.
         """
 
         if self.training:
             raise RuntimeError("the sparse-memory mirror is inference-only; call eval()")
         if latent.ndim != 5:
-            raise ValueError(f"latent must be [B, C, F, H, W], got {tuple(latent.shape)}")
+            raise ValueError(f"latent must be [B, C, F, H, W] or the strip [B, C, F, 1, S], got {tuple(latent.shape)}")
         if form != sm.FORM_TARGET and memory_latents is not None:
             raise ValueError("memory_latents places a target forward; the sequence and the prefix count their own latents")
-        layout = sm.form_layout(form, latent.shape[2] // self.patch_size[0], memory_latents)
         batch = latent.shape[0]
         device = latent.device
         x = latent.to(self.dtype)
@@ -312,14 +380,26 @@ class SMPolicyModel(PolicyModel):
             x.shape[-2] // self.patch_size[1],
             x.shape[-1] // self.patch_size[2],
         )
-        if self.h * self.w != sm.TOKENS_PER_FRAME:
-            raise ValueError(
-                f"a sparse-memory latent frame holds {sm.TOKENS_PER_FRAME} tokens (the chunk bounds), got {self.h} x {self.w}"
-            )
+        if view_shapes is None or len(view_shapes) == 1:
+            if view_shapes is not None and tuple(int(v) for v in view_shapes[0]) != (self.h, self.w):
+                raise ValueError(f"one view of latent shape {tuple(view_shapes[0])} on a {self.h} x {self.w} grid")
+            view_shapes, view_slot_ids, strip = ((self.h, self.w),), (0,), False
+        else:
+            view_shapes = tuple((int(height), int(width)) for height, width in view_shapes)
+            view_slot_ids = tuple(int(slot) for slot in view_slot_ids)
+            if len(view_slot_ids) != len(view_shapes):
+                raise ValueError(f"{len(view_shapes)} views need as many slot ids, got {view_slot_ids}")
+            if tuple(self.patch_size) != (1, 1, 1) or self.h != 1 or self.w != sum(h * w for h, w in view_shapes):
+                raise ValueError(
+                    f"a strip of the views {view_shapes} is [B, C, F, 1, {sum(h * w for h, w in view_shapes)}] at patch "
+                    f"size 1, got {tuple(latent.shape)} at patch size {tuple(self.patch_size)}"
+                )
+            strip = True
+        frame_tokens = self.h * self.w
+        layout = sm.form_layout(form, self.f, memory_latents, frame_tokens)
         if (robot is None) != (layout["rows"] == 0):
             raise ValueError(f"a {form} forward carries {layout['rows']} robot rows; robot={'given' if robot else None}")
-        self._check_caches(form, caches, layout["memory_latents"])
-        view_shapes = ((self.h, self.w),)
+        self._check_caches(form, caches, layout["memory_latents"], frame_tokens)
         timesteps = torch.as_tensor(video_timesteps, device=device).reshape(batch, -1)
         if timesteps.shape[1] != self.f:
             raise ValueError(f"video_timesteps carries {timesteps.shape[1]} frames for a {self.f}-frame forward")
@@ -331,7 +411,7 @@ class SMPolicyModel(PolicyModel):
         video = strip_to_view_tokens(self.x_embedder(x), self.f, view_shapes)
         n_video = video.shape[1]
         video_timestep = strip_to_view_tokens(
-            self._to_model_t_domain(timesteps).repeat_interleave(self.h * self.w, dim=1), self.f, view_shapes
+            self._to_model_t_domain(timesteps).repeat_interleave(frame_tokens, dim=1), self.f, view_shapes
         )
         if robot is None:
             tokens = video
@@ -364,26 +444,46 @@ class SMPolicyModel(PolicyModel):
             raise ValueError(f"a {form} forward holds {layout['bounds'][-1]} tokens, got {tokens.shape[1]}")
 
         fps = PhysicalTimeWanRotaryPosEmbed._normalize_fps(model_fps, batch, device)
-        rope_linear = self.sm_rope(
-            self.rope_linear, fps, layout["phi"], self.h, self.w, layout["rows"], layout["step_offset"], device
-        )
-        rope_softmax = self.sm_rope(
-            self.rope_softmax, fps, layout["phi"], self.h, self.w, layout["rows"], layout["step_offset"], device
-        )
+        rope_args = (fps, layout["phi"], view_shapes, view_slot_ids, layout["rows"], layout["step_offset"], device)
+        rope_linear = self.sm_rope(self.rope_linear, *rope_args)
+        rope_softmax = self.sm_rope(self.rope_softmax, *rope_args)
         time_embedding = self.t_embedder(token_timestep.flatten()).unflatten(0, token_timestep.shape)
         modulation = self.t_block(time_embedding)
         text, text_mask = self._grouped_text_condition(y, mask)
-        if text.shape[1] != 1:
+        if not strip and text.shape[1] != 1:
             raise ValueError(f"the one-view canvas carries ONE prompt row (G = 1), got G={text.shape[1]}")
-        hidden = self._sm_trunk(tokens, text, modulation, text_mask, rope_linear, rope_softmax, layout["bounds"], caches)
+        text, text_mask, spans = self._text_spans(text, text_mask, view_shapes, self.f, layout["rows"])
+        text_order = None
+        if strip:
+            # Sana ``_strip_order``: the view-major tokens in strip order, the robot rows last
+            order = torch.cat(
+                (
+                    view_to_strip_tokens(torch.arange(n_video, device=device)[None, :, None], self.f, view_shapes)[0, :, 0],
+                    torch.arange(n_video, tokens.shape[1], device=device),
+                )
+            )
+            text_order = (torch.argsort(order), order)
+            tokens = tokens.index_select(1, order)
+            modulation = modulation.index_select(2, order)
+            rope_linear = rope_linear.index_select(2, order)
+            rope_softmax = rope_softmax.index_select(2, order)
+        hidden = self._sm_trunk(
+            tokens, text, modulation, text_mask, rope_linear, rope_softmax, layout["bounds"], caches, spans, text_order
+        )
         if robot is None:
             return {}
+        if text_order is not None:
+            hidden = hidden.index_select(1, text_order[0])
         video_tokens = self.final_layer(hidden[:, :n_video], time_embedding[:, :, :n_video])
         video_tokens = view_to_strip_tokens(video_tokens, self.f, view_shapes)
         action_pred = self.action_head(hidden[:, n_video + 1 :], time_embedding[:, :, n_video + 1 :]).masked_fill(
             ~action_mask, 0
         )
-        return {"x": self.unpatchify(video_tokens), "action_pred": action_pred}
+        if strip:
+            velocity = video_tokens.unflatten(1, (self.f, frame_tokens)).permute(0, 3, 1, 2).unsqueeze(3)
+        else:
+            velocity = self.unpatchify(video_tokens)
+        return {"x": velocity, "action_pred": action_pred}
 
 
 def build_sm_policy(
@@ -400,4 +500,4 @@ def build_sm_policy(
     return model.to(device=device, dtype=dtype).eval()
 
 
-__all__ = ["GDN_RECURRENCE_KEYS", "SMPolicyModel", "build_sm_policy"]
+__all__ = ["GDN_RECURRENCE_KEYS", "SMPolicyModel", "ViewShapes", "build_sm_policy", "view_token_counts"]

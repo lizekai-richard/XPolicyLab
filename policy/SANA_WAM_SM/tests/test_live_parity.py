@@ -2,7 +2,9 @@
 
 The live class and the mirror get identical random weights (tiny dims, fp64, CPU, xformers off, ``flash_attn`` bound to an
 fp64 reference varlen as Sana's own tests do; softmax attention in fp64 on both sides). Checked, for both memory types
-(strided s = 25, fixed m = 16) and n = 0, 1, 3 memory latents:
+(strided m = 16, s = 16 and global m = 16), n = 0, 1, 3 memory latents and both layouts (the 10 x 16 sana_pixel canvas
+with one prompt group; the sana_latent strip of three 8 x 10 views at the semantic slots (0, 2, 3) with four prompt
+groups of different lengths):
 
 * the training forward (``model(x, t, y, data_info)`` on [S | M_1..M_n | T] + rows) == ``forward_sm(form='sequence')``,
   every token;
@@ -37,8 +39,13 @@ from sana_wam_min.policy_model.config import PolicyConfig
 FPS = 25.0
 C_LAT = 4
 GRID = (10, 16)
+VIEWS = ((8, 10), (8, 10), (8, 10))
+VIEW_SLOTS = (0, 2, 3)
+GROUP_TOKENS = (2, 3, 4, 5)
+LAYOUTS = ("canvas", "sana_latent")
 TEXT_LEN, TEXT_CH = 7, 16
-MEMORIES = {"strided": {"memory_type": "strided", "memory_stride": 25}, "fixed": {"memory_type": "fixed", "memory_frames": 16}}
+MEMORIES = {"strided": {"memory_type": "strided", "memory_frames": 16, "memory_stride": 16},
+            "global": {"memory_type": "global", "memory_frames": 16}}
 CLOSE = {"rtol": 1e-9, "atol": 1e-12}
 # prefix + target vs the whole sequence: the matmuls run on fewer rows (Sana's own bound is 1e-12 / 1e-14)
 ROUND_OFF = {"rtol": 1e-10, "atol": 1e-12}
@@ -59,8 +66,9 @@ class _Cfg(SimpleNamespace):
 class Twins:
     """A tiny live sparse-memory policy and the mirror with the same weights (fp64)."""
 
-    def __init__(self, memory, *, separate=True, depth=4, seed=7):
+    def __init__(self, memory, *, separate=True, depth=4, seed=7, layout="canvas"):
         net = _live.live_causal()
+        self.strip = layout == "sana_latent"
         Live = net.SanaRWMVideoQwenNextSubAttnResV2SelfFlowWorldModelCameraConditionMultiViewCausal
         self.memory = dict(memory)
         torch.manual_seed(seed)
@@ -71,9 +79,10 @@ class Twins:
         )
         policy = {"actions_per_chunk": {str(int(FPS)): sm.CHUNK_ROWS}, **memory}
         config = _Cfg(
-            model=_Cfg(extra={"chunk_causal_policy": policy, "rope": "aligned"}),
+            # the (8, 16) semantic tile of every robot_sft config (sana_wam_min strip_spatial_rope_tile_shape_from_train_config)
+            model=_Cfg(extra={"chunk_causal_policy": policy, "rope": "aligned"}, multiview_spatial_rope_tile_shape=(8, 16)),
             scheduler=_Cfg(action_flow_shift=1.0 if separate else None),
-            data=_Cfg(extra={"multiview": "sana_pixel"}),
+            data=_Cfg(extra={"multiview": "sana_latent" if self.strip else "sana_pixel"}),
             vae=_Cfg(vae_stride=[8, 32, 32]),
         )
         self.live = Live(config=config, **kwargs)
@@ -85,10 +94,13 @@ class Twins:
         contract = SMContract(
             actions_per_chunk=sm.CHUNK_ROWS, video_frame_stride=4, memory_type=memory["memory_type"],
             memory_frames=memory.get("memory_frames"), memory_stride=memory.get("memory_stride"), model_fps=FPS,
-            tier_num_frames=33, trained_memory_latents=8, multiview="sana_pixel", visual_layout="sana_pixel_canvas",
+            tier_num_frames=33, trained_memory_latents=8, multiview="sana_latent" if self.strip else "sana_pixel",
+            visual_layout="three_view_strip" if self.strip else "sana_pixel_canvas",
             rope="aligned", dt_bias_init=-5.0, a_log_init=0.0, reset_legacy_beta=False,
         )
-        self.mirror = SMPolicyModel(PolicyConfig.from_sana_kwargs(config=config, **kwargs), contract)
+        policy_config = PolicyConfig.from_sana_kwargs(config=config, **kwargs)
+        assert tuple(policy_config.multiview_spatial_rope_tile_shape) == tuple(self.live.multiview_spatial_rope_tile_shape) == (8, 16)
+        self.mirror = SMPolicyModel(policy_config, contract)
         state = {k: v for k, v in self.live.state_dict().items()
                  if k not in ("pos_embed", "y_embedder.y_embedding", "plucker_embed.weight")}
         result = self.mirror.load_state_dict(state, strict=True)
@@ -104,11 +116,15 @@ class Twins:
             return torch.randn(*shape, generator=g, dtype=torch.float64)
 
         self.randn = randn
-        self.y = randn(1, 1, 1, TEXT_LEN, TEXT_CH)
-        self.y_null = randn(1, 1, 1, TEXT_LEN, TEXT_CH)
-        self.mask = torch.ones(1, 1, TEXT_LEN, dtype=torch.int16)
-        self.mask[..., 5:] = 0
-        self.latents = randn(1, C_LAT, 5, *GRID)          # [S | M_1..M_3 | T] at most
+        groups = len(VIEWS) + 1 if self.strip else 1
+        self.y = randn(1, groups, 1, TEXT_LEN, TEXT_CH)
+        self.y_null = randn(1, groups, 1, TEXT_LEN, TEXT_CH)
+        self.mask = torch.zeros(1, groups, TEXT_LEN, dtype=torch.int16)
+        for group in range(groups):
+            self.mask[:, group, : GROUP_TOKENS[group] if self.strip else 5] = 1
+        # [S | M_1..M_3 | T] at most: the canvas grid, or the strip [1, C, F, 1, sum(h_v * w_v)]
+        self.latents = randn(1, C_LAT, 5, 1, sum(h * w for h, w in VIEWS)) if self.strip else randn(1, C_LAT, 5, *GRID)
+        self.views = {"view_shapes": VIEWS, "view_slot_ids": VIEW_SLOTS} if self.strip else {}
         self.action = randn(1, sm.CHUNK_ROWS, 80)
         self.state = randn(1, 80)
         self.t_video = 700.0
@@ -127,6 +143,12 @@ class Twins:
             "view_latent_shape": torch.tensor([[list(GRID)]]),
             "video_frame_stride": torch.tensor([4]),
         }
+        if self.strip:
+            info.update(
+                view_count=torch.tensor([len(VIEWS)]),
+                view_latent_shape=torch.tensor([[list(shape) for shape in VIEWS]]),
+                view_slot_ids=torch.tensor([list(VIEW_SLOTS)]),
+            )
         if robot:
             info.update(
                 action80=self.action,
@@ -160,7 +182,7 @@ class Twins:
         x = self.x(n) if x is None else x
         return self.mirror.forward_sm(
             x, self.timesteps(x.shape[2])[:, 0], self.y, self.mask, form=sm.FORM_SEQUENCE, model_fps=FPS,
-            robot=self.robot(),
+            robot=self.robot(), **self.views,
         )
 
     def live_deploy(self, n):
@@ -177,7 +199,7 @@ class Twins:
         caches = [GDNCache(commit=True) if b.attn_type == GDN_KIND else SoftmaxCache(commit=True) for b in self.mirror.blocks]
         out = self.mirror.forward_sm(
             self.x(n)[:, :, :-1], torch.zeros(1, n + 1, dtype=torch.float64), self.y, self.mask, form=sm.FORM_PREFIX,
-            model_fps=FPS, caches=caches,
+            model_fps=FPS, caches=caches, **self.views,
         )
         assert out == {}
         return caches
@@ -186,17 +208,18 @@ class Twins:
         caches = [GDNCache(seed=c.out) if isinstance(c, GDNCache) else SoftmaxCache(prefix=c.out) for c in prefix_caches]
         return self.mirror.forward_sm(
             self.x(n)[:, :, -1:], torch.full((1, 1), self.t_video, dtype=torch.float64), self.y, self.mask,
-            form=sm.FORM_TARGET, model_fps=FPS, robot=self.robot(), caches=caches, memory_latents=n,
+            form=sm.FORM_TARGET, model_fps=FPS, robot=self.robot(), caches=caches, memory_latents=n, **self.views,
         )
 
 
 # -- the forwards ---------------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize("memory", MEMORIES.values(), ids=list(MEMORIES))
 @pytest.mark.parametrize("n", [0, 1, 3])
-def test_the_sequence_is_the_live_training_forward(memory, n):
-    twins = Twins(memory)
+def test_the_sequence_is_the_live_training_forward(memory, n, layout):
+    twins = Twins(memory, layout=layout)
     live, ours = twins.live_sequence(n), twins.mirror_sequence(n)
     torch.testing.assert_close(ours["x"], live["x"].reshape(ours["x"].shape), **CLOSE)
     torch.testing.assert_close(ours["action_pred"], live["action_pred"], **CLOSE)
@@ -209,10 +232,11 @@ def test_a_shared_schedule_runs_too():
     torch.testing.assert_close(ours["action_pred"], live["action_pred"], **CLOSE)
 
 
+@pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize("memory", MEMORIES.values(), ids=list(MEMORIES))
 @pytest.mark.parametrize("n", [0, 1, 3])
-def test_the_prefix_and_the_target_are_the_live_deploy_entries(memory, n):
-    twins = Twins(memory)
+def test_the_prefix_and_the_target_are_the_live_deploy_entries(memory, n, layout):
+    twins = Twins(memory, layout=layout)
     live, live_caches = twins.live_deploy(n)
     prefix = twins.mirror_prefix(n)
     ours = twins.mirror_target(n, prefix)
@@ -225,15 +249,17 @@ def test_the_prefix_and_the_target_are_the_live_deploy_entries(memory, n):
             torch.testing.assert_close(cache.out[1], held["z"], **CLOSE)
         else:
             assert set(held) == {"k", "v"}
-            assert cache.out[0].shape == held["k"].shape == (1, sm.TOKENS_PER_FRAME * (n + 1), 2, 32)
+            frame_tokens = sum(h * w for h, w in VIEWS) if twins.strip else sm.TOKENS_PER_FRAME
+            assert cache.out[0].shape == held["k"].shape == (1, frame_tokens * (n + 1), 2, 32)
             torch.testing.assert_close(cache.out[0], held["k"], **CLOSE, msg=lambda m: f"layer {index} k: {m}")
             torch.testing.assert_close(cache.out[1], held["v"], **CLOSE, msg=lambda m: f"layer {index} v: {m}")
 
 
+@pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize("memory", MEMORIES.values(), ids=list(MEMORIES))
 @pytest.mark.parametrize("n", [0, 1, 3])
-def test_the_prefix_and_the_target_reproduce_the_sequences_last_chunk(memory, n):
-    twins = Twins(memory)
+def test_the_prefix_and_the_target_reproduce_the_sequences_last_chunk(memory, n, layout):
+    twins = Twins(memory, layout=layout)
     sequence = twins.mirror_sequence(n)
     prefix = twins.mirror_prefix(n)
     reads = [twins.mirror_target(n, prefix) for _ in range(2)]
@@ -242,21 +268,24 @@ def test_the_prefix_and_the_target_reproduce_the_sequences_last_chunk(memory, n)
     torch.testing.assert_close(reads[0]["action_pred"], sequence["action_pred"], **ROUND_OFF)
 
 
-def test_the_sink_and_memory_latents_never_read_the_last_chunk():
-    twins = Twins(MEMORIES["strided"])
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_the_sink_and_memory_latents_never_read_the_last_chunk(layout):
+    twins = Twins(MEMORIES["strided"], layout=layout)
     reference = twins.mirror_sequence(3)
     edited = twins.x(3).clone()
     edited[:, :, -1] += 1.0
     twins.action = twins.action + 1.0
     twins.state = twins.state + 1.0
     twins.t_action, twins.t_video = 123.0, 321.0
+    if twins.strip:
+        twins.y[:, len(VIEWS)] += 1.0     # the robot group reaches the robot rows alone
     out = twins.mirror_sequence(3, edited)
     torch.testing.assert_close(out["x"][:, :, :-1], reference["x"][:, :, :-1], **EXACT)
     assert not torch.equal(out["x"][:, :, -1:], reference["x"][:, :, -1:])
 
 
 def test_the_forms_are_checked():
-    twins = Twins(MEMORIES["fixed"])
+    twins = Twins(MEMORIES["global"])
     mirror = twins.mirror
     x = twins.x(2)
     with pytest.raises(ValueError, match="only the target"):
@@ -279,9 +308,15 @@ def test_the_forms_are_checked():
     with pytest.raises(ValueError, match="memory_latents places"):
         mirror.forward_sm(x, twins.timesteps(4)[:, 0], twins.y, twins.mask, form=sm.FORM_SEQUENCE, model_fps=FPS,
                           robot=twins.robot(), memory_latents=2)
-    with pytest.raises(ValueError, match="160 tokens"):
-        mirror.forward_sm(x[..., :8], twins.timesteps(4)[:, 0], twins.y, twins.mask, form=sm.FORM_SEQUENCE,
-                          model_fps=FPS, robot=twins.robot())
+    with pytest.raises(ValueError, match="ONE prompt row"):
+        mirror.forward_sm(x, twins.timesteps(4)[:, 0], twins.y.expand(1, 2, 1, -1, -1), twins.mask.expand(1, 2, -1),
+                          form=sm.FORM_SEQUENCE, model_fps=FPS, robot=twins.robot())
+    with pytest.raises(ValueError, match="one view of latent shape"):
+        mirror.forward_sm(x, twins.timesteps(4)[:, 0], twins.y, twins.mask, form=sm.FORM_SEQUENCE, model_fps=FPS,
+                          robot=twins.robot(), view_shapes=((8, 10),))
+    with pytest.raises(ValueError, match="a strip of the views"):
+        mirror.forward_sm(x, twins.timesteps(4)[:, 0], twins.y, twins.mask, form=sm.FORM_SEQUENCE, model_fps=FPS,
+                          robot=twins.robot(), view_shapes=((8, 10),) * 2, view_slot_ids=(0, 2))
 
 
 # -- the session --------------------------------------------------------------------------------------------------------
@@ -298,16 +333,18 @@ def _sessions(twins, cfg_scale, action_cfg_scale, steps=3):
             twins.mirror, caption=Caption(twins.y, twins.mask), unconditional_caption=Caption(twins.y_null, twins.mask),
             steps=steps, flow_shift=5.0, action_flow_shift=1.0, video_cfg_scale=cfg_scale,
             action_cfg_scale=1.0 if action_cfg_scale is None else action_cfg_scale, model_fps=FPS, deploy_form=form,
+            view_slot_ids=VIEW_SLOTS if twins.strip else (0,),
         )
         for form in (DEPLOY_CACHED, DEPLOY_UNCACHED)
     }
     return live, ours
 
 
+@pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize("memory", MEMORIES.values(), ids=list(MEMORIES))
 @pytest.mark.parametrize("cfg_scale, action_cfg_scale", [(1.0, None), (2.0, 1.5), (6.0, None)])
-def test_a_decision_is_the_live_sessions(memory, cfg_scale, action_cfg_scale):
-    twins = Twins(memory)
+def test_a_decision_is_the_live_sessions(memory, cfg_scale, action_cfg_scale, layout):
+    twins = Twins(memory, layout=layout)
     live, ours = _sessions(twins, cfg_scale, action_cfg_scale)
     prefix = twins.x(2)[:, :, :-1]
     action_mask = torch.ones(1, sm.CHUNK_ROWS, 80, dtype=torch.bool)
@@ -318,15 +355,16 @@ def test_a_decision_is_the_live_sessions(memory, cfg_scale, action_cfg_scale):
         DEPLOY_UNCACHED: live.decide_uncached(prefix, generator=torch.Generator().manual_seed(9), **state),
     }
     for form, session in ours.items():
-        action, target = session.decide(prefix, generator=torch.Generator().manual_seed(9), **state)
+        views = VIEWS if twins.strip else None
+        action, target = session.decide(prefix, view_shapes=views, generator=torch.Generator().manual_seed(9), **state)
         torch.testing.assert_close(target, reference[form][1], **CLOSE, msg=lambda m: f"{form} target: {m}")
         torch.testing.assert_close(action, reference[form][0], **CLOSE, msg=lambda m: f"{form} action: {m}")
-        assert target.shape == (1, C_LAT, 1, *GRID) and action.shape == (1, sm.CHUNK_ROWS, 80)
+        assert target.shape == (1, C_LAT, 1, *prefix.shape[3:]) and action.shape == (1, sm.CHUNK_ROWS, 80)
         assert not bool(action[..., 66:].any()) and session.decision == 1
 
 
-def test_a_session_refuses_a_fixed_prefix_of_another_size():
-    twins = Twins(MEMORIES["fixed"])
+def test_a_session_refuses_a_prefix_of_another_size():
+    twins = Twins(MEMORIES["global"])
     _, ours = _sessions(twins, 6.0, None)
     mask = torch.ones(1, sm.CHUNK_ROWS, 80, dtype=torch.bool)
     with pytest.raises(ValueError, match="holds 2 latents, the prefix 3"):
