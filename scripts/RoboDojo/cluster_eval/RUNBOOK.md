@@ -22,12 +22,23 @@ only execute what `deploy.sh` put on their shared home. Paths below use the site
 | run | one checkpoint x one seed over the complete protocol: 42 tasks / 54 task configs / 2100 episodes, 95 units | `eval/master.py` driven by `eval/run.sh` |
 | campaign | one or more checkpoints x seeds 0, 1, 2, one seed at a time on every free GPU, then the 3-seed tables | `eval/campaign.sh <def>` with a definition `eval/defs/*.env` |
 
-The protocol (arXiv:2607.04434 s3.1.3, RoboDojo pinned at `726e9aa`): 42 tasks in 5 dimensions (Generalization 12,
+The protocol (arXiv:2607.04434 s3.1.3, RoboDojo pinned at `09bd5f5` since 2026-10-18, `726e9aa` before): 42 tasks in 5 dimensions (Generalization 12,
 Precision 8, Long-Horizon 8, Memory 6, Open 8); 50 episodes per task, a Generalization task being 25 standard + 25 on its
 `_random` variant, so one seed = 54 task configs = 2100 episodes; seeds 0, 1 and 2. Success rate and score per task;
 dimension = mean over its tasks; **overall = mean of the five dimension means** (the official `summarize_result.py`).
 The tasks whose extra arms are all `type: support` (make_kong, play_tic_tac_toe, imitate_sorting_sequence) are always
 included (`--support-arm-embodiments on`).
+
+**Pin history.** `2184bf8` (2026-08-23, `node/install_node.sh`) -> `726e9aa` (2026-09-22, `node/node_pin_726e9aa.sh`) -> `09bd5f5`
+(2026-10-12 upstream, `node/node_pin_09bd5f5.sh`). The last step is five upstream commits, of which only PR #48 (`487e425`)
+changes the simulation: it makes `reset_drive_targets()` push the restored drive targets to PhysX (the same correction as
+the `robodojo_spring_button_reset.patch` of the VPP2 repository). Before it, the rest pose of a SpringButton was the "sagged"
+pose captured at scene setup: the button of `swap_blocks` rested at joint ratio 0.79 in every traced episode, so the release (> 0.9)
+and press-transition (> 0.95) checks of its reward cannot hold and `swap_blocks` cannot succeed (SR and score 0.00 in every run
+we have); `press_by_number` (buttons rest at 1.0) is unaffected. Measured on one checkpoint with the same layouts: swap_blocks 0/50 -> 23/50, press_by_number
+20/50 -> 18/50 (noise). So every run made on the 726e9aa pin has `swap_blocks` = 0 (its Memory / overall numbers are low by that task's share);
+runs on 09bd5f5 are not comparable with them on that task. Apply the pin with `bash node/node_pin_09bd5f5.sh`
+and check it with `node/node_pin_verify.sh`.
 
 ## 1. One-time setup of a site
 
@@ -35,7 +46,7 @@ included (`--support-arm-embodiments on`).
 
 - bash, rsync, ssh keys that log into every node non-interactively (`ssh -o BatchMode=yes <user>@<node><domain>` must work).
 - A python 3 with `pyyaml` (`CE_PY`).
-- A RoboDojo checkout at `726e9aa` (`CE_ROBODOJO_CHECKOUT`): the master plans the tasks from it, `summarize_result.py`
+- A RoboDojo checkout at `09bd5f5` (`CE_ROBODOJO_CHECKOUT`): the master plans the tasks from it, `summarize_result.py`
   writes the official tables from it, `deploy.sh` copies its `env_cfg/` to the shared home.
 - This XPolicyLab checkout (the adapters are deployed from it).
 
@@ -57,7 +68,7 @@ Each node needs, under `CE_NODE_ROOT`:
 
 | file | exports | built by |
 |---|---|---|
-| `activate.sh` | `SANA_SIM_PY` (the Isaac Sim / RoboDojo python), `ROBODOJO_CHECKOUT` (RoboDojo at `726e9aa`, with its `Assets`) | `node/install_node.sh` (Isaac Sim 5.1 + IsaacLab + curobo, python 3.11; resumable steps, `--only <step>`), then `node/node_pin_726e9aa.sh` |
+| `activate.sh` | `SANA_SIM_PY` (the Isaac Sim / RoboDojo python), `ROBODOJO_CHECKOUT` (RoboDojo at `09bd5f5`, with its `Assets`) | `node/install_node.sh` (Isaac Sim 5.1 + IsaacLab + curobo, python 3.11; resumable steps, `--only <step>`), then `node/node_pin_09bd5f5.sh` (a fresh node fast-forwards straight from the install pin) |
 | `activate_sana_wam.sh` | `SANA_PY` (the policy-server python) | `node/install_sana_wam.sh`, or by hand per `policy/SANA_WAM/INSTALLATION.md` section 1 (one env serves SANA_WAM, SANA_MOT, SANA_WAM_CAUSAL and SANA_WAM_SM) |
 
 Never run two conda installers concurrently on one node. One single-GPU slot needs ~25 of 48 GB (policy server ~17 GB +

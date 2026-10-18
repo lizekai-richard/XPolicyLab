@@ -2,7 +2,7 @@
 
 Every table below is produced by a script in this directory, so two campaigns run from this checkout report in the same
 format. The official numbers always come from RoboDojo's own `scripts/internal/summarize_result.py` (pinned checkout
-`726e9aa`). Nothing is hand-edited.
+`09bd5f5`; runs made on the earlier `726e9aa` pin cannot succeed on `swap_blocks`, see RUNBOOK.md "Pin history"). Nothing is hand-edited.
 
 ## Names
 
