@@ -62,7 +62,8 @@ view_resize: null
 # and gripper targets are absolute future targets" for the EEF-only absolute line). Sana rwm/sparse-memory db382ee90
 # (2026-10-17) changed it for every later run to "robot_base_eef; end-effector targets are absolute future poses expressed
 # in the robot base frame" (the sana_latent m8s25 run among them), and no config key tells the two apart: set the
-# checkpoint's own sentence (its README).
+# checkpoint's own sentence (its README). A sentence can also be named (sana_wam_sm.runtime.ACTION_MODE_TEXT_PRESETS), the
+# form an eval-worker override needs (the workers split overrides on whitespace): action_mode_text=db382ee90 is the one above.
 action_mode_text: null
 diffusion_seed_base: 20261012
 eef_pose_check: true

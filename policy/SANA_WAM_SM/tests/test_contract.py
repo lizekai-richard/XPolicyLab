@@ -252,3 +252,9 @@ def test_the_action_mode_sentence_can_be_the_checkpoints_own():
     assert frontend.action_mode_text == short and not frontend._prompt_cache
     with pytest.raises(ValueError, match="empty"):
         apply_action_mode_text(frontend, " . ")
+    # a deploy override is one whitespace-free token, so the sentence goes by the name of its Sana commit
+    from sana_wam_sm.runtime import ACTION_MODE_TEXT_PRESETS
+
+    frontend.action_mode_text, frontend._prompt_cache = table, OrderedDict(old=1)
+    assert apply_action_mode_text(frontend, "db382ee90") == "deploy" and frontend.action_mode_text == short
+    assert ACTION_MODE_TEXT_PRESETS["db382ee90"] == short and not frontend._prompt_cache

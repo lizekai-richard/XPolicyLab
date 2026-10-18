@@ -48,14 +48,24 @@ from .session import Caption, SMSession  # noqa: E402
 from .vae_encode import canvas_uint8, encode_views, views_uint8  # noqa: E402
 
 
+# Action Mode sentences named by the Sana commit that introduced them: a deploy override is a whitespace-free key=value token
+# (the eval workers split their override string on whitespace), so a sentence is passed by name, e.g. action_mode_text=db382ee90
+ACTION_MODE_TEXT_PRESETS = {
+    # rwm/sparse-memory db382ee90 (2026-10-17): the absolute-EEF sentence of every run trained after it (the sana_latent m8s25 run)
+    "db382ee90": "robot_base_eef; end-effector targets are absolute future poses expressed in the robot base frame",
+}
+
+
 def apply_action_mode_text(frontend, action_mode_text: Optional[str]) -> str:
-    """Put a checkpoint's own Action Mode sentence on the front-end (dropping a trailing period: the field renderer adds
-    one) and drop the prompts it cached; returns the sentence's source, ``deploy`` or ``table`` (None keeps the
-    sentence the front-end rendered from the training yaml's modes)."""
+    """Put a checkpoint's own Action Mode sentence on the front-end (a sentence, or the name of one in
+    ``ACTION_MODE_TEXT_PRESETS``; a trailing period is dropped: the field renderer adds one) and drop the prompts it cached;
+    returns the sentence's source, ``deploy`` or ``table`` (None keeps the sentence the front-end rendered from the
+    training yaml's modes)."""
 
     if action_mode_text is None:
         return "table"
     text = str(action_mode_text).strip()
+    text = ACTION_MODE_TEXT_PRESETS.get(text, text)
     text = text[:-1].rstrip() if text.endswith(".") else text
     if not text:
         raise ValueError("action_mode_text is empty; null keeps the sentence of the training yaml's modes")
@@ -260,4 +270,4 @@ class SMRuntime:
         return latent, shapes
 
 
-__all__ = ["SMRuntime", "apply_action_mode_text"]
+__all__ = ["ACTION_MODE_TEXT_PRESETS", "SMRuntime", "apply_action_mode_text"]
