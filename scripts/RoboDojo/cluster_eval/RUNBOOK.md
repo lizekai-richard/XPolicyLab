@@ -47,8 +47,11 @@ put the figurine on the stand, place the mouse on the mouse pad, and push the ke
 RoboDojo data of `cfb06d1d` (2026-08-17) or earlier was trained on the old one. `ORGANIZE_TABLE_PROMPT=old` (in the environment of
 `eval/run.sh`, or as a knob of a campaign definition) serves such a checkpoint the old sentence: the run name gets `_oldorg`, so old
 and new runs of a checkpoint never mix, and the workers get `SANA_EVAL_ORGANIZE_TABLE_PROMPT=old`; an organize_table unit then builds
-its node-local workspace with a private copy of `task/` whose `organize_table.py` carries the old sentence (the pinned checkout is never
-touched; the unit fails with `prologue_fail` if the file carries neither sentence exactly once, i.e. upstream reworded it again).
+a node-local workspace of its OWN (`<CE_NODE_XPL_WS>_oldorg/<unit>.a<attempt>`) with a private copy of `task/` whose `organize_table.py`
+carries the old sentence. The shared workspace is never edited: it serves every other unit of the node at the same time, and a real
+`task/` directory there would be inherited by all of them (`ln -sfn` cannot replace a directory), so a worker refuses a shared
+workspace whose `task` is not the symlink (`prologue_fail`). The pinned checkout is never touched; the unit fails with `prologue_fail`
+if the file carries neither sentence exactly once, i.e. upstream reworded it again.
 The default is `new`, the simulator's own instruction (the official protocol). For the SANA adapters,
 `grep "instruction:" units/<unit>/a1/server/server.stdout.log` shows what the policy received.
 

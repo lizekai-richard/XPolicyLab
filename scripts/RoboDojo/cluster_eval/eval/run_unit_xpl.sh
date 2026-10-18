@@ -38,8 +38,11 @@
 #   SANA_EVAL_ORGANIZE_TABLE_PROMPT   new (default: the instruction the simulator gives) | old: an organize_table unit gets a node-local
 #                                copy of the pinned task/ whose organize_table.py carries the OLD instruction, the long sentence RoboDojo
 #                                gave before 726e9aa and the HF RoboDojo data <= cfb06d1d (2026-08-17) carries -- the training prompt of
-#                                every checkpoint trained on that data. The pinned checkout itself is never touched; eval/run.sh sets this
-#                                from ORGANIZE_TABLE_PROMPT and tags the run name _oldorg
+#                                every checkpoint trained on that data. The copy lives in a workspace of the unit's OWN
+#                                (<XPL_WS>_oldorg/<unit>.a<attempt>): the shared workspace serves every other unit of the node at the same
+#                                time, and a real task/ directory there would be inherited by all of them (ln -sfn cannot replace a
+#                                directory). The pinned checkout itself is never touched; eval/run.sh sets this from ORGANIZE_TABLE_PROMPT and
+#                                tags the run name _oldorg
 #   ROBODOJO_ROOT (default CE_NODE_ROOT), INSTALL_DIR (default this script's parent dir), SERVER_STARTUP_TIMEOUT (3000)
 # Site values: <INSTALL_DIR>/site.env (deploy.sh copies the active site configuration there; CE_SITE_NODE overrides).
 # Node runtime contract: $ROBODOJO_ROOT/activate.sh exports SANA_SIM_PY (the Isaac/RoboDojo python) and ROBODOJO_CHECKOUT
@@ -86,6 +89,9 @@ OT_PROMPT=${SANA_EVAL_ORGANIZE_TABLE_PROMPT:-new}
 [[ $OT_PROMPT == new || $OT_PROMPT == old ]] || { echo "SANA_EVAL_ORGANIZE_TABLE_PROMPT must be new or old, got '$OT_PROMPT'" >&2; exit 64; }
 [[ $RUN_ROOT == /*robodojo* ]] || { echo "RUN_ROOT must be an absolute path containing 'robodojo'" >&2; exit 64; }
 [[ $ATTEMPT =~ ^[0-9]+$ ]] || { echo "ATTEMPT must be an integer" >&2; exit 64; }
+if [[ $OT_PROMPT == old && $TASK == organize_table ]]; then
+  XPL_WS=${XPL_WS%/}_oldorg/$UNIT_ID.a$ATTEMPT   # a workspace of this unit's own (see SANA_EVAL_ORGANIZE_TABLE_PROMPT)
+fi
 
 U=$RUN_ROOT/units/$UNIT_ID
 A=$U/a$ATTEMPT
@@ -315,7 +321,7 @@ build_workspace() { # node-local RoboDojo workspace = the pinned checkout by sym
   ln -sfn "$XPL_ROOT" "$XPL_WS/XPolicyLab"
   mkdir -p "$XPL_WS/eval_result"
   if [[ $OT_PROMPT == old && $TASK == organize_table ]]; then
-    # the old training sentence: a private copy of task/ (the pinned checkout is shared and stays as it is)
+    # the old training sentence in a private copy of task/ (this workspace is the unit's own; the pinned checkout is untouched)
     rm -rf "$XPL_WS/task"; mkdir -p "$XPL_WS/task"; cp -a "$ROBODOJO_CHECKOUT/task/." "$XPL_WS/task/" || return 1
     "$PYBIN" - "$XPL_WS/task/RoboDojo/tasks/organize_table.py" <<'PY' || return 1
 import sys
@@ -330,7 +336,10 @@ elif text.count(NEW) == 1 and OLD not in text:
 else:
     sys.exit('organize_table.py carries neither known instruction exactly once (reworded upstream again?)')
 PY
-    log "organize_table prompt: OLD (node-local copy of task/)"
+    log "organize_table prompt: OLD (unit-private workspace $XPL_WS)"
+  elif [[ ! -L $XPL_WS/task ]]; then
+    # ln -sfn cannot replace a real directory: a private task/ left in a shared workspace would serve its edits to every unit
+    log "$XPL_WS/task is not the symlink to the pinned checkout's task/ (a private copy left behind?)"; return 1
   fi
   [[ -f $XPL_WS/env_cfg/$ENV_CFG_TYPE.yml && -f $XPL_WS/scripts/eval_policy.sh && -f $XPL_WS/src/eval_client/main.py && -f $XPL_WS/XPolicyLab/policy/$POLICY_NAME/deploy.yml ]]
 }
