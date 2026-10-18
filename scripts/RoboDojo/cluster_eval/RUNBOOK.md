@@ -40,6 +40,18 @@ we have); `press_by_number` (buttons rest at 1.0) is unaffected. Measured on one
 runs on 09bd5f5 are not comparable with them on that task. Apply the pin with `bash node/node_pin_09bd5f5.sh`
 and check it with `node/node_pin_verify.sh`.
 
+**organize_table prompt.** RoboDojo shortened the instruction of `organize_table` at `726e9aa` (2026-09-19; the HF data followed on
+2026-09-22). Old: "Place the mouse on the mouse pad, push the keyboard into the frame, put the figurine on the stand, place the alarm
+clock on the drawer, then open the drawer and put all remaining miscellaneous items inside." New: "Place the alarm clock on the drawer,
+put the figurine on the stand, place the mouse on the mouse pad, and push the keyboard into the frame." A checkpoint trained on the HF
+RoboDojo data of `cfb06d1d` (2026-08-17) or earlier was trained on the old one. `ORGANIZE_TABLE_PROMPT=old` (in the environment of
+`eval/run.sh`, or as a knob of a campaign definition) serves such a checkpoint the old sentence: the run name gets `_oldorg`, so old
+and new runs of a checkpoint never mix, and the workers get `SANA_EVAL_ORGANIZE_TABLE_PROMPT=old`; an organize_table unit then builds
+its node-local workspace with a private copy of `task/` whose `organize_table.py` carries the old sentence (the pinned checkout is never
+touched; the unit fails with `prologue_fail` if the file carries neither sentence exactly once, i.e. upstream reworded it again).
+The default is `new`, the simulator's own instruction (the official protocol). For the SANA adapters,
+`grep "instruction:" units/<unit>/a1/server/server.stdout.log` shows what the policy received.
+
 ## 1. One-time setup of a site
 
 ### 1.1 Control host

@@ -35,6 +35,11 @@
 #                                unit evaluates (EPS of them) out of LAYOUT_TOTAL. The official client's resume
 #                                manifest is pre-seeded with every other layout marked 'abandoned', so it runs
 #                                exactly these ids; _result.json then holds only these layouts.
+#   SANA_EVAL_ORGANIZE_TABLE_PROMPT   new (default: the instruction the simulator gives) | old: an organize_table unit gets a node-local
+#                                copy of the pinned task/ whose organize_table.py carries the OLD instruction, the long sentence RoboDojo
+#                                gave before 726e9aa and the HF RoboDojo data <= cfb06d1d (2026-08-17) carries -- the training prompt of
+#                                every checkpoint trained on that data. The pinned checkout itself is never touched; eval/run.sh sets this
+#                                from ORGANIZE_TABLE_PROMPT and tags the run name _oldorg
 #   ROBODOJO_ROOT (default CE_NODE_ROOT), INSTALL_DIR (default this script's parent dir), SERVER_STARTUP_TIMEOUT (3000)
 # Site values: <INSTALL_DIR>/site.env (deploy.sh copies the active site configuration there; CE_SITE_NODE overrides).
 # Node runtime contract: $ROBODOJO_ROOT/activate.sh exports SANA_SIM_PY (the Isaac/RoboDojo python) and ROBODOJO_CHECKOUT
@@ -77,6 +82,8 @@ case $POLICY_NAME in
   *)                 XPL_PYDEPS=${SANA_EVAL_XPL_PYDEPS:-} ;;
 esac
 ENV_CFG_TYPE=arx_x5
+OT_PROMPT=${SANA_EVAL_ORGANIZE_TABLE_PROMPT:-new}
+[[ $OT_PROMPT == new || $OT_PROMPT == old ]] || { echo "SANA_EVAL_ORGANIZE_TABLE_PROMPT must be new or old, got '$OT_PROMPT'" >&2; exit 64; }
 [[ $RUN_ROOT == /*robodojo* ]] || { echo "RUN_ROOT must be an absolute path containing 'robodojo'" >&2; exit 64; }
 [[ $ATTEMPT =~ ^[0-9]+$ ]] || { echo "ATTEMPT must be an integer" >&2; exit 64; }
 
@@ -307,6 +314,24 @@ build_workspace() { # node-local RoboDojo workspace = the pinned checkout by sym
   done
   ln -sfn "$XPL_ROOT" "$XPL_WS/XPolicyLab"
   mkdir -p "$XPL_WS/eval_result"
+  if [[ $OT_PROMPT == old && $TASK == organize_table ]]; then
+    # the old training sentence: a private copy of task/ (the pinned checkout is shared and stays as it is)
+    rm -rf "$XPL_WS/task"; mkdir -p "$XPL_WS/task"; cp -a "$ROBODOJO_CHECKOUT/task/." "$XPL_WS/task/" || return 1
+    "$PYBIN" - "$XPL_WS/task/RoboDojo/tasks/organize_table.py" <<'PY' || return 1
+import sys
+path = sys.argv[1]
+OLD = 'Place the mouse on the mouse pad, push the keyboard into the frame, put the figurine on the stand, place the alarm clock on the drawer, then open the drawer and put all remaining miscellaneous items inside.'
+NEW = 'Place the alarm clock on the drawer, put the figurine on the stand, place the mouse on the mouse pad, and push the keyboard into the frame.'
+text = open(path).read()
+if text.count(OLD) == 1 and NEW not in text:
+    print('organize_table.py already carries the old instruction')
+elif text.count(NEW) == 1 and OLD not in text:
+    open(path, 'w').write(text.replace(NEW, OLD))
+else:
+    sys.exit('organize_table.py carries neither known instruction exactly once (reworded upstream again?)')
+PY
+    log "organize_table prompt: OLD (node-local copy of task/)"
+  fi
   [[ -f $XPL_WS/env_cfg/$ENV_CFG_TYPE.yml && -f $XPL_WS/scripts/eval_policy.sh && -f $XPL_WS/src/eval_client/main.py && -f $XPL_WS/XPolicyLab/policy/$POLICY_NAME/deploy.yml ]]
 }
 
@@ -334,7 +359,7 @@ else
     echo "checkpoint_root=$CKPT"; echo "text_encoder_path=${TE_PATH:-}"; echo "vae_path=${VAE_PATH:-}"; echo "env_cfg_type=$ENV_CFG_TYPE"
     echo "policy_overrides=${POLICY_OVERRIDE_ARGS[*]:-}"
     echo "ws_policy_port=$RPC_PORT"; echo "server_python=$SERVER_PY"; echo "sim_python=$SANA_SIM_PY"; echo "eval_num=$EPS"; echo "seed=$SEED"
-    echo "extra_overrides=$XPL_EXTRA_OVERRIDES"; echo "action_type=$XPL_ACTION_TYPE"; echo "layout_ids=$LAYOUT_IDS"; echo "layout_total=$LAYOUT_TOTAL"
+    echo "extra_overrides=$XPL_EXTRA_OVERRIDES"; echo "action_type=$XPL_ACTION_TYPE"; echo "layout_ids=$LAYOUT_IDS"; echo "layout_total=$LAYOUT_TOTAL"; echo "organize_table_prompt=$OT_PROMPT"
     echo "deploy_yml_sha256=$(sha256sum "$XPL_ROOT/policy/$POLICY_NAME/deploy.yml" | cut -d' ' -f1)"
     echo "model_py_sha256=$(sha256sum "$XPL_ROOT/policy/$POLICY_NAME/model.py" | cut -d' ' -f1)"
   } >"$A/server/resolved_inputs.txt"

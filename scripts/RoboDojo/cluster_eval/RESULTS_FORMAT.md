@@ -9,7 +9,7 @@ format. The official numbers always come from RoboDojo's own `scripts/internal/s
 **Run** (one checkpoint, one eval seed), made by `eval/run.sh name`:
 
 ```
-official_seed<S>_<label>_xpl_vcfg<V>_acfg<A>_nfe<N>_<vfs<v>_afs<a> | fs<v>>_<ee|joint>[_eval<crop|stretch>][_nas<K>]
+official_seed<S>_<label>_xpl_vcfg<V>_acfg<A>_nfe<N>_<vfs<v>_afs<a> | fs<v>>_<ee|joint>[_oldorg][_eval<crop|stretch>][_nas<K>]
 ```
 
 Each field records one serving setting:
@@ -21,6 +21,8 @@ Each field records one serving setting:
 - `ee` / `joint` is how actions are executed.
 - `_eval<mode>` marks a view-resize A/B.
 - `_nas<K>` means only the first K of the 32 predicted targets are executed before replanning.
+- `_oldorg` means organize_table was given its OLD instruction (`ORGANIZE_TABLE_PROMPT=old`, see RUNBOOK.md "organize_table prompt"): the long sentence
+  of the HF RoboDojo data <= `cfb06d1d`, instead of the short one the simulator has given since `726e9aa`.
 
 **Unit**: `<task config>__s<seed>`. The suffixes mark how the unit was split:
 

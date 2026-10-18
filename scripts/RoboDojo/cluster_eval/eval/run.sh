@@ -21,9 +21,12 @@
 #   VIDEO_LAYOUT SANA_MOT only (default sana_pixel_canvas): asserts the checkpoint's video layout
 #   VIEW_RESIZE  crop | stretch: ONLY to force a view resize against the checkpoint's own (an A/B; run name _eval<mode>). By
 #                default the adapter stretches, and every label in eval/pre_stretch_labels.txt is served with the legacy crop
+#   ORGANIZE_TABLE_PROMPT  new (default: the instruction the simulator gives) | old: organize_table gets the OLD instruction -- the long
+#                sentence of RoboDojo before 726e9aa and of the HF RoboDojo data <= cfb06d1d (2026-08-17), the training prompt of the
+#                checkpoints trained on it (run name _oldorg; the worker edits a node-local copy of the pinned task/, see run_unit_xpl.sh)
 #   EXTRA_OVERRIDES  more space-separated deploy.yml key=value overrides (diagnostics, e.g. prediction_latent_dir=@ATTEMPT_DIR@/pred)
 #   RUN          the run name; default official_seed<SEED>_<label>_xpl_vcfg<V>_acfg<A>_nfe<N>_<vfs<v>_afs<a> | fs<v>>_<action
-#                type>[_eval<resize>][_nas<NAS>] -- the names of every published run
+#                type>[_oldorg][_eval<resize>][_nas<NAS>] -- the names of every published run
 #   SHARD_PLAN DIM_ORDER PIN_LONGEST EXTRA_MASTER_ARGS   master planning knobs (defaults below)
 #   BASELINES    run names `compare` puts next to this run
 #
@@ -83,7 +86,10 @@ VIEW_RESIZE=${VIEW_RESIZE:-}
 VR_TAG=""; [[ -n $VIEW_RESIZE && $VIEW_RESIZE != "$TRAINED_RESIZE" ]] && VR_TAG=_eval$VIEW_RESIZE
 if [[ -n $VIEW_RESIZE ]]; then VR_EXPECT="$VIEW_RESIZE (deploy)"; elif [[ $TRAINED_RESIZE == crop ]]; then VR_EXPECT="crop (deploy)"; else VR_EXPECT="stretch (default)"; fi
 FS_TAG=fs$VIDEO_FS; [[ -n $ACTION_FS ]] && FS_TAG=vfs${VIDEO_FS}_afs$ACTION_FS
-RUN=${RUN:-official_seed${SEED}_${CKPT_LABEL}_xpl_vcfg${VIDEO_CFG}_acfg${ACTION_CFG}_nfe${NFE}_${FS_TAG}_${ACTION_TYPE}${VR_TAG}${NAS:+_nas$NAS}}
+ORGANIZE_TABLE_PROMPT=${ORGANIZE_TABLE_PROMPT:-new}
+[[ $ORGANIZE_TABLE_PROMPT == new || $ORGANIZE_TABLE_PROMPT == old ]] || { echo "ORGANIZE_TABLE_PROMPT must be new or old, got '$ORGANIZE_TABLE_PROMPT'"; exit 2; }
+OT_TAG=""; if [[ $ORGANIZE_TABLE_PROMPT == old ]]; then OT_TAG=_oldorg; WORKER_ENV="${WORKER_ENV:+$WORKER_ENV }SANA_EVAL_ORGANIZE_TABLE_PROMPT=old"; fi
+RUN=${RUN:-official_seed${SEED}_${CKPT_LABEL}_xpl_vcfg${VIDEO_CFG}_acfg${ACTION_CFG}_nfe${NFE}_${FS_TAG}_${ACTION_TYPE}${OT_TAG}${VR_TAG}${NAS:+_nas$NAS}}
 OVERRIDES="sampling_steps=$NFE cfg_scale=$VIDEO_CFG action_cfg_scale=$ACTION_CFG flow_shift=$VIDEO_FS"
 [[ -n $ACTION_FS ]] && OVERRIDES+=" action_flow_shift=$ACTION_FS"
 OVERRIDES+=" normalization_sha256=$NORM_SHA"
@@ -185,6 +191,7 @@ case $cmd in
   show)
     printf '%s\n' "RUN=$RUN" "ADAPTER=$ADAPTER POLICY=$POLICY CKPT=$CKPT NORM_SHA=${NORM_SHA:-<unset>} SEED=$SEED" \
       "trained view resize: $TRAINED_RESIZE; served: ${VIEW_RESIZE:-$TRAINED_RESIZE} (ready line: view_resize=$VR_EXPECT)" \
+      "organize_table prompt: $ORGANIZE_TABLE_PROMPT" \
       "overrides: $OVERRIDES" "ports: slots $RPC_BASE/$WS_BASE + 50 + g, smoke $SMOKE_RPC_PORT/$SMOKE_WS_PORT${WORKER_ENV:+; worker env $WORKER_ENV}" \
       "master: ${COMMON[*]} ${EXTRA_MASTER_ARGS:-}" "state: $STATE; run root: $CE_EVAL_ROOT/$RUN" ;;
   expect-ready) expect_ready ;;
@@ -315,7 +322,7 @@ PYEOF
     while [[ $# -gt 0 ]]; do case $1 in --dry-run|--force) topts+=("$1"); shift ;; --*) topts+=("$1" "$2"); shift 2 ;; *) targs+=(--task "$1"); shift ;; esac; done
     [[ ${#targs[@]} -gt 0 ]] || targs=(--task play_tic_tac_toe --task imitate_sorting_sequence)
     # the shards are started through `bash run.sh smoke-gpu`, which inherits this environment (ADAPTER, CKPT_LABEL, ...)
-    export ADAPTER CKPT_LABEL CKPT NORM_SHA SEED NFE VIDEO_CFG ACTION_CFG VIDEO_FS ACTION_FS NAS ACTION_TYPE VIDEO_LAYOUT VIEW_RESIZE
+    export ADAPTER CKPT_LABEL CKPT NORM_SHA SEED NFE VIDEO_CFG ACTION_CFG VIDEO_FS ACTION_FS NAS ACTION_TYPE VIDEO_LAYOUT VIEW_RESIZE ORGANIZE_TABLE_PROMPT
     export EXTRA_OVERRIDES=${EXTRA_OVERRIDES:-}
     "$PY" "$EVAL/tail_shards.py" --run "$RUN" --driver "$EVAL/run.sh" --policy "$POLICY" "${targs[@]}" "${topts[@]}" "$sub" ;;
   status) sed -n 1,40p "$STATE/STATUS.md"; echo ...; tail -n 6 "$STATE/master.log" ;;
