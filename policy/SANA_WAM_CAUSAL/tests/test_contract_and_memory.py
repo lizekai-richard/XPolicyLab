@@ -136,9 +136,34 @@ def test_the_released_no_observation_record_is_accepted():
     check_run_record(_record(RECORD_NOOBS_S3324), resolve_causal_contract(_load(FIRST_FRAME_NOOBS)))
 
 
+@pytest.mark.parametrize("value,expected", [(None, True), (True, True), (False, False)], ids=["absent", "true", "false"])
+def test_the_gdn_output_normalizer_switch_resolves(value, expected):
+    """Sana c414e9b32: model.memory_gdn_output_normalizer, absent = true (every config before the key divides); the
+    ready line names it."""
+
+    cfg = copy.deepcopy(_load(RECIPE_PIXEL_N2))
+    assert "memory_gdn_output_normalizer" not in cfg["model"]
+    if value is not None:
+        cfg["model"]["memory_gdn_output_normalizer"] = value
+    contract = resolve_causal_contract(cfg)
+    assert contract.gdn_output_normalizer is expected
+    assert contract.describe().endswith(f"first_chunk=0 gdn_output_normalizer={expected}")
+
+
+@pytest.mark.parametrize("value", ["false", 0, 1])
+def test_a_gdn_output_normalizer_that_is_not_a_boolean_is_refused(value):
+    """Sana's bool() would serve the string "false" as true: only a yaml boolean is accepted."""
+
+    cfg = copy.deepcopy(_load(RECIPE_PIXEL_N2))
+    cfg["model"]["memory_gdn_output_normalizer"] = value
+    with pytest.raises(ValueError, match="memory_gdn_output_normalizer must be true or false"):
+        resolve_causal_contract(cfg)
+
+
 @pytest.mark.parametrize(
     "key,value",
-    [("aligned_phase_window", "padded"), ("memory_content", "video_and_action"), ("chunk_observation", "false")],
+    [("aligned_phase_window", "padded"), ("memory_content", "video_and_action"), ("chunk_observation", "false"),
+     ("memory_gdn_output_normalizer", False)],
 )
 def test_a_run_record_contradicting_the_config_is_refused(key, value):
     contract = resolve_causal_contract(_load(FIRST_FRAME_NOOBS))

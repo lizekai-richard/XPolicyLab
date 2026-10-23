@@ -182,3 +182,16 @@ def test_the_probe_computes_in_fp32_under_the_generations_bf16_autocast(tmp_path
         results.append((data["softmax_mass"], data["softmax_out"], data["gdn"]))
     for plain, autocast in zip(*results):
         np.testing.assert_array_equal(plain, autocast)
+
+
+def test_a_probe_refuses_a_numerator_only_model():
+    """The GDN parts are shares of the readout's denominator; a numerator-only model (model.memory_gdn_output_normalizer
+    false, Sana c414e9b32) never divides by it, so the probe refuses to install."""
+
+    model = _tiny_model(window=WINDOW)
+    for block in model.blocks:
+        if isinstance(block.attn, CausalGDNAttention):
+            block.attn.output_normalizer = False
+    with pytest.raises(NotImplementedError, match="numerator-only"):
+        AttentionProbe(model)
+    assert all(block.attn.probe is None for block in model.blocks)

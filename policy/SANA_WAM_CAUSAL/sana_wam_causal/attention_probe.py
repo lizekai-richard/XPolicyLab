@@ -47,6 +47,11 @@ class AttentionProbe:
     """Per-chunk aggregates of the memory read; ``install`` it on a ``CausalPolicyModel``, the session drives it."""
 
     def __init__(self, model) -> None:
+        if any(getattr(block.attn, "output_normalizer", True) is False for block in model.blocks):
+            raise NotImplementedError(
+                "attention_dump_dir: the probe's GDN parts are shares of the readout's denominator, which a numerator-only "
+                "checkpoint (model.memory_gdn_output_normalizer false) does not divide by"
+            )
         self.kinds = [block.attn_type for block in model.blocks]
         self.softmax_layers = [i for i, kind in enumerate(self.kinds) if kind != "GatedDeltaNet"]
         self.gdn_layers = [i for i, kind in enumerate(self.kinds) if kind == "GatedDeltaNet"]

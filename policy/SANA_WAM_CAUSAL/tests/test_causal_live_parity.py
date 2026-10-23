@@ -1,6 +1,7 @@
 """Live parity of the causal mirror against Sana's chunk-causal policy on the episode protocol in its single form
-(``SANA_CAUSAL_REPO``: Sana rwm/zekai-merge at or after 4bd6eca83, checked at 7de7711c2; no chunk observations, the sink
-on every canvas).
+(``SANA_CAUSAL_REPO``: Sana rwm/zekai-merge at or after 4bd6eca83, checked at 7de7711c2, b297028fe and c4d1d246d; no
+chunk observations, the sink on every canvas). The numerator-only GDN readout (``model.memory_gdn_output_normalizer:
+false``) needs a tree at or after c414e9b32; those tests skip on an older one.
 
 The live class and the mirror get identical random weights (tiny dims, fp64, CPU, xformers off, ``flash_attn`` bound to
 an fp64 reference varlen as Sana's own tests do). The decisive check is the teacher-forced deploy contract: the
@@ -17,6 +18,7 @@ a session owns the ``dev`` package).
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import types
@@ -32,7 +34,7 @@ from sana_wam_causal.model import CausalPolicyModel
 from sana_wam_causal.session import Caption, CausalMemory, CausalPolicySession
 from sana_wam_min.policy_model.config import PolicyConfig
 
-SANA_CAUSAL_REPO = os.path.expanduser(os.environ.get("SANA_CAUSAL_REPO", "~/zekail/Sana_zekai_merge_7de7711c2"))
+SANA_CAUSAL_REPO = os.path.expanduser(os.environ.get("SANA_CAUSAL_REPO", "~/zekail/Sana_zekai_merge_c4d1d246d"))
 FPS = 16.0
 C_LAT = 4
 VIEW = (3, 4)
@@ -91,13 +93,29 @@ def _live_modules():
     return causal, crwm
 
 
+def _require_live_gdn_normalizer():
+    """Skip unless the live tree has the numerator-only GDN switch (Sana c414e9b32: ``_readout(..., normalizer)``)."""
+
+    _live_modules()
+    from dev.rwm.diffusion.model.layers import chunk_causal_gdn
+
+    if "normalizer" not in inspect.signature(chunk_causal_gdn._readout).parameters:
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates model.memory_gdn_output_normalizer (c414e9b32)")
+
+
 class Twins:
     """A tiny live causal policy and the mirror with the same weights (fp64), plus one random episode: the sink (the
     first frame, chunk 0's observation), clean targets and noisy targets."""
 
     def __init__(self, *, views=1, stride=4, chunk=32, window=None, separate=True, chunks=4, depth=4, seed=11,
-                 fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, first_frame=False):
+                 fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, first_frame=False, normalizer=True,
+                 live_normalizer=None):
         causal, self.crwm = _live_modules()
+        # the mirror's GDN readout (contract.gdn_output_normalizer) and the live one (model.memory_gdn_output_normalizer;
+        # live_normalizer differs only in the negative control)
+        live_normalizer = normalizer if live_normalizer is None else live_normalizer
+        if not live_normalizer:
+            _require_live_gdn_normalizer()
         Live = causal.SanaRWMVideoQwenNextSubAttnResV2SelfFlowWorldModelCameraConditionMultiViewCausal
         self.views, self.stride, self.chunk, self.window = views, stride, chunk, window
         self.separate, self.memory = separate, memory
@@ -115,10 +133,12 @@ class Twins:
         if window is not None:
             options["sliding_window_chunks"] = window
         multiview = "sana_pixel" if views == 1 else "sana_latent"
+        model_options = {} if live_normalizer else {"memory_gdn_output_normalizer": False}
         config = _Cfg(
             model=_Cfg(
                 extra={"chunk_causal_policy": options, "rope": "aligned"},
                 multiview_spatial_rope_tile_shape=(8, 16),
+                **model_options,
             ),
             scheduler=_Cfg(action_flow_shift=1.0 if separate else None),
             data=_Cfg(extra={"multiview": multiview}),
@@ -127,6 +147,7 @@ class Twins:
         self.live = Live(config=config, **kwargs)
         assert self.live.memory_content == memory and self.live.sliding_window_chunks == window
         assert tuple(self.live.multiview_spatial_rope_tile_shape) == (8, 16)
+        assert getattr(self.live, "memory_gdn_output_normalizer", True) is live_normalizer
         with torch.no_grad():
             for parameter in self.live.parameters():
                 parameter.uniform_(-0.05, 0.05)
@@ -138,6 +159,7 @@ class Twins:
             visual_layout="sana_pixel_canvas" if views == 1 else "three_view_strip", rope="aligned",
             dt_bias_init=-5.0, a_log_init=0.0, reset_legacy_beta=False,
             aligned_phase_window="first_frame" if first_frame else "padded",
+            gdn_output_normalizer=normalizer,
         )
         policy_config = PolicyConfig.from_sana_kwargs(config=config, **kwargs)
         assert tuple(policy_config.multiview_spatial_rope_tile_shape) == (8, 16)
@@ -354,6 +376,41 @@ def test_first_frame_deploy_chain_equals_two_stream_training_forward(views, stri
         torch.testing.assert_close(a_ours, a_live, **CLOSE, msg=lambda m: f"chunk {k} action: {m}")
 
 
+NUMERATOR_CASES = [CASES[0], CASES[2], CASES[5]]
+NUMERATOR_IDS = [CASE_IDS[0], CASE_IDS[2], CASE_IDS[5]]
+
+
+@pytest.mark.parametrize("first_frame", [False, True], ids=["padded", "first-frame"])
+@pytest.mark.parametrize("memory", MEMORIES)
+@pytest.mark.parametrize("views,stride,chunk,window,length", NUMERATOR_CASES, ids=NUMERATOR_IDS)
+def test_numerator_only_deploy_chain_equals_two_stream_training_forward(views, stride, chunk, window, length, memory,
+                                                                       first_frame):
+    """model.memory_gdn_output_normalizer false (Sana c414e9b32): every GDN layer reads its numerator alone on both
+    sides, and the deploy chain still equals the two-stream training forward chunk by chunk."""
+
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=length, memory=memory,
+                  first_frame=first_frame, normalizer=False)
+    assert all(block.attn.output_normalizer is False for block in twins.mirror.blocks if block.attn_type == "GatedDeltaNet")
+    training = twins.two_stream(length) if first_frame else twins.two_stream(length)[1:]
+    streaming = twins.streaming_first_frame(length) if first_frame else twins.streaming(length)
+    assert len(training) == len(streaming)
+    for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming)):
+        torch.testing.assert_close(x_ours, x_live, **CLOSE, msg=lambda m: f"chunk {k} video: {m}")
+        torch.testing.assert_close(a_ours, a_live, **CLOSE, msg=lambda m: f"chunk {k} action: {m}")
+
+
+@pytest.mark.parametrize("views", [1, 3])
+def test_a_mirror_that_divides_is_caught_on_a_numerator_only_policy(views):
+    """Negative control: the mirror dividing by the denominator while the live policy reads the numerator alone misses
+    the training forward -- the parity above can tell the two readouts apart."""
+
+    twins = Twins(views=views, window=2, chunks=4, memory=MEMORY_VIDEO_ONLY, first_frame=True, live_normalizer=False)
+    training = twins.two_stream(4)
+    streaming = twins.streaming_first_frame(4)
+    gap = max(_max_abs(streaming[k][i], training[k][i]) for k in range(4) for i in (0, 1))
+    assert gap > 1e-6, gap
+
+
 @pytest.mark.parametrize("views", [1, 3])
 def test_a_first_frame_chunk_0_without_the_sink_is_caught(views):
     """Negative control: a chunk 0 that does not read the sink (noisy chunk 0's rule with chunk observations, before
@@ -468,6 +525,46 @@ def test_layer_cache_gdn_commit_is_the_live_scan():
             cache = LayerCache(commit=True, gdn_state=cache.gdn_next if lo else None)
             pieces.append(ours(x[:, lo:hi], cache=cache))
     torch.testing.assert_close(torch.cat(pieces, dim=1), expected, rtol=1e-12, atol=1e-15)
+
+
+def test_a_numerator_only_gdn_commit_is_the_live_scan():
+    """The same three committed segments with ``output_normalizer`` false on both shells == Sana's gdn_scan reading the
+    numerator alone; the carried (S, z) is the default one's (a commit writes z either way)."""
+
+    _require_live_gdn_normalizer()
+    from dev.rwm.diffusion.model.layers.chunk_causal_gdn import CachedChunkCausalPolicyGDNAttention
+
+    from sana_wam_causal.layers import CausalGDNAttention, LayerCache
+
+    torch.manual_seed(3)
+    live = CachedChunkCausalPolicyGDNAttention(
+        64, 64, heads=2, dim=32, eps=1e-8, use_bias=False, qk_norm=True, norm_eps=1e-5, chunk_size=1,
+        chunk_split_strategy="first_frame", conv_kernel_size=0, k_conv_only=True, output_gate_act="sigmoid",
+        use_o_norm=True, key_scale_mode="dim_spatial",
+    ).double().eval()
+    with torch.no_grad():
+        for parameter in live.parameters():
+            parameter.uniform_(-0.3, 0.3)
+    live.output_normalizer = False
+    ours = CausalGDNAttention(64, 64, heads=2, output_normalizer=False).double().eval()
+    ours.load_state_dict(live.state_dict(), strict=True)
+    divides = CausalGDNAttention(64, 64, heads=2).double().eval()
+    divides.load_state_dict(live.state_dict(), strict=True)
+    sizes = [5, 7, 6]
+    x = torch.randn(1, sum(sizes), 64, dtype=torch.float64)
+    bounds = [0, 5, 12, 18]
+    with torch.no_grad():
+        expected = live(x, HW=(x.shape[1], 1, 1), chunk_index=bounds)
+        caches = {"ours": LayerCache(commit=True), "divides": LayerCache(commit=True)}
+        pieces = {"ours": [], "divides": []}
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            for name, layer in (("ours", ours), ("divides", divides)):
+                caches[name] = LayerCache(commit=True, gdn_state=caches[name].gdn_next if lo else None)
+                pieces[name].append(layer(x[:, lo:hi], cache=caches[name]))
+    torch.testing.assert_close(torch.cat(pieces["ours"], dim=1), expected, rtol=1e-12, atol=1e-15)
+    assert _max_abs(torch.cat(pieces["divides"], dim=1), expected) > 1e-6
+    for carried, reference in zip(caches["ours"].gdn_next, caches["divides"].gdn_next):
+        torch.testing.assert_close(carried, reference, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("views", [1, 3])

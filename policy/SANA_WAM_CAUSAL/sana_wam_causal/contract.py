@@ -30,6 +30,11 @@ one chunk, memory only; the deploy commits it and emits from chunk 1) or ``first
 frame's own chunk with no memory before it but the sink and is supervised; the deploy emits from chunk 0, which reads
 the sink as its observation).
 
+``model.memory_gdn_output_normalizer`` (Sana ``c414e9b32``; ``true`` when absent) decides every GDN layer's readout: true
+divides the numerator ``q (gS + K^T diag(beta) V)`` by the denominator ``ReLU(q) . (gz + K_den^T beta) + eps``, false
+returns the numerator alone (z is still carried, so a commit writes the same state either way). The per-head RMSNorm
+after the readout cancels any positive denominator, so the two differ where it is near zero or negative.
+
 The sink-less per-chunk observation protocol (Sana ``61aad2d58`` .. ``3cbe3d85e``'s deploy, the pantheon14k m48n24
 checkpoints) is retired here as in Sana; its configs carry ``data.extra.window_repeats``, which no episode recipe does
 (the episode launcher refuses it), and are refused with the reason, at start-up, before the weights are read. So are a
@@ -104,6 +109,7 @@ class CausalContract:
     a_log_init: float
     reset_legacy_beta: bool
     aligned_phase_window: str = ALIGNED_PHASE_PADDED  # padded: chunk 0 frozen, memory only | first_frame: chunk 0 emitted
+    gdn_output_normalizer: bool = True  # false: every GDN layer reads its numerator alone (memory_gdn_output_normalizer)
 
     @property
     def first_chunk(self) -> int:
@@ -118,7 +124,8 @@ class CausalContract:
             f"video_frame_stride={self.video_frame_stride} latent_frames_per_chunk={self.latent_frames_per_chunk} "
             f"sliding_window_chunks={window} memory_content={self.memory_content} "
             f"chunk_observation=False multiview={self.multiview} visual_layout={self.visual_layout} "
-            f"rope={self.rope} aligned_phase_window={self.aligned_phase_window} first_chunk={self.first_chunk}"
+            f"rope={self.rope} aligned_phase_window={self.aligned_phase_window} first_chunk={self.first_chunk} "
+            f"gdn_output_normalizer={self.gdn_output_normalizer}"
         )
 
 
@@ -176,6 +183,18 @@ def resolve_aligned_phase_window(value: Any) -> str:
     return str(value)
 
 
+def resolve_gdn_output_normalizer(value: Any) -> bool:
+    """``model.memory_gdn_output_normalizer`` as Sana reads it (``sana_qwennext_policy_causal``, c414e9b32): None (a
+    config older than the key) -> true; a yaml boolean otherwise (Sana's ``bool()`` would read the string "false" as
+    true, so anything but a boolean is refused)."""
+
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        raise ValueError(f"model.memory_gdn_output_normalizer must be true or false, got {value!r}")
+    return value
+
+
 def refuse_chunk_observation(value: Any) -> None:
     """``chunk_observation`` as Sana reads it since 4bd6eca83 (``causal_rwm_train.refuse_chunk_observation``): chunk
     observations are retired, every noisy chunk reads its observation from the memory; absent or ``false`` is accepted
@@ -211,8 +230,8 @@ def load_run_records(directory: str | Path) -> list[tuple[Path, Mapping[str, Any
 def check_run_record(record: Mapping[str, Any], contract: CausalContract, source: str = "the run record") -> None:
     """Refuse a checkpoint whose run record contradicts the contract its config resolves to: a run that trained chunk
     observations (``chunk_observation`` anything but false: its config may lack the key, which the single form reads
-    as false) and a recorded ``aligned_phase_window`` / ``memory_content`` other than the config's. Keys the record
-    does not carry are not checked."""
+    as false) and a recorded ``aligned_phase_window`` / ``memory_content`` / ``memory_gdn_output_normalizer`` other
+    than the config's. Keys the record does not carry are not checked."""
 
     observation = record.get("chunk_observation")
     if observation is not None and observation is not False:
@@ -224,6 +243,7 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
     for key, resolved in (
         ("aligned_phase_window", contract.aligned_phase_window),
         ("memory_content", contract.memory_content),
+        ("memory_gdn_output_normalizer", contract.gdn_output_normalizer),
     ):
         recorded = record.get(key)
         if recorded is not None and recorded != resolved:
@@ -385,6 +405,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         a_log_init=float(options.get("a_log_init", DEFAULT_A_LOG_INIT)),
         reset_legacy_beta=bool(options.get("reset_legacy_beta", False)),
         aligned_phase_window=aligned_phase_window,
+        gdn_output_normalizer=resolve_gdn_output_normalizer(model_cfg.get("memory_gdn_output_normalizer")),
     )
 
 
@@ -412,5 +433,6 @@ __all__ = [
     "resolve_aligned_phase_window",
     "refuse_chunk_observation",
     "resolve_causal_contract",
+    "resolve_gdn_output_normalizer",
     "resolve_memory_content",
 ]

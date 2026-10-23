@@ -7,9 +7,10 @@ protocol only changes which state version and which entries a forward reads -- t
   segment per forward (every deploy window is one segment): the donor's ``GatedDeltaNet`` projections plus the
   recurrence parameters ``gate_proj`` / ``A_log`` / ``dt_bias`` (and the never-read ``recall_gate`` buffer), the
   segment key scale ``(dim * n)^-1/2``, the per-segment decay ``exp(-e^A_log * softplus(gate_proj(mean x) + dt_bias))``,
-  the read ``q (gS + K^T diag(beta) V) / (q_den (gz + K_den^T beta) + eps)`` and the delta-rule write of ``(S, z)``
-  (``gdn_scan`` / ``_chunk_slices`` / ``_readout``, same einsum contractions, fp32 compute, complex64 RoPE on the
-  numerator path only).
+  the read ``q (gS + K^T diag(beta) V) / (q_den (gz + K_den^T beta) + eps)`` -- its numerator alone under
+  ``model.memory_gdn_output_normalizer: false`` (Sana c414e9b32, ``_readout(normalizer=False)``) -- and the
+  delta-rule write of ``(S, z)`` (``gdn_scan`` / ``_chunk_slices`` / ``_readout``, same einsum contractions, fp32
+  compute, complex64 RoPE on the numerator path only).
 * ``CausalSoftmaxAttention`` <- ``layers/chunk_causal_softmax.py`` ``CachedChunkCausalPolicySoftmaxAttention``: q/k
   RMSNorm, fp64 RoPE cast back to the activation dtype, then attention over ``[context entries | this window]``. The
   two-stream training forward's spans are the reference for the read SET (which entries a forward reads). A commit
@@ -91,8 +92,11 @@ class CausalGDNAttention(GatedDeltaNet):
         fp32_attention: bool = False,
         dt_bias_init: float = -5.0,
         a_log_init: float = 0.0,
+        output_normalizer: bool = True,
     ) -> None:
         super().__init__(in_dim, out_dim, heads=heads, eps=eps, norm_eps=norm_eps, fp32_attention=fp32_attention)
+        # false: the readout is the numerator alone (Sana ``model.memory_gdn_output_normalizer``, c414e9b32)
+        self.output_normalizer = bool(output_normalizer)
         self.gate_proj = nn.Linear(in_dim, heads, bias=True)
         self.A_log = nn.Parameter(torch.full((heads,), float(a_log_init), dtype=torch.float32))
         self.dt_bias = nn.Parameter(torch.full((heads,), float(dt_bias_init), dtype=torch.float32))
@@ -163,12 +167,16 @@ class CausalGDNAttention(GatedDeltaNet):
         decayed_state = state * decay[..., None, None]
         decayed_z = state_z * decay[..., None]
 
-        # _readout: the decayed past plus the chunk's own beta-gated sum-linear attention
+        # _readout: the decayed past plus the chunk's own beta-gated sum-linear attention, over the denominator unless
+        # the checkpoint reads the numerator alone
         intra_read = torch.einsum("bhld,bhl,bhlv->bhdv", k_c, beta_c, v_c)
         num = torch.einsum("bhld,bhdv->bhlv", q_c, decayed_state + intra_read)
-        intra_z = torch.einsum("bhld,bhl->bhd", k_den_c, beta_c)
-        den = torch.einsum("bhld,bhd->bhl", q_den_c, decayed_z + intra_z) + self.eps
-        out = (num / den[..., None]).to(v.dtype)
+        if self.output_normalizer:
+            intra_z = torch.einsum("bhld,bhl->bhd", k_den_c, beta_c)
+            den = torch.einsum("bhld,bhd->bhl", q_den_c, decayed_z + intra_z) + self.eps
+            out = (num / den[..., None]).to(v.dtype)
+        else:
+            out = num.to(v.dtype)
         if self.probe is not None and self.probe.active:
             self.probe.gdn(self.probe_layer, q_c, decayed_state, intra_read, q_den_c, decayed_z, intra_z, self.eps)
 
@@ -242,6 +250,7 @@ class CausalPolicyBlock(PolicyBlock):
         fp32_attention: bool,
         dt_bias_init: float = -5.0,
         a_log_init: float = 0.0,
+        gdn_output_normalizer: bool = True,
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = hidden_size
@@ -256,6 +265,7 @@ class CausalPolicyBlock(PolicyBlock):
                 fp32_attention=fp32_attention,
                 dt_bias_init=dt_bias_init,
                 a_log_init=a_log_init,
+                output_normalizer=gdn_output_normalizer,
             )
         elif attention_kind == SOFTMAX_KIND:
             self.attn = CausalSoftmaxAttention(

@@ -142,6 +142,7 @@ class CausalPolicyModel(PolicyModel):
                 fp32_attention=config.fp32_attention,
                 dt_bias_init=contract.dt_bias_init,
                 a_log_init=contract.a_log_init,
+                gdn_output_normalizer=contract.gdn_output_normalizer,
             )
             for kind in self.block_attn_types
         )
