@@ -1005,3 +1005,164 @@ def test_the_session_refuses_a_broken_opening():
     session.reset_memory()
     with pytest.raises(RuntimeError, match="commit_sink first"):
         session.generate_chunk(**kwargs)
+
+
+@pytest.mark.parametrize("state", [False, True], ids=["obs", "obs+state"])
+@pytest.mark.parametrize("window", [1, 2])
+def test_every_forward_of_an_observed_episode_reads_exactly_its_causal_set(state, window):
+    """The causal read sets of an observed episode, layer by layer (the softmax kernel runs without a mask, so its keys
+    ARE the read set): chunk c's observation prefill reads the sink, the window's committed chunks and its own group
+    (the observation latent of every view, plus the state row under causal_state) -- no target or action key exists in
+    it; every denoising step reads the sink, the window, the prefill's observation K/V (exactly the tensors the prefill
+    left) and its own targets and rows; the commit reads the sink, the window and its own targets, no observation. GDN:
+    the prefill and the denoise reads write nothing, the denoise reads pool with the observation's tokens, the commit
+    neither reads an observation nor skips its write."""
+
+    from sana_wam_causal.layers import CausalGDNAttention, CausalSoftmaxAttention
+
+    chunks = 4
+    twins = Twins(views=3, window=window, chunks=chunks, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=True,
+                  state=state)
+    session = twins.session(steps=2, video_cfg=3.0)   # two text streams, two steps
+    width, chunk = twins.width, twins.chunk
+    n_obs = width + int(state)
+    n_denoise = width + chunk + (0 if state else 1)
+    soft, gdn, phase = [], [], {"name": None}
+    run_attention = CausalSoftmaxAttention._run_attention
+    gdn_forward = CausalGDNAttention.forward
+
+    def record_soft(self, q, k, v):
+        soft.append((phase["name"], q.shape[1], k, v))
+        return run_attention(self, q, k, v)
+
+    def record_gdn(self, x, rotary_emb=None, cache=None):
+        observed = cache.gdn_observation   # what the forward READS (a prefill leaves its own terms here afterwards)
+        out = gdn_forward(self, x, rotary_emb=rotary_emb, cache=cache)
+        gdn.append((phase["name"], x.shape[1], bool(cache.observation_prefill), None if observed is None else observed.count,
+                    cache.commit, cache.gdn_next is not None))
+        if cache.observation_prefill:
+            assert cache.gdn_observation is not None and cache.gdn_observation.count == x.shape[1]
+        return out
+
+    prefill = session.prefill_observation
+    left = {}
+
+    def recording_prefill(caption, memory, observation, **kwargs):
+        caches = prefill(caption, memory, observation, **kwargs)
+        left.setdefault(session.chunk_idx, []).append(caches)
+        return caches
+
+    CausalSoftmaxAttention._run_attention, CausalGDNAttention.forward = record_soft, record_gdn
+    session.prefill_observation = recording_prefill
+    mask = torch.ones(1, chunk, 80, dtype=torch.bool)
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    try:
+        phase["name"] = "sink"
+        session.commit_sink(twins.ours(twins.sink))
+        for c in range(chunks):
+            n_window = min(c, window) * width
+            soft.clear(), gdn.clear()
+            phase["name"] = "generate"
+            session.generate_chunk(anchor_state=twins.states[c], anchor_state_mask=state_mask, action_mask=mask,
+                                   observation=twins.ours(twins.observations[c]))
+            prefills = [entry for entry in soft if entry[1] == n_obs]
+            denoise = [entry for entry in soft if entry[1] == n_denoise]
+            assert len(prefills) + len(denoise) == len(soft)
+            layers = len(session.memories[0].sink)
+            assert len(prefills) == 2 * layers and len(denoise) == 2 * 2 * layers   # 2 streams; 2 steps x 2 streams
+            for _, q, k, _v in prefills:
+                assert k.shape[1] == width + n_window + n_obs          # sink | window | its own group
+            for i, (_, q, k, _v) in enumerate(denoise):
+                assert k.shape[1] == width + n_window + n_obs + n_denoise   # sink | window | observation | itself
+            # the observation keys every denoising step reads are the prefill's own (per stream, per softmax layer)
+            for stream, caches in enumerate(left[c]):
+                observation_k = [cache.softmax_context[0][:, -n_obs:] for cache in caches if cache.softmax_context is not None]
+                steps = [entry for entry in denoise][stream * layers : (stream + 1) * layers]
+                for k_obs, (_, _, k, _v) in zip(observation_k, steps):
+                    torch.testing.assert_close(k[:, width + n_window : width + n_window + n_obs], k_obs.to(k.dtype),
+                                               rtol=0, atol=0)
+            gdn_prefill = [entry for entry in gdn if entry[2]]
+            gdn_denoise = [entry for entry in gdn if not entry[2]]
+            assert all(t == n_obs and count is None and not commit and not wrote for _, t, _, count, commit, wrote in gdn_prefill)
+            assert all(t == n_denoise and count == n_obs and not commit and not wrote
+                       for _, t, _, count, commit, wrote in gdn_denoise)
+            soft.clear(), gdn.clear()
+            phase["name"] = "commit"
+            twins.commit(session, c)
+            assert all(q == width and k.shape[1] == width + n_window + width for _, q, k, _v in soft)
+            assert all(count is None and commit and wrote and not pre for _, t, pre, count, commit, wrote in gdn)
+    finally:
+        CausalSoftmaxAttention._run_attention, CausalGDNAttention.forward = run_attention, gdn_forward
+
+
+@pytest.mark.parametrize("state", [False, True], ids=["obs", "obs+state"])
+def test_an_observation_and_its_state_are_read_by_their_own_chunk_only(state):
+    """Who reads whom, on the deploy chain's outputs: moving chunk 1's observation latent (or its anchor state) moves
+    chunk 1's generation and no other chunk's -- nothing of it reaches the memory; moving chunk 1's noisy targets moves
+    chunk 1 only and leaves the observation's prefill terms as they were (the observation never reads its targets);
+    moving the clean chunk 1 committed to the memory moves the chunks after it and none before."""
+
+    chunks = 4
+    twins = Twins(views=3, window=2, chunks=chunks, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=True,
+                  state=state)
+    mask = torch.ones(1, twins.chunk, 80, dtype=torch.bool)
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    g = torch.Generator().manual_seed(29)
+    noise = [(torch.randn(1, C_LAT, twins.f_chunk, 1, twins.width, generator=g, dtype=torch.float64),
+              torch.randn(1, twins.chunk, 80, generator=g, dtype=torch.float64)) for _ in range(chunks)]
+
+    def episode():
+        session = twins.session(steps=2, video_cfg=3.0)
+        session.commit_sink(twins.ours(twins.sink))
+        terms, outs = [], []
+        prefill = session.prefill_observation
+
+        def recording(caption, memory, observation, **kwargs):
+            caches = prefill(caption, memory, observation, **kwargs)
+            terms.append([(c.gdn_observation.kv.clone() if c.gdn_observation is not None else c.softmax_context[0][:, -1:].clone())
+                          for c in caches])
+            return caches
+
+        session.prefill_observation = recording
+        for c in range(chunks):
+            outs.append(session.generate_chunk(
+                anchor_state=twins.states[c], anchor_state_mask=state_mask, action_mask=mask,
+                video_noise=twins.ours(noise[c][0]), action_noise=noise[c][1], observation=twins.ours(twins.observations[c]),
+            ))
+            twins.commit(session, c)
+        return outs, terms
+
+    base, base_terms = episode()
+
+    def moved_chunks(edit):
+        kind, index, value = edit
+        original = getattr(twins, kind)[index] if kind != "noise" else noise[index]
+        if kind == "noise":
+            noise[index] = (noise[index][0] + value, noise[index][1])
+        else:
+            getattr(twins, kind)[index] = original + value
+        try:
+            outs, terms = episode()
+        finally:
+            if kind == "noise":
+                noise[index] = original
+            else:
+                getattr(twins, kind)[index] = original
+        moved = {c for c in range(chunks)
+                 if any(float((a - b).abs().max()) > 1e-9 for a, b in zip(outs[c], base[c]))}
+        same = {c for c in range(chunks)
+                if all(torch.equal(a, b) for a, b in zip(outs[c], base[c]))}
+        assert moved | same == set(range(chunks)) and not moved & same
+        return moved, terms
+
+    moved, _ = moved_chunks(("observations", 1, 1.0))
+    assert moved == {1}
+    moved, _ = moved_chunks(("states", 1, 0.5))
+    assert moved == {1}
+    moved, terms = moved_chunks(("noise", 1, 1.0))
+    assert moved == {1}
+    for stream in (0, 1):   # chunk 1's prefill (streams 2 and 3 of the episode's prefills) never saw its targets
+        for a, b in zip(terms[2 + stream], base_terms[2 + stream]):
+            assert torch.equal(a, b)
+    moved, _ = moved_chunks(("clean", 1, 1.0))
+    assert moved == {2, 3}
