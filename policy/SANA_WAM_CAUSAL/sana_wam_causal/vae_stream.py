@@ -163,6 +163,18 @@ class ViewStreams:
         self.chunks += 1
         return self._pack(targets)
 
+    @torch.no_grad()
+    def encode_observation(self, frames: Sequence[torch.Tensor]) -> torch.Tensor:
+        """A ``causal_observation`` chunk's observation latent (Sana ``CausalViewStream.encode_observation``): every
+        view's frame at the chunk's start instant encoded alone, as the sink is, on a fresh stream of its own -- the
+        episode's streams stay where they were -> ``[1, C, 1, ...]`` packed as the policy reads it."""
+
+        if not self._streams:
+            raise RuntimeError("open the streams at the episode's first frame (start) before encoding an observation")
+        if len(frames) != len(self._streams):
+            raise ValueError(f"{len(self._streams)} views stream, got {len(frames)} observation frames")
+        return self._pack([LatentStream(self.bundle).start(frame) for frame in frames])
+
 
 @torch.no_grad()
 def encode_window(bundle: VaeBundle, frames: Sequence[torch.Tensor]) -> torch.Tensor:

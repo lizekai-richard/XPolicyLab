@@ -28,6 +28,14 @@ Then one emitted chunk per cycle, mirroring the robot loop, from the first emitt
    targets alone, no robot rows). It reads like the generation of chunk c, then writes the next GDN state and keeps its
    softmax K/V as entry c.
 
+Under ``causal_observation`` (Sana 764ee2113, deploy adc4867ea) every chunk also reads its OWN observation latent o_c,
+its start frame encoded alone (chunk 0's is the sink's latent), which ``generate_chunk`` takes: before the denoising
+steps one clean forward per stream prefills it (``prefill_observation``, Sana ``forward_observation``) on video frame
+c * f_c + 1 -- under ``causal_state`` (afc9874b6, deploy 8b599e49d) with the chunk's state row at step c * C + C / f_c --
+reading the sink, the window, the GDN state and itself and writing nothing to the memory; every denoising step then reads
+it besides the window (``LayerCache.observed``), its targets one frame later (c * f_c + 2 ..) and its robot rows
+C / f_c steps later (the C action rows alone under ``causal_state``). The commit is the policy's without the option.
+
 Softmax read, W = ``sliding_window_chunks``: the forwards on chunk c (its denoising steps and its commit) read the sink
 and the newest ``min(c, W)`` committed chunks, ``c - W .. c - 1``. This is the two-stream training forward's rule (Sana
 ``CachedChunkCausalPolicySoftmaxAttention._two_stream_spans``: noisy chunk c reads the sink plus clean chunks
@@ -65,7 +73,7 @@ from sana_wam_min.policy_model.attention import apply_rotary_emb_fp64_softmax  #
 
 from .contract import MEMORY_VIDEO_AND_ACTION  # noqa: E402
 from .layers import GDN_KIND, LayerCache  # noqa: E402
-from .model import CausalPolicyModel, ViewShapes  # noqa: E402
+from .model import ROBOT_FORM_ACTIONS, ROBOT_FORM_CHUNK, ROBOT_FORM_STATE, CausalPolicyModel, ViewShapes  # noqa: E402
 
 LEFT_GRIPPER, RIGHT_GRIPPER = 16, 45
 
@@ -214,6 +222,8 @@ class CausalPolicySession:
         self.memory_content = str(model.memory_content)
         self.robot_memory = self.memory_content == MEMORY_VIDEO_AND_ACTION
         self.first_chunk = int(model.first_chunk)   # 1 after a padded window's frozen chunk 0, 0 on a first-frame window
+        self.observation = bool(model.causal_observation)   # every chunk prefills its own observation latent
+        self.causal_state = bool(model.causal_state)        # ... with the chunk's state row in its group
         self.steps = int(steps)
         if self.steps <= 0:
             raise ValueError("steps must be positive")
@@ -327,14 +337,61 @@ class CausalPolicySession:
         return frame_offset - origin * self.f_chunk, step_offset - origin * self.chunk_actions
 
     def _forward(self, latent, timesteps, caption: Caption, memory: CausalMemory, *, frame_offset, step_offset, robot,
-                 caches):
+                 caches, robot_form=ROBOT_FORM_CHUNK):
         soft_frame, soft_step = self._softmax_offsets(memory, frame_offset, step_offset)
         return self.model.forward_window(
             latent, timesteps, caption.y, caption.mask,
             model_fps=self.model_fps, frame_offset=frame_offset, step_offset=step_offset, view_shapes=self.view_shapes,
             view_slot_ids=self.view_slot_ids, robot=robot, caches=caches, softmax_frame_offset=soft_frame,
-            softmax_step_offset=soft_step,
+            softmax_step_offset=soft_step, robot_form=robot_form,
         )
+
+    def window_offsets(self) -> tuple[int, int]:
+        """(first target frame, first robot step) of chunk ``chunk_idx``'s denoising window on the physical clock: c *
+        f_c + 1 and c * C; under ``causal_observation`` one latent frame later, c * f_c + 2 and c * C + C / f_c (the
+        observation latent sits at c * f_c + 1 and the state row at its instant; Sana ``forward_chunk``)."""
+
+        frame = self.chunk_idx * self.f_chunk + 1
+        step = self.chunk_idx * self.chunk_actions
+        if self.observation:
+            frame, step = frame + 1, step + self.chunk_actions // self.f_chunk
+        return frame, step
+
+    def denoise_robot(self, robot: dict) -> tuple[dict, str]:
+        """The robot rows of a denoising window and their form: the chunk's state and C action rows, the C action rows
+        alone under ``causal_state`` (the state row is in the observation prefill)."""
+
+        if not self.causal_state:
+            return robot, ROBOT_FORM_CHUNK
+        return {key: robot[key] for key in ("action80", "action_mask80", "action_timesteps")}, ROBOT_FORM_ACTIONS
+
+    def prefill_observation(
+        self,
+        caption: Caption,
+        memory: CausalMemory,
+        observation: torch.Tensor,
+        *,
+        state: torch.Tensor,
+        state_mask: torch.Tensor,
+    ) -> list[LayerCache]:
+        """Prefill chunk ``chunk_idx``'s observation latent ``[1, C_lat, 1, H, W]`` into one stream's read (Sana
+        ``forward_observation``): one clean forward on video frame c * f_c + 1 (one frame after the most recent memory
+        latent), under ``causal_state`` with the chunk's state row at step c * C + C / f_c, reading the sink, the
+        softmax window, the GDN state and itself and writing nothing to the memory. Returns the caches of the chunk's
+        denoise reads, which read the observation besides the window (``LayerCache.observed``)."""
+
+        caches = self._caches(memory, commit=False)
+        for cache in caches:
+            cache.observation_prefill = True
+        robot, form = None, ROBOT_FORM_CHUNK
+        if self.causal_state:
+            robot, form = {"state80": state, "state_mask80": state_mask}, ROBOT_FORM_STATE
+        frame = self.chunk_idx * self.f_chunk + 1
+        step = self.chunk_idx * self.chunk_actions + self.chunk_actions // self.f_chunk
+        t = torch.zeros(1, 1, device=observation.device)
+        self._forward(observation, t, caption, memory, frame_offset=frame, step_offset=step, robot=robot, caches=caches,
+                      robot_form=form)
+        return [cache.observed() for cache in caches]
 
     # -- the episode opening -----------------------------------------------------------------------------------------
 
@@ -371,11 +428,19 @@ class CausalPolicySession:
         video_noise: Optional[torch.Tensor] = None,
         action_noise: Optional[torch.Tensor] = None,
         gripper_bounds: Optional[tuple[tuple[float, float], tuple[float, float]]] = None,
+        observation: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Denoise chunk ``chunk_idx`` (from the first emitted chunk on) against frozen memory, which holds its
         observation; returns (normalized actions [1, C, 80], target latents [1, C_lat, f_c, H, W]). Nothing is
-        written."""
+        written. A ``causal_observation`` policy takes the chunk's own observation latent ``[1, C_lat, 1, H, W]`` (its
+        start frame encoded alone, chunk 0's the sink's latent), required by such a policy and refused by any other:
+        it is prefilled once per stream (``prefill_observation``) and every denoising step reads it."""
 
+        if (observation is not None) != self.observation:
+            raise ValueError(
+                "a causal_observation policy generates every chunk from its own observation latent"
+                if self.observation else "this policy reads no observation latent (causal_observation is off)"
+            )
         if not self.has_sink:
             raise RuntimeError("every chunk reads the sink, chunk 0's only view of a frame: commit_sink first")
         if self.chunk_idx < self.first_chunk:
@@ -404,12 +469,23 @@ class CausalPolicySession:
         action_mask = action_mask.to(device)
         video_scheduler = make_scheduler(self.steps, self.flow_shift, device)
         action_scheduler = make_scheduler(self.steps, self.action_flow_shift, device)
-        caches_by_stream = [self._caches(memory, commit=False) for memory in self.memories]
-        # the targets sit at c * f_c + 1 .., after the instant c * f_c of the frame they read as their observation
-        frame_offset = self.chunk_idx * self.f_chunk + 1
-        step_offset = self.chunk_idx * chunk
         state = anchor_state.reshape(1, -1).to(device)
         state_mask = anchor_state_mask.reshape(1, -1).to(device=device, dtype=torch.bool)
+        if self.observation:
+            if self.probe is not None:
+                raise NotImplementedError("the attention probe does not model a causal_observation chunk's prefill")
+            observation = observation.to(device=device, dtype=latent_dtype)
+            self._check_latent(observation, 1, "observation")
+            with self._autocast(device):
+                caches_by_stream = [
+                    self.prefill_observation(caption, memory, observation, state=state, state_mask=state_mask)
+                    for caption, memory in self.streams
+                ]
+        else:
+            caches_by_stream = [self._caches(memory, commit=False) for memory in self.memories]
+        # the targets sit at c * f_c + 1 .., after the instant c * f_c of the frame they read as their observation (one
+        # frame later under causal_observation, after the observation latent's frame)
+        frame_offset, step_offset = self.window_offsets()
         probe = self.probe
         if probe is not None:
             read_ids, origin = self.memories[0].read_plan()
@@ -428,13 +504,13 @@ class CausalPolicySession:
                     action_t = action_timestep.reshape(1, 1).expand(1, chunk).to(torch.float32)
                     latent = video
                     window_t = video_t
-                    robot = {
+                    robot, robot_form = self.denoise_robot({
                         "state80": state,
                         "state_mask80": state_mask,
                         "action80": action,
                         "action_mask80": action_mask,
                         "action_timesteps": action_t,
-                    }
+                    })
                     outputs = []
                     for stream_index, (caption, memory, caches) in enumerate(
                         zip(self.captions, self.memories, caches_by_stream)
@@ -444,7 +520,7 @@ class CausalPolicySession:
                         outputs.append(
                             self._forward(
                                 latent, window_t, caption, memory, frame_offset=frame_offset, step_offset=step_offset,
-                                robot=robot, caches=caches,
+                                robot=robot, caches=caches, robot_form=robot_form,
                             )
                         )
                     cond = outputs[0]

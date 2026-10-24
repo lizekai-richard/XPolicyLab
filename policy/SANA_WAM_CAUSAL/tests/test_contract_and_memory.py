@@ -49,6 +49,8 @@ FIRST_FRAME_NOOBS = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_epi
 # neither key) and the run records of two Hub uploads (RUN_ID.json, trimmed to identity and protocol): that VO
 # checkpoint and the released no-observation one (FIRST_FRAME_NOOBS)
 OBSERVATION_S1000 = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoonly_s1000.yaml")
+# the released mix-v3 dense sana_latent N1-obs checkpoint (step 15000): causal_observation + causal_state, numerator-only GDN
+N1_OBS_S15000 = os.path.join(_paths.FIXTURES, "config_causal_mixv3_dense14k_sana_latent_episode_n1_obs_videoonly_s15000.yaml")
 RECORD_S1000 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_s1000.json")
 RECORD_NOOBS_S3324 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_noobs_s3324.json")
 SINKLESS_VA = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
@@ -158,6 +160,62 @@ def test_a_gdn_output_normalizer_that_is_not_a_boolean_is_refused(value):
     cfg["model"]["memory_gdn_output_normalizer"] = value
     with pytest.raises(ValueError, match="memory_gdn_output_normalizer must be true or false"):
         resolve_causal_contract(cfg)
+
+
+def test_the_released_n1_obs_checkpoint_resolves_with_its_observation_and_state():
+    """The real config.yaml of the mix-v3 dense sana_latent N1-obs checkpoint (step 15000): every noisy chunk reads its
+    own observation latent with its state row (Sana 764ee2113 / afc9874b6), the GDN numerator alone (c414e9b32); its
+    training-only speed switches (gdn_fused_two_stream, attn_res_fast_attend, attn_res_compiled_sum) change nothing."""
+
+    contract = resolve_causal_contract(_load(N1_OBS_S15000))
+    assert (contract.causal_observation, contract.causal_state, contract.gdn_output_normalizer) == (True, True, False)
+    assert (contract.sliding_window_chunks, contract.memory_content, contract.aligned_phase_window) == (
+        1, MEMORY_VIDEO_ONLY, ALIGNED_PHASE_FIRST_FRAME,
+    )
+    assert (contract.multiview, contract.visual_layout) == ("sana_latent", "three_view_strip")
+    text = contract.describe()
+    assert " chunk_observation=False causal_observation=True causal_state=True multiview=sana_latent " in text
+    assert text.endswith("first_chunk=0 gdn_output_normalizer=False")
+
+
+@pytest.mark.parametrize(
+    "observation,state,expected",
+    [(None, None, (False, False)), (True, None, (True, False)), (True, True, (True, True)), (False, False, (False, False))],
+    ids=["absent", "observation", "observation+state", "both-false"],
+)
+def test_the_causal_observation_switches_resolve(observation, state, expected):
+    cfg = copy.deepcopy(_load(RECIPE_PIXEL_N2))
+    for key, value in (("causal_observation", observation), ("causal_state", state)):
+        if value is not None:
+            _policy(cfg)[key] = value
+    contract = resolve_causal_contract(cfg)
+    assert (contract.causal_observation, contract.causal_state) == expected
+    assert f"causal_observation={expected[0]} causal_state={expected[1]} " in contract.describe()
+
+
+@pytest.mark.parametrize(
+    "edit,match",
+    [
+        ({"causal_state": True}, "set causal_observation: true"),
+        ({"causal_observation": "true"}, "causal_observation='true': must be true or false"),
+        ({"causal_observation": True, "causal_state": 1}, "causal_state=1: must be true or false"),
+        ({"physical_rope": True}, "physical_rope=True: the deploy clock does not follow it"),
+    ],
+    ids=["state-without-observation", "observation-string", "state-int", "physical-rope"],
+)
+def test_the_causal_observation_switches_are_refused_outside_their_contract(edit, match):
+    cfg = copy.deepcopy(_load(RECIPE_PIXEL_N2))
+    _policy(cfg).update(edit)
+    with pytest.raises((ValueError, NotImplementedError), match=match):
+        resolve_causal_contract(cfg)
+
+
+def test_a_run_record_contradicting_the_observation_switches_is_refused():
+    contract = resolve_causal_contract(_load(N1_OBS_S15000))
+    check_run_record({"causal_observation": True, "causal_state": True, "memory_gdn_output_normalizer": False}, contract)
+    for key in ("causal_observation", "causal_state"):
+        with pytest.raises(ValueError, match=f"records {key}=False"):
+            check_run_record({key: False}, contract)
 
 
 @pytest.mark.parametrize(

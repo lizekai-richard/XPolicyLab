@@ -298,6 +298,8 @@ class Model(ModelTemplate):
         self.frame_stride = int(contract.video_frame_stride)
         self.memory_content = str(contract.memory_content)
         self.first_chunk = int(contract.first_chunk)   # the episode's first emission: 1 (padded window) or 0 (first frame)
+        # causal_observation: every chunk is generated from its own observation latent (its start frame encoded alone)
+        self.causal_observation = bool(contract.causal_observation)
         check_commit_actions(self.commit_actions, self.memory_content)
 
         # diagnostics: per-chunk memory-read aggregates of every generation forward (attention_probe.py)
@@ -459,10 +461,10 @@ class Model(ModelTemplate):
         return wm_error, gap
 
     def _open_memory(self, views: list[torch.Tensor], anchor_raw: np.ndarray, anchor_norm: torch.Tensor,
-                     action_mask: torch.Tensor, timings: dict) -> None:
+                     action_mask: torch.Tensor, timings: dict) -> torch.Tensor:
         """(Re)open the streams and the memory at this frame: the sink (the first emitted chunk's observation), then a
         padded window's frozen first chunk (its rows hold the robot at this state under video_and_action); a
-        first-frame window's streams open on the sink alone."""
+        first-frame window's streams open on the sink alone. Returns the sink's latent."""
 
         device = self.runtime.device
         self._streams = self.runtime.new_streams()
@@ -473,7 +475,7 @@ class Model(ModelTemplate):
         self._session.view_shapes = self._streams.view_shapes if self.runtime.strip else None
         if self.first_chunk == 0:
             _, timings["open_commit_s"] = timed(self._session.commit_sink, sink)
-            return
+            return sink
         mask_cpu = action_mask[0].detach().cpu()
         hold_raw = torch.from_numpy(np.repeat(anchor_raw[None].astype(np.float32), self.chunk_actions, axis=0))
         hold = normalize_action(hold_raw, mask_cpu, self.normalization).masked_fill(~mask_cpu, 0)
@@ -486,6 +488,7 @@ class Model(ModelTemplate):
             )
 
         _, timings["open_commit_s"] = timed(opening)
+        return sink
 
     def get_action(self) -> list[dict[str, np.ndarray]]:
         obs = self._latest_obs
@@ -518,10 +521,19 @@ class Model(ModelTemplate):
         anchor_mask_t = torch.as_tensor(anchor_mask, dtype=torch.bool, device=device)
         action_mask = anchor_mask_t.reshape(1, 1, -1).expand(1, self.chunk_actions, -1).contiguous()
         views = self.runtime.view_frames(frames)
+        sink = None
         if first or self.memory_mode == "none":
             # the episode opens here (memory none: every chunk reopens it at its own start frame); the first emitted
             # chunk's observation is the sink, the first frame encoded alone
-            self._open_memory(views, anchor_raw, anchor_norm, action_mask, timings)
+            sink = self._open_memory(views, anchor_raw, anchor_norm, action_mask, timings)
+        observation_kwargs = {}
+        if self.causal_observation:
+            # the chunk's own observation latent: its start frame encoded alone, i.e. the sink's latent at the frame the
+            # memory (re)opened at, else this frame on fresh streams of its own (Sana encode_observation)
+            observation = sink
+            if observation is None:
+                observation, timings["observation_encode_s"] = timed(self._streams.encode_observation, views)
+            observation_kwargs["observation"] = observation
         chunk = self._session.chunk_idx   # the training chunk this window is (the first emitted one at the first frame)
         expected = self.first_chunk if self.memory_mode == "none" else decision + self.first_chunk
         if chunk != expected:
@@ -537,6 +549,7 @@ class Model(ModelTemplate):
             action_mask=action_mask,
             generator=generator,
             gripper_bounds=self.gripper_bounds,
+            **observation_kwargs,
         )
         if self._probe is not None:
             self._probe.write(

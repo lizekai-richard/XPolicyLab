@@ -47,6 +47,10 @@ class AttentionProbe:
     """Per-chunk aggregates of the memory read; ``install`` it on a ``CausalPolicyModel``, the session drives it."""
 
     def __init__(self, model) -> None:
+        if getattr(model, "causal_observation", False):
+            raise NotImplementedError(
+                "attention_dump_dir: the probe does not model a causal_observation chunk's observation prefill"
+            )
         if any(getattr(block.attn, "output_normalizer", True) is False for block in model.blocks):
             raise NotImplementedError(
                 "attention_dump_dir: the probe's GDN parts are shares of the readout's denominator, which a numerator-only "

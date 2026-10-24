@@ -1,5 +1,8 @@
 """Real-weight teacher-forcing parity: Sana's two-stream TRAINING forward vs the adapter's KV-cache inference, on the
-episode canvas in its single form (no chunk observations; the live tree must be at or after Sana 4bd6eca83).
+episode canvas in its single form (no chunk observations; the live tree must be at or after Sana 4bd6eca83). A
+``causal_observation`` checkpoint (Sana 764ee2113, causal_state afc9874b6; a live tree at or after them) runs with every
+chunk's own observation latent -- its start frame encoded alone -- on both sides: [o_c | targets] on the canvas, the
+session's observation prefill before the chunk's window on the chain.
 
 The same checkpoint and the same inputs go through two implementations of one prediction:
 
@@ -125,6 +128,37 @@ def build_live(sana_repo: str, ckpt_dir: str, dtype: torch.dtype, device):
     return model, result.missing_keys
 
 
+def reference_forms(model) -> list[str]:
+    """The live training forward in its reference forms: the recipe's training-only speed switches off (Sana 02aebea6e
+    gdn_fused_two_stream, c4d1d246d attn_res_fast_attend / attn_res_compiled_sum: Triton / cached forms of the same
+    math, the GDN one with bf16 matmuls) and the two-stream softmax through Sana's per-segment ``_two_stream_spans``,
+    which the FlexAttention call equals up to summation order (its compiled kernel at head dim 256 needs 139 KB of shared
+    memory, more than an sm_86 board has). Returns what was changed."""
+
+    changed = []
+    if getattr(model, "gdn_fused_two_stream", False):
+        model.gdn_fused_two_stream = False
+        changed.append("gdn_fused_two_stream")
+    for name in ("fast_training_attend", "compiled_source_sum"):
+        if getattr(model.attn_res, name, False):
+            setattr(model.attn_res, name, False)
+            changed.append(f"attn_res.{name}")
+
+    def spans(self, q, k, v, bounds, num_clean, window=None, sink=0, sink_phases=None, observation_spans=()):
+        return self._two_stream_spans(q, k, v, bounds, num_clean, window=window, sink=sink, sink_phases=sink_phases,
+                                      observation_spans=observation_spans)
+
+    for block in model.blocks:
+        attn = block.attn
+        if getattr(attn, "fused_two_stream", False):
+            attn.fused_two_stream = False
+        if hasattr(attn, "_two_stream_attention") and hasattr(attn, "_two_stream_spans"):
+            attn._two_stream_attention = types.MethodType(spans, attn)
+            if "two_stream_spans" not in changed:
+                changed.append("two_stream_spans")
+    return changed
+
+
 def gdn_rope_in_float64() -> None:
     """fp64 runs: both implementations rotate the GDN numerator in complex64 (Sana ``chunk_causal_gdn._rope_bhnd``, the
     port's ``layers.rope_bhnd_complex64``), i.e. at fp32 precision whatever the activations; at real sizes a last-bit
@@ -196,13 +230,17 @@ def two_stream(live, crwm, inp, L, f_c, chunk, memory_content, first, autocast_d
     dev = next(live.parameters()).device
     views, slots = inp["view_shapes"], inp["view_slots"]
     width = sum(h * w for h, w in views)
-    x = torch.cat([sink] + clean[: L - 1] + noisy[:L], dim=2)
+    # causal_observation: noisy chunk c is [o_c | targets], o_c clean (Sana noisy_chunk_frames)
+    observations = inp.get("observations")
+    lead = int(observations is not None)
+    noisy = [torch.cat([observations[c], noisy[c]], dim=2) if lead else noisy[c] for c in range(L)]
+    x = torch.cat([sink] + clean[: L - 1] + noisy, dim=2)
     strip = x.reshape(*x.shape[:3], 1, width)
     frames = x.shape[2]
     noisy_start = 1 + (L - 1) * f_c
     t_video = torch.zeros(1, frames, dtype=torch.float32)
     for c in range(L):
-        lo = noisy_start + c * f_c
+        lo = noisy_start + c * (lead + f_c) + lead
         t_video[:, lo : lo + f_c] = inp["t_video"][c]
     memory = crwm.memory_row_chunks(L, memory_content)
     rows = torch.cat(inp["a_clean"][:memory] + inp["a_noisy"][:L], dim=1)
@@ -234,7 +272,7 @@ def two_stream(live, crwm, inp, L, f_c, chunk, memory_content, first, autocast_d
     positions = crwm.action_row_positions(grid, chunk)
     preds = []
     for c in range(first, L):
-        lo = noisy_start + c * f_c
+        lo = noisy_start + c * (lead + f_c) + lead
         v = out["x"][:, :, lo : lo + f_c].reshape(1, -1, f_c, *clean[0].shape[-2:])
         a = out["action_pred"].index_select(1, positions[(memory + c) * chunk : (memory + c + 1) * chunk].to(dev))
         preds.append((v.float().cpu(), a.float().cpu()))
@@ -277,11 +315,19 @@ def kv_chain(mirror, inp, L, window, first, autocast_dtype):
             "action80": inp["a_noisy"][k].to(dev, dtype), "action_mask80": amask, "action_timesteps": action_t,
         }
         reads.append((session.read_chunk_ids(), session.softmax_origin()))
-        caches = session._caches(memory, commit=False)
         with torch.no_grad(), session._autocast(dev):
+            if session.observation:   # the chunk's observation prefill (Sana forward_observation), read by its window
+                caches = session.prefill_observation(
+                    caption, memory, inp["observations"][k].to(dev, dtype), state=robot["state80"],
+                    state_mask=robot["state_mask80"],
+                )
+            else:
+                caches = session._caches(memory, commit=False)
+            frame_offset, step_offset = session.window_offsets()
+            robot, robot_form = session.denoise_robot(robot)
             out = session._forward(
-                inp["noisy"][k].to(dev, dtype), video_t, caption, memory, frame_offset=k * f_c + 1,
-                step_offset=k * chunk, robot=robot, caches=caches,
+                inp["noisy"][k].to(dev, dtype), video_t, caption, memory, frame_offset=frame_offset,
+                step_offset=step_offset, robot=robot, caches=caches, robot_form=robot_form,
             )
         preds.append((out["x"].float().cpu(), out["action_pred"].float().cpu()))
         if k < L - 1:
@@ -355,6 +401,16 @@ def main() -> int:
     for k in range(first, L):
         per_tick = [views[(k - first) * chunk + t] for t in range(stride, chunk + 1, stride)]
         clean.append(streams.encode_chunk([[v[i] for v in per_tick] for i in range(len(per_tick[0]))]).float().cpu())
+    observations = None
+    if contract.causal_observation:
+        # every chunk's own observation latent: its start frame encoded alone (chunk `first` starts at the first frame,
+        # so its observation is the sink's latent; a padded window's frozen chunk 0 takes the sink too)
+        observations = [sink.float().cpu()] * first + [
+            streams.encode_observation(views[(k - first) * chunk]).float().cpu() for k in range(first, L)
+        ]
+        obs_gap = float((observations[first] - sink.float().cpu()).abs().max())
+        print(f"[tf-parity] causal_observation: {L} observation latents (chunk {first}'s vs the sink: max {obs_gap:.1e})",
+              flush=True)
     sink = sink.float().cpu()
     first_frame, _ = runtime.encode_sink(views[0])
     sink_gap = float(((first_frame.float().cpu() - sink) ** 2).mean().sqrt() / (sink ** 2).mean().sqrt().clamp_min(1e-8))
@@ -381,6 +437,8 @@ def main() -> int:
         "a_clean": [rows[k * chunk + 1 : (k + 1) * chunk + 1][None] for k in range(L)],
         "t_video": [1000.0 * s for s in sig_v], "t_action": [1000.0 * s for s in sig_a],
     }
+    if observations is not None:
+        inp["observations"] = observations
     inp["noisy"] = [(1 - s) * x0 + s * torch.randn(x0.shape, generator=g) for s, x0 in zip(sig_v, clean)]
     inp["a_noisy"] = [((1 - s) * a0 + s * torch.randn(a0.shape, generator=g)).masked_fill(~action_mask, 0)
                       for s, a0 in zip(sig_a, inp["a_clean"])]
@@ -397,6 +455,7 @@ def main() -> int:
         dtype = getattr(torch, prec)
         autocast = None if dtype in (torch.float32, torch.float64) else dtype
         live, missing = build_live(args.sana_repo, args.checkpoint_dir, dtype, model_device)
+        print(f"[tf-parity] {prec} live reference forms: {reference_forms(live)}", flush=True)
         if dtype == torch.float64:
             attention_in_working_precision(live)
         t1 = time.perf_counter()

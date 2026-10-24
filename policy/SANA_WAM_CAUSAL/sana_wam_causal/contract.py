@@ -30,6 +30,15 @@ one chunk, memory only; the deploy commits it and emits from chunk 1) or ``first
 frame's own chunk with no memory before it but the sink and is supervised; the deploy emits from chunk 0, which reads
 the sink as its observation).
 
+``model.extra.chunk_causal_policy.causal_observation`` (Sana ``764ee2113``, deploy ``adc4867ea``; false when absent) gives
+every noisy chunk its own observation latent o_c, its start frame encoded alone (chunk 0's is the sink's latent), clean,
+one latent frame after the most recent memory latent: it reads the sink, the softmax window, the GDN state and itself,
+never its chunk's targets or robot rows, and is never committed; the chunk's targets (one frame after it) and robot
+rows (C / f_c steps later) read it besides the window. ``causal_state`` (Sana ``afc9874b6``, deploy ``8b599e49d``; false
+when absent, true only with ``causal_observation``) joins the chunk's state row to o_c's group: the denoise window then
+carries the targets and the C action rows alone. ``physical_rope`` (Sana ``6e91eaf2a``) is refused: Sana's cached
+session refuses it too.
+
 ``model.memory_gdn_output_normalizer`` (Sana ``c414e9b32``; ``true`` when absent) decides every GDN layer's readout: true
 divides the numerator ``q (gS + K^T diag(beta) V)`` by the denominator ``ReLU(q) . (gz + K_den^T beta) + eps``, false
 returns the numerator alone (z is still carried, so a commit writes the same state either way). The per-head RMSNorm
@@ -110,6 +119,8 @@ class CausalContract:
     reset_legacy_beta: bool
     aligned_phase_window: str = ALIGNED_PHASE_PADDED  # padded: chunk 0 frozen, memory only | first_frame: chunk 0 emitted
     gdn_output_normalizer: bool = True  # false: every GDN layer reads its numerator alone (memory_gdn_output_normalizer)
+    causal_observation: bool = False    # every noisy chunk opens with its own observation latent, read causally
+    causal_state: bool = False          # the chunk's state row joins its observation latent (causal_observation only)
 
     @property
     def first_chunk(self) -> int:
@@ -123,7 +134,8 @@ class CausalContract:
             f"protocol={PROTOCOL_EPISODE} actions_per_chunk={self.actions_per_chunk} "
             f"video_frame_stride={self.video_frame_stride} latent_frames_per_chunk={self.latent_frames_per_chunk} "
             f"sliding_window_chunks={window} memory_content={self.memory_content} "
-            f"chunk_observation=False multiview={self.multiview} visual_layout={self.visual_layout} "
+            f"chunk_observation=False causal_observation={self.causal_observation} causal_state={self.causal_state} "
+            f"multiview={self.multiview} visual_layout={self.visual_layout} "
             f"rope={self.rope} aligned_phase_window={self.aligned_phase_window} first_chunk={self.first_chunk} "
             f"gdn_output_normalizer={self.gdn_output_normalizer}"
         )
@@ -195,6 +207,33 @@ def resolve_gdn_output_normalizer(value: Any) -> bool:
     return value
 
 
+def resolve_causal_observation(value: Any) -> bool:
+    """``causal_observation`` as Sana reads it (``causal_rwm_train.resolve_causal_observation``, 764ee2113): None ->
+    false, a yaml boolean otherwise."""
+
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"model.extra.chunk_causal_policy.causal_observation={value!r}: must be true or false")
+    return value
+
+
+def resolve_causal_state(value: Any, observation: bool) -> bool:
+    """``causal_state`` as Sana reads it (``causal_rwm_train.resolve_causal_state``, afc9874b6): None -> false, a yaml
+    boolean otherwise, true only with ``causal_observation`` (the state row joins the observation latent)."""
+
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"model.extra.chunk_causal_policy.causal_state={value!r}: must be true or false")
+    if value and not observation:
+        raise ValueError(
+            "model.extra.chunk_causal_policy.causal_state joins every noisy chunk's state row to its observation latent; "
+            "set causal_observation: true"
+        )
+    return value
+
+
 def refuse_chunk_observation(value: Any) -> None:
     """``chunk_observation`` as Sana reads it since 4bd6eca83 (``causal_rwm_train.refuse_chunk_observation``): chunk
     observations are retired, every noisy chunk reads its observation from the memory; absent or ``false`` is accepted
@@ -244,6 +283,8 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
         ("aligned_phase_window", contract.aligned_phase_window),
         ("memory_content", contract.memory_content),
         ("memory_gdn_output_normalizer", contract.gdn_output_normalizer),
+        ("causal_observation", contract.causal_observation),
+        ("causal_state", contract.causal_state),
     ):
         recorded = record.get(key)
         if recorded is not None and recorded != resolved:
@@ -364,6 +405,14 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         )
     memory_content = resolve_memory_content(options.get("memory_content"))
     refuse_chunk_observation(options.get("chunk_observation"))
+    causal_observation = resolve_causal_observation(options.get("causal_observation"))
+    causal_state = resolve_causal_state(options.get("causal_state"), causal_observation)
+    physical_rope = options.get("physical_rope")
+    if physical_rope is not None and physical_rope is not False:
+        raise NotImplementedError(
+            f"model.extra.chunk_causal_policy.physical_rope={physical_rope!r}: the deploy clock does not follow it (Sana's "
+            "cached session refuses it, posttrain_causal_handoff 01 section 5)"
+        )
     aligned_phase_window = resolve_aligned_phase_window(_extra(cfg.get("data")).get("aligned_phase_window"))
     window = options.get("sliding_window_chunks")
     window = None if window is None else int(window)
@@ -406,6 +455,8 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         reset_legacy_beta=bool(options.get("reset_legacy_beta", False)),
         aligned_phase_window=aligned_phase_window,
         gdn_output_normalizer=resolve_gdn_output_normalizer(model_cfg.get("memory_gdn_output_normalizer")),
+        causal_observation=causal_observation,
+        causal_state=causal_state,
     )
 
 
@@ -433,6 +484,8 @@ __all__ = [
     "resolve_aligned_phase_window",
     "refuse_chunk_observation",
     "resolve_causal_contract",
+    "resolve_causal_observation",
+    "resolve_causal_state",
     "resolve_gdn_output_normalizer",
     "resolve_memory_content",
 ]

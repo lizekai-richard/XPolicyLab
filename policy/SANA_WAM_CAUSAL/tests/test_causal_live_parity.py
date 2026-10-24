@@ -43,6 +43,10 @@ TEXT_LEN, TEXT_CH = 7, 16
 MEMORIES = [MEMORY_VIDEO_AND_ACTION, MEMORY_VIDEO_ONLY]
 CLOSE = {"rtol": 1e-9, "atol": 1e-12}            # fp64 everywhere (fp32 attention off on both sides)
 FP32_ATTENTION_CLOSE = {"rtol": 1e-5, "atol": 1e-8}  # fp32 attention on: CPU SDPA kernels pick layouts freely
+# causal_observation: the denoise read splits the noisy segment's sums (its decay pool, its K^T diag(beta) V) between the
+# prefill and the window, which moves fp64 round-off; Sana's own observation-session parity uses the same bound
+# (tests/test_causal_observation_session.py EXACT)
+OBSERVED_CLOSE = {"rtol": 1e-7, "atol": 1e-9}
 
 
 def _reference_varlen(q, k, v, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None, dropout_p=0.0):
@@ -103,13 +107,22 @@ def _require_live_gdn_normalizer():
         pytest.skip(f"{SANA_CAUSAL_REPO} predates model.memory_gdn_output_normalizer (c414e9b32)")
 
 
+def _require_live_causal_observation(state: bool = False):
+    """Skip unless the live tree serves causal_observation (Sana 764ee2113) and, for ``state``, causal_state
+    (afc9874b6) in its cached session."""
+
+    _, crwm = _live_modules()
+    if not hasattr(crwm, "resolve_causal_observation") or (state and not hasattr(crwm, "resolve_causal_state")):
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates causal_observation / causal_state (764ee2113 / afc9874b6)")
+
+
 class Twins:
     """A tiny live causal policy and the mirror with the same weights (fp64), plus one random episode: the sink (the
     first frame, chunk 0's observation), clean targets and noisy targets."""
 
     def __init__(self, *, views=1, stride=4, chunk=32, window=None, separate=True, chunks=4, depth=4, seed=11,
                  fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, first_frame=False, normalizer=True,
-                 live_normalizer=None):
+                 live_normalizer=None, observation=False, state=False):
         causal, self.crwm = _live_modules()
         # the mirror's GDN readout (contract.gdn_output_normalizer) and the live one (model.memory_gdn_output_normalizer;
         # live_normalizer differs only in the negative control)
@@ -130,6 +143,10 @@ class Twins:
             softmax_ratio=0.5, attn_res_block_size=2, use_time_conditioning=False, y_norm=True, cross_norm=True,
         )
         options = {"actions_per_chunk": {str(int(FPS)): chunk}, "memory_content": memory}
+        self.observation, self.state = bool(observation), bool(state)
+        if observation:
+            _require_live_causal_observation(state)
+            options.update(causal_observation=True, causal_state=bool(state))
         if window is not None:
             options["sliding_window_chunks"] = window
         multiview = "sana_pixel" if views == 1 else "sana_latent"
@@ -159,7 +176,7 @@ class Twins:
             visual_layout="sana_pixel_canvas" if views == 1 else "three_view_strip", rope="aligned",
             dt_bias_init=-5.0, a_log_init=0.0, reset_legacy_beta=False,
             aligned_phase_window="first_frame" if first_frame else "padded",
-            gdn_output_normalizer=normalizer,
+            gdn_output_normalizer=normalizer, causal_observation=self.observation, causal_state=self.state,
         )
         policy_config = PolicyConfig.from_sana_kwargs(config=config, **kwargs)
         assert tuple(policy_config.multiview_spatial_rope_tile_shape) == (8, 16)
@@ -192,6 +209,9 @@ class Twins:
         self.y_null = randn(1, self.groups, 1, TEXT_LEN, TEXT_CH)
         self.mask = torch.ones(1, self.groups, TEXT_LEN, dtype=torch.int16)
         self.mask[..., 5:] = 0
+        # causal_observation: every chunk's own observation latent (its start frame encoded alone), drawn after the
+        # rest so the episode above is the same with and without the option
+        self.observations = [randn(1, C_LAT, 1, 1, self.width) for _ in range(chunks)]
 
     @property
     def video_and_action(self) -> bool:
@@ -220,11 +240,14 @@ class Twins:
         targets in the mirror's layout, action [1, C, 80])."""
 
         crwm, f_c, chunk = self.crwm, self.f_chunk, self.chunk
-        x = torch.cat([self.sink] + self.clean[: length - 1] + self.noisy[:length], dim=2)
+        # under causal_observation noisy chunk c is [o_c | targets], o_c clean (Sana noisy_chunk_frames)
+        lead = int(self.observation)
+        noisy = [torch.cat([self.observations[c], self.noisy[c]], dim=2) if lead else self.noisy[c] for c in range(length)]
+        x = torch.cat([self.sink] + self.clean[: length - 1] + noisy, dim=2)
         t_video = torch.zeros(1, x.shape[2], dtype=torch.float64)
         noisy_start = 1 + (length - 1) * f_c
         for c in range(length):
-            lo = noisy_start + c * f_c
+            lo = noisy_start + c * (lead + f_c) + lead
             t_video[:, lo : lo + f_c] = self.t_video[c]
         memory = crwm.memory_row_chunks(length, self.memory)
         rows = torch.cat(self.a_clean[:memory] + self.a_noisy[:length], dim=1)
@@ -253,7 +276,7 @@ class Twins:
         positions = crwm.action_row_positions(grid, chunk)
         chunks = []
         for k in range(length):
-            lo = noisy_start + k * f_c
+            lo = noisy_start + k * (lead + f_c) + lead
             rows_k = positions[(memory + k) * chunk : (memory + k + 1) * chunk]
             chunks.append((self.ours(out["x"][:, :, lo : lo + f_c]), out["action_pred"].index_select(1, rows_k)))
         return chunks
@@ -288,12 +311,21 @@ class Twins:
         ``generate_chunk`` runs), on the given noisy latents and timesteps."""
 
         f_c = self.f_chunk
+        assert session.chunk_idx == k
         t_window = torch.full((1, f_c), self.t_video[k], dtype=torch.float64)
         memory = session.memories[0]
-        caches = session._caches(memory, commit=False)
+        if session.observation:
+            caches = session.prefill_observation(
+                session.captions[0], memory, self.ours(self.observations[k]), state=self.states[k],
+                state_mask=torch.ones(1, 80, dtype=torch.bool),
+            )
+        else:
+            caches = session._caches(memory, commit=False)
+        frame_offset, step_offset = session.window_offsets()
+        robot, form = session.denoise_robot(self.robot(k, noisy=True))
         out = session._forward(
-            self.ours(self.noisy[k]), t_window, session.captions[0], memory, frame_offset=k * f_c + 1,
-            step_offset=k * self.chunk, robot=self.robot(k, noisy=True), caches=caches,
+            self.ours(self.noisy[k]), t_window, session.captions[0], memory, frame_offset=frame_offset,
+            step_offset=step_offset, robot=robot, caches=caches, robot_form=form,
         )
         return out["x"], out["action_pred"]
 
@@ -409,6 +441,90 @@ def test_a_mirror_that_divides_is_caught_on_a_numerator_only_policy(views):
     streaming = twins.streaming_first_frame(4)
     gap = max(_max_abs(streaming[k][i], training[k][i]) for k in range(4) for i in (0, 1))
     assert gap > 1e-6, gap
+
+
+OBSERVATION_CASES = [
+    # views, stride, chunk, window, length, memory, first_frame, normalizer
+    (1, 4, 32, 1, 5, MEMORY_VIDEO_ONLY, True, False),      # the N1-obs recipe on the canvas
+    (3, 4, 32, 1, 5, MEMORY_VIDEO_ONLY, True, False),      # ... on the strip (the released N1-obs checkpoint)
+    (3, 4, 32, 2, 6, MEMORY_VIDEO_ONLY, True, True),       # N2-obs before the numerator-only switch
+    (1, 4, 32, 2, 6, MEMORY_VIDEO_AND_ACTION, False, True),
+    (3, 4, 32, None, 4, MEMORY_VIDEO_AND_ACTION, True, True),
+    (1, 1, 16, 3, 6, MEMORY_VIDEO_ONLY, False, False),     # f_c = 2: the rows move C / f_c = 8 steps
+]
+OBSERVATION_IDS = ["V1-W1-vo-ff-num", "V3-W1-vo-ff-num", "V3-W2-vo-ff", "V1-W2-va-pad", "V3-noW-va-ff", "V1-s1c16-W3-vo-pad-num"]
+
+
+@pytest.mark.parametrize("state", [False, True], ids=["obs", "obs+state"])
+@pytest.mark.parametrize("views,stride,chunk,window,length,memory,first_frame,normalizer", OBSERVATION_CASES,
+                         ids=OBSERVATION_IDS)
+def test_an_observed_deploy_chain_equals_two_stream_training_forward(views, stride, chunk, window, length, memory,
+                                                                    first_frame, normalizer, state):
+    """causal_observation (Sana 764ee2113) and causal_state (afc9874b6): every noisy chunk of the training canvas
+    [sink | clean | (o_c, targets_c) ...] == the deploy chain's chunk (its observation prefill, then its denoising
+    window reading it besides the memory), past the softmax window, on both front-ends, both memory contents, both phase
+    windows, with and without the GDN denominator."""
+
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=length, memory=memory,
+                  first_frame=first_frame, normalizer=normalizer, observation=True, state=state)
+    assert twins.live.causal_observation and twins.live.causal_state is state
+    training = twins.two_stream(length) if first_frame else twins.two_stream(length)[1:]
+    streaming = twins.streaming_first_frame(length) if first_frame else twins.streaming(length)
+    assert len(training) == len(streaming)
+    for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming)):
+        torch.testing.assert_close(x_ours, x_live, **OBSERVED_CLOSE, msg=lambda m: f"chunk {k} video: {m}")
+        torch.testing.assert_close(a_ours, a_live, **OBSERVED_CLOSE, msg=lambda m: f"chunk {k} action: {m}")
+
+
+def _observed_window(twins, session, k, *, drop_gdn=False, drop_softmax=False, state_in_window=False, shift=0):
+    """Chunk k's denoising window after its observation prefill, with one part of the protocol broken (negative
+    controls): the GDN or softmax observation terms dropped, the state row in the window, the window ``shift`` frames
+    off its slot."""
+
+    memory = session.memories[0]
+    caches = session.prefill_observation(
+        session.captions[0], memory, twins.ours(twins.observations[k]), state=twins.states[k],
+        state_mask=torch.ones(1, 80, dtype=torch.bool),
+    )
+    for cache in caches:
+        if drop_gdn:
+            cache.gdn_observation = None
+        if drop_softmax and cache.softmax_context is not None:
+            n_obs = twins.width + int(twins.state)
+            cache.softmax_context = tuple(t[:, :-n_obs] for t in cache.softmax_context)
+    frame_offset, step_offset = session.window_offsets()
+    robot = twins.robot(k, noisy=True)
+    robot, form = (robot, "chunk") if state_in_window else session.denoise_robot(robot)
+    if state_in_window:
+        session.model.causal_state = False   # the model would refuse a full chunk window under causal_state
+    try:
+        out = session._forward(
+            twins.ours(twins.noisy[k]), torch.full((1, twins.f_chunk), twins.t_video[k], dtype=torch.float64),
+            session.captions[0], memory, frame_offset=frame_offset + shift, step_offset=step_offset, robot=robot,
+            caches=caches, robot_form=form,
+        )
+    finally:
+        session.model.causal_state = twins.state
+    return out["x"], out["action_pred"]
+
+
+@pytest.mark.parametrize(
+    "broken", ["drop_gdn", "drop_softmax", "state_in_window", "shift"],
+    ids=["no-gdn-observation", "no-softmax-observation", "state-in-the-window", "targets-at-the-observation-frame"],
+)
+def test_a_broken_observation_protocol_is_caught(broken):
+    """Negative controls: the parity above misses as soon as the denoise read drops the observation's GDN terms or its
+    softmax K/V, carries the state row itself under causal_state, or puts its targets on the observation's frame."""
+
+    twins = Twins(views=3, window=1, chunks=3, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=True,
+                  state=broken == "state_in_window" or broken == "drop_softmax")
+    training = twins.two_stream(3)
+    session = twins.session()
+    session.commit_sink(twins.ours(twins.sink))
+    kwargs = {"shift": -1} if broken == "shift" else {broken: True}
+    moved = _observed_window(twins, session, 0, **kwargs)
+    gap = max(_max_abs(moved[i], training[0][i]) for i in (0, 1))
+    assert gap > 1e-6, (broken, gap)
 
 
 @pytest.mark.parametrize("views", [1, 3])
@@ -703,6 +819,143 @@ def test_a_first_frame_session_matches_the_live_deploy_session(views, memory, vi
     assert ours.chunk_idx == live.chunk_idx == chunks
 
 
+OBSERVED_SESSION_CASES = [
+    # views, memory, video_cfg, action_cfg, position mode, window, state, normalizer
+    (3, MEMORY_VIDEO_ONLY, 6.0, 1.0, "rank", 1, True, False),       # the released N1-obs checkpoint's contract
+    (1, MEMORY_VIDEO_ONLY, 3.0, 1.0, "absolute", 1, True, False),
+    (3, MEMORY_VIDEO_ONLY, 2.5, 1.7, "absolute", 2, False, True),
+    (1, MEMORY_VIDEO_AND_ACTION, 2.5, 1.7, "rank", 2, True, True),
+    (3, MEMORY_VIDEO_AND_ACTION, 3.0, 1.0, "rank", 4, False, False),
+]
+
+
+@pytest.mark.parametrize("views,memory,video_cfg,action_cfg,position_mode,window,state,normalizer", OBSERVED_SESSION_CASES)
+def test_an_observed_session_matches_the_live_deploy_session(views, memory, video_cfg, action_cfg, position_mode,
+                                                            window, state, normalizer):
+    """A first-frame episode of a causal_observation policy (causal_state on or off): the mirror's session == Sana's
+    CausalPolicyChunkSession (deploy adc4867ea / 8b599e49d), both generating every chunk from its own observation
+    latent (prefilled once per text stream, read by every step) with per-stream CFG past the window boundary, then the
+    same commits."""
+
+    steps, chunks = 3, 6
+    twins = Twins(views=views, window=window, chunks=chunks, memory=memory, first_frame=True, observation=True,
+                  state=state, normalizer=normalizer)
+    live = _live_session(twins, steps, video_cfg, action_cfg, position_mode)
+    ours = twins.session(steps=steps, video_cfg=video_cfg, action_cfg=action_cfg)
+    assert ours.observation and ours.causal_state is state
+    mask = torch.ones(1, twins.chunk, 80, dtype=torch.bool)
+    mask[..., 60:] = False
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    live.commit_sink(twins.sink)
+    ours.commit_sink(twins.ours(twins.sink))
+    g = torch.Generator().manual_seed(23)
+    for k in range(chunks):
+        video_noise = torch.randn(1, C_LAT, twins.f_chunk, 1, twins.width, generator=g, dtype=torch.float64)
+        action_noise = torch.randn(1, twins.chunk, 80, generator=g, dtype=torch.float64)
+        observation = twins.sink if k == 0 else twins.observations[k]   # chunk 0's observation is the sink's latent
+        a_live, v_live = live.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask, video_noise=video_noise,
+            action_noise=action_noise, observation=observation,
+        )
+        a_ours, v_ours = ours.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask,
+            video_noise=twins.ours(video_noise), action_noise=action_noise, observation=twins.ours(observation),
+        )
+        torch.testing.assert_close(a_ours, a_live, **OBSERVED_CLOSE, msg=lambda m: f"chunk {k} action: {m}")
+        torch.testing.assert_close(v_ours, twins.ours(v_live), **OBSERVED_CLOSE, msg=lambda m: f"chunk {k} video: {m}")
+        live.commit_chunk(twins.clean[k], twins.a_clean[k], anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask)
+        ours.commit_chunk(twins.ours(twins.clean[k]), twins.a_clean[k], anchor_state=twins.states[k],
+                          anchor_state_mask=state_mask, action_mask=mask)
+    assert ours.chunk_idx == live.chunk_idx == chunks
+
+
+def test_an_observed_policy_requires_its_observation_and_others_refuse_one():
+    """generate_chunk of a causal_observation policy needs the chunk's observation latent; a policy without the option
+    refuses one (Sana's session does both)."""
+
+    observed = Twins(chunks=2, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=True)
+    plain = Twins(chunks=2, memory=MEMORY_VIDEO_ONLY, first_frame=True)
+    mask = torch.ones(1, observed.chunk, 80, dtype=torch.bool)
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    for twins, observation, match in (
+        (observed, None, "generates every chunk from its own observation latent"),
+        (plain, plain.ours(plain.sink), "reads no observation latent"),
+    ):
+        session = twins.session()
+        session.commit_sink(twins.ours(twins.sink))
+        with pytest.raises(ValueError, match=match):
+            session.generate_chunk(anchor_state=twins.states[0], anchor_state_mask=state_mask, action_mask=mask,
+                                   observation=observation)
+    session = observed.session()
+    session.commit_sink(observed.ours(observed.sink))
+    with pytest.raises(ValueError, match="observation must be"):
+        session.generate_chunk(anchor_state=observed.states[0], anchor_state_mask=state_mask, action_mask=mask,
+                               observation=observed.ours(observed.noisy[0]).repeat(1, 1, 2, 1, 1))
+
+
+@pytest.mark.parametrize("state", [False, True], ids=["obs", "obs+state"])
+def test_an_observed_generation_writes_nothing_to_the_memory(state):
+    """The observation latent and the state row are read by their chunk's generation only: a whole generate_chunk (the
+    prefill and every denoising step, both text streams) leaves every stream's memory -- the GDN (S, z) and the softmax
+    sink and committed entries -- the same tensors with the same values, and the entry counts unchanged."""
+
+    twins = Twins(views=3, window=2, chunks=4, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=True, state=state)
+    session = twins.session(steps=2, video_cfg=3.0)
+    session.commit_sink(twins.ours(twins.sink))
+    mask = torch.ones(1, twins.chunk, 80, dtype=torch.bool)
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    for k in range(3):
+        before = [
+            ({i: tuple(t.clone() for t in m.gdn[i]) for i in m.gdn}, {i: m.sink[i] for i in m.sink},
+             {i: [tuple(t.clone() for t in e) for e in m.chunks[i]] for i in m.chunks}, m.committed, m.has_sink)
+            for m in session.memories
+        ]
+        objects = [({i: m.gdn[i] for i in m.gdn}, {i: list(m.chunks[i]) for i in m.chunks}) for m in session.memories]
+        session.generate_chunk(anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask,
+                               observation=twins.ours(twins.observations[k]))
+        for m, (gdn, sink, chunks, committed, has_sink), (gdn_obj, chunk_obj) in zip(session.memories, before, objects):
+            assert m.committed == committed and m.has_sink == has_sink and session.chunk_idx == k
+            for i in m.gdn:
+                assert m.gdn[i] is gdn_obj[i]
+                for now, then in zip(m.gdn[i], gdn[i]):
+                    torch.testing.assert_close(now, then, rtol=0, atol=0)
+            for i in m.sink:
+                assert m.sink[i] is sink[i]
+            for i in m.chunks:
+                assert len(m.chunks[i]) == len(chunks[i]) and all(a is b for a, b in zip(m.chunks[i], chunk_obj[i]))
+                for now, then in zip(m.chunks[i], chunks[i]):
+                    for x, y in zip(now, then):
+                        torch.testing.assert_close(x, y, rtol=0, atol=0)
+        twins.commit(session, k)
+
+
+def test_the_commits_after_observed_chunks_are_the_policys_without_the_option():
+    """The commit is the policy's without causal_observation: after every chunk's prefill and denoise reads, the
+    memory each commit leaves (GDN (S, z), softmax entries) equals that of the same policy that never observed."""
+
+    observed = Twins(views=3, window=2, chunks=4, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=True,
+                     state=True)
+    plain = Twins(views=3, window=2, chunks=4, memory=MEMORY_VIDEO_ONLY, first_frame=True)
+    plain.mirror.load_state_dict(observed.mirror.state_dict())
+    sessions = []
+    for twins in (observed, plain):
+        session = twins.session()
+        session.commit_sink(twins.ours(twins.sink))
+        for k in range(3):
+            if twins is observed:
+                twins.denoise_forward(session, k)
+            twins.commit(session, k)
+        sessions.append(session)
+    a, b = (s.memories[0] for s in sessions)
+    for index in a.gdn:
+        for x, y in zip(a.gdn[index], b.gdn[index]):
+            torch.testing.assert_close(x, y, rtol=0, atol=0)
+    for index in a.chunks:
+        for (ka, va), (kb, vb) in zip(a.chunks[index], b.chunks[index]):
+            torch.testing.assert_close(ka, kb, rtol=0, atol=0)
+            torch.testing.assert_close(va, vb, rtol=0, atol=0)
+
+
 def test_the_softmax_clock_stays_in_a_training_window_and_the_gdn_clock_is_physical():
     """Every rotary table the mirror builds during a 7-chunk episode with W = 3: the softmax layers' positions stay
     inside a training window (the sink at frame 0, the read's chunks in slots 0..W-1, the forward's own chunk at most in
@@ -714,9 +967,11 @@ def test_the_softmax_clock_stays_in_a_training_window_and_the_gdn_clock_is_physi
     calls = []
     original = mirror.window_rope
 
-    def recording(rope, fps, frames, view_shapes, view_slot_ids, robot_rows, frame_offset, step_offset, device):
+    def recording(rope, fps, frames, view_shapes, view_slot_ids, robot_rows, frame_offset, step_offset, device,
+                  robot_step_start=0):
         calls.append((rope is mirror.rope_softmax, frames, robot_rows, frame_offset, step_offset))
-        return original(rope, fps, frames, view_shapes, view_slot_ids, robot_rows, frame_offset, step_offset, device)
+        return original(rope, fps, frames, view_shapes, view_slot_ids, robot_rows, frame_offset, step_offset, device,
+                        robot_step_start)
 
     mirror.window_rope = recording
     twins.streaming(length)

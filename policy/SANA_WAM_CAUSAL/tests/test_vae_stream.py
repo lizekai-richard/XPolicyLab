@@ -202,3 +202,35 @@ def test_the_streams_are_sanas_window_encode(bundle):
     for c in range(chunks + 1):
         assert torch.equal(live[:, :, 2 * c : 2 * c + 1], observations[c]), f"observation {c}"
         assert torch.equal(live[:, :, 2 * c + 1 : 2 * c + 2], targets[c]), f"targets {c}"
+
+
+@pytest.mark.parametrize("views", [1, 3])
+def test_an_observation_is_its_frame_encoded_alone_and_leaves_the_streams_where_they_were(bundle, views):
+    """causal_observation (Sana encode_observation): a chunk's observation latent is every view's start frame encoded
+    alone, bit for bit the sink's encode of that frame and the one-shot encode of the one frame, packed like the sink;
+    a first-frame episode whose streams encode one observation per chunk streams every chunk exactly as without them."""
+
+    chunks = 3
+    episode = _episode(views, chunks, seed=33)
+    firsts = [first for first, _ in episode]
+
+    def chunk_frames(j):
+        return [later[FRAMES_PER_CHUNK * j : FRAMES_PER_CHUNK * (j + 1)] for _, later in episode]
+
+    reference = ViewStreams(bundle, frames_per_chunk=FRAMES_PER_CHUNK, frozen_first_chunk=False)
+    reference.start(firsts)
+    expected = [reference.encode_chunk(chunk_frames(j)) for j in range(chunks)]
+    streams = ViewStreams(bundle, frames_per_chunk=FRAMES_PER_CHUNK, frozen_first_chunk=False)
+    sink, _ = streams.start(firsts)
+    assert torch.equal(streams.encode_observation(firsts), sink)   # chunk 0's observation: the sink's latent
+    got = []
+    for j in range(chunks):
+        got.append(streams.encode_chunk(chunk_frames(j)))
+        starts = [frames[-1] for frames in chunk_frames(j)]       # the next chunk's start frame: this chunk's last
+        observation = streams.encode_observation(starts)
+        alone = pack_multiview_latents([encode_window(bundle, [frame]) for frame in starts])[0]
+        assert torch.equal(observation, alone) and observation.shape[2] == 1
+    for j in range(chunks):
+        assert torch.equal(got[j], expected[j]), f"chunk {j}: the observation encodes moved the stream"
+    with pytest.raises(ValueError, match="observation frames"):
+        streams.encode_observation(firsts[:1] * (views + 1))

@@ -195,3 +195,12 @@ def test_a_probe_refuses_a_numerator_only_model():
     with pytest.raises(NotImplementedError, match="numerator-only"):
         AttentionProbe(model)
     assert all(block.attn.probe is None for block in model.blocks)
+
+
+def test_a_probe_refuses_a_causal_observation_model():
+    """The probe does not model a chunk's observation prefill (Sana 764ee2113): it refuses to install."""
+
+    model = _tiny_model(window=WINDOW)
+    model.causal_observation = True
+    with pytest.raises(NotImplementedError, match="causal_observation"):
+        AttentionProbe(model)

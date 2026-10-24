@@ -25,7 +25,11 @@ A forward receives an optional ``LayerCache``: absent = a window that reads and 
 softmax reads only the window); present = a cached window that reads ``cache.gdn_state`` (None = the zero state, the
 sink's write) / ``cache.softmax_context`` (the sink and the committed chunks of the read, already rotated) and,
 when ``cache.commit`` is set, leaves the next GDN state and this window's K/V in ``cache.gdn_next`` /
-``cache.softmax_new`` for the session to keep.
+``cache.softmax_new`` for the session to keep. Under ``causal_observation`` (Sana 764ee2113) a chunk's observation
+prefill (``cache.observation_prefill``) reads like any window and leaves its read terms (``gdn_observation``,
+``softmax_observation``); the chunk's denoise reads (``LayerCache.observed``) take them besides the window: the GDN pools
+its decay and key scale with the observation's tokens and reads their terms besides the state (Sana
+``gdn_observed_read``), the softmax reads the observation's rotated K/V after the window.
 """
 
 from __future__ import annotations
@@ -56,6 +60,18 @@ SOFTMAX_KIND = "GatedSoftmaxAttention"
 
 
 @dataclass
+class GDNObservation:
+    """A chunk's observation latent as its denoise reads take it in one GDN layer (Sana ``CachedObservation``): its
+    layer inputs summed over its tokens in float32 or better (its share of the chunk's decay pool), its read terms
+    ``K^T diag(beta) V`` [B,H,D,D] and ``K_den^T beta`` [B,H,D] without the key scale (K rotated), and its token count."""
+
+    x_sum: torch.Tensor
+    kv: torch.Tensor
+    z: torch.Tensor
+    count: int
+
+
+@dataclass
 class LayerCache:
     """One layer's view of the session memory for one forward (one text stream)."""
 
@@ -65,6 +81,27 @@ class LayerCache:
     # (k, v) [B,T,H,D] of the entries this forward reads, oldest first, k already rotated on THIS read's clock
     softmax_context: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     softmax_new: Optional[tuple[torch.Tensor, torch.Tensor]] = None      # this window's (PRE-RoPE k, v), written on commit
+    # causal_observation: the window is the chunk's observation prefill (reads like a denoise step, writes nothing to
+    # the memory) and leaves its read terms here for the chunk's denoise reads
+    observation_prefill: bool = False
+    gdn_observation: Optional[GDNObservation] = None                    # GDN: the observation a denoise read pools with
+    softmax_observation: Optional[tuple[torch.Tensor, torch.Tensor]] = None  # softmax: its (k rotated, v) [B,T,H,D]
+
+    def observed(self) -> "LayerCache":
+        """The cache of the chunk's denoise reads after this observation prefill: the same read with the observation
+        appended to the softmax context (Sana's store reads [sink | window | o_c | the denoise window]) and the GDN
+        observation terms."""
+
+        if not self.observation_prefill:
+            raise RuntimeError("only an observation prefill leaves an observation for the denoise reads")
+        context = self.softmax_context
+        if self.softmax_observation is not None:
+            k_obs, v_obs = self.softmax_observation
+            context = (k_obs, v_obs) if context is None else (
+                torch.cat((context[0], k_obs.to(context[0].dtype)), dim=1),
+                torch.cat((context[1], v_obs.to(context[1].dtype)), dim=1),
+            )
+        return LayerCache(gdn_state=self.gdn_state, softmax_context=context, gdn_observation=self.gdn_observation)
 
 
 def rope_bhnd_complex64(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -122,6 +159,14 @@ class CausalGDNAttention(GatedDeltaNet):
         gate = self.gate_proj(x.mean(dim=1)).float()
         return (-self.A_log.float().exp() * F.softplus(gate + self.dt_bias.float())).exp()
 
+    def observed_decay(self, x: torch.Tensor, observation: GDNObservation) -> torch.Tensor:
+        """``[B, H]`` decay of a denoise window pooled with its chunk's observation latent: the mean of the window's and
+        the observation's inputs in float32 or better (Sana ``_observed_decay``)."""
+
+        pooled = (observation.x_sum + x.to(observation.x_sum.dtype).sum(dim=1)) / float(x.shape[1] + observation.count)
+        gate = self.gate_proj(pooled.to(x.dtype)).float()
+        return (-self.A_log.float().exp() * F.softplus(gate + self.dt_bias.float())).exp()
+
     def forward(  # type: ignore[override]
         self,
         x: torch.Tensor,
@@ -143,7 +188,16 @@ class CausalGDNAttention(GatedDeltaNet):
         if rotary_emb is not None:
             q_num = rope_bhnd_complex64(q_num, rotary_emb)
             k_num = rope_bhnd_complex64(k_num, rotary_emb)
-        decay_raw = self.chunk_decay(x)
+        # causal_observation: a prefill reads like any window and leaves its observation terms; a denoise read after it
+        # pools the decay and the key scale with the observation and reads its terms besides the state (Sana
+        # ``gdn_observed_read``: gdn_two_stream's noisy segment with its observation tokens cached)
+        prefill = cache is not None and cache.observation_prefill
+        observed = None if cache is None else cache.gdn_observation
+        if (prefill or observed is not None) and cache.commit:
+            raise RuntimeError("an observation prefill and the reads after it write nothing to the memory")
+        if prefill and observed is not None:
+            raise RuntimeError("an observation prefill reads no earlier observation")
+        decay_raw = self.chunk_decay(x) if observed is None else self.observed_decay(x, observed)
 
         compute = torch.float64 if q_num.dtype == torch.float64 else torch.float32
         q_c = q_num.to(compute)
@@ -152,7 +206,15 @@ class CausalGDNAttention(GatedDeltaNet):
         q_den_c = q_den.to(compute)
         k_den_c = k_den.to(compute)
         beta_c = beta.to(compute)
-        n_valid = torch.full((batch,), float(tokens), dtype=compute, device=x.device)
+        if prefill:
+            cache.gdn_observation = GDNObservation(
+                x_sum=x.to(torch.promote_types(x.dtype, torch.float32)).sum(dim=1),
+                kv=torch.einsum("bhld,bhl,bhlv->bhdv", k_c, beta_c, v_c),
+                z=torch.einsum("bhld,bhl->bhd", k_den_c, beta_c),
+                count=int(tokens),
+            )
+        n_valid = torch.full((batch,), float(tokens + (0 if observed is None else observed.count)), dtype=compute,
+                             device=x.device)
         key_scale = (self.dim * n_valid).rsqrt()[:, None, None, None]
         k_c = k_c * key_scale
         k_den_c = k_den_c * key_scale
@@ -166,6 +228,9 @@ class CausalGDNAttention(GatedDeltaNet):
             state, state_z = seed[0].to(compute), seed[1].to(compute)
         decayed_state = state * decay[..., None, None]
         decayed_z = state_z * decay[..., None]
+        if observed is not None:
+            decayed_state = decayed_state + key_scale * observed.kv.to(compute)
+            decayed_z = decayed_z + key_scale[..., 0] * observed.z.to(compute)
 
         # _readout: the decayed past plus the chunk's own beta-gated sum-linear attention, over the denominator unless
         # the checkpoint reads the numerator alone
@@ -215,11 +280,16 @@ class CausalSoftmaxAttention(GatedSoftmaxAttention):
         k = self.k_norm(k).reshape(batch, tokens, self.heads, self.dim)
         v = v.reshape(batch, tokens, self.heads, self.dim)
         if cache is not None and cache.commit:
+            if cache.observation_prefill:
+                raise RuntimeError("an observation prefill writes nothing to the memory")
             # kept BEFORE the rotary embedding: every later read rotates it on the fly at that read's own positions
             cache.softmax_new = (k.detach(), v.detach())
         if rotary_emb is not None:
             q = apply_rotary_emb_fp64_softmax(q, rotary_emb)
             k = apply_rotary_emb_fp64_softmax(k, rotary_emb)
+        if cache is not None and cache.observation_prefill:
+            # the chunk's denoise reads take it on this same read clock (Sana's store: its observation region)
+            cache.softmax_observation = (k.detach(), v.detach())
         if cache is not None and cache.softmax_context is not None:
             context_k, context_v = cache.softmax_context
             k = torch.cat((context_k.to(k.dtype), k), dim=1)
@@ -325,6 +395,7 @@ __all__ = [
     "CausalGDNAttention",
     "CausalPolicyBlock",
     "CausalSoftmaxAttention",
+    "GDNObservation",
     "GDN_KIND",
     "LayerCache",
     "SOFTMAX_KIND",

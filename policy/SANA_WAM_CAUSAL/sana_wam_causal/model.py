@@ -13,7 +13,12 @@ streaming session needs (Sana ``CausalPolicyChunkSession`` with ``forward_sink``
   the session memory and takes its observation from the last frame of the most recent latent in it;
 * the commit of chunk c at t = 0: [chunk-c targets] + [state | C actions] under ``memory_content`` video_and_action,
   the targets alone (no robot rows) under video_only -- the two-stream clean chunk c (chunk 0 the frozen first chunk),
-  which reads like the generation of chunk c, then writes its GDN state and softmax K/V.
+  which reads like the generation of chunk c, then writes its GDN state and softmax K/V;
+* under ``causal_observation`` (Sana 764ee2113): the observation prefill of chunk c, its own observation latent (one
+  frame at ``c * f_chunk + 1``, t = 0; under ``causal_state`` with the chunk's state row alone, ``robot_form`` state),
+  which reads like a denoising window and writes nothing to the memory; the denoising window then sits one frame later
+  and its robot rows ``C / f_chunk`` steps later, the C action rows alone under ``causal_state`` (``robot_form``
+  actions, at rows 1..C of the chunk grid).
 
 Front-ends: the one-view canvas ``[B, C, F, H, W]`` (``sana_pixel``) and the three-view strip ``[B, C, F, 1,
 sum(H_v * W_v)]`` (``sana_latent``), restored to view-major tokens (every view's frames in turn) before the trunk, the
@@ -62,6 +67,11 @@ from .contract import ACTION_TEMPORAL_COMPRESSION, MEMORY_VIDEO_AND_ACTION, Caus
 from .layers import GDN_KIND, CausalPolicyBlock, LayerCache  # noqa: E402
 
 GDN_RECURRENCE_KEYS = ("gate_proj.weight", "gate_proj.bias", "A_log", "dt_bias", "recall_gate")
+# the robot rows of a window (Sana ``ROBOT_ROWS_STATE`` / ``ROBOT_ROWS_ACTIONS`` of a causal_state policy)
+ROBOT_FORM_CHUNK = "chunk"        # the state row and the C action rows (every window without causal_state)
+ROBOT_FORM_STATE = "state"        # the state row alone: a causal_state observation prefill
+ROBOT_FORM_ACTIONS = "actions"    # the C action rows alone: a causal_state denoise window
+ROBOT_FORMS = (ROBOT_FORM_CHUNK, ROBOT_FORM_STATE, ROBOT_FORM_ACTIONS)
 
 
 ViewShapes = tuple[tuple[int, int], ...]
@@ -119,6 +129,8 @@ class CausalPolicyModel(PolicyModel):
         self.memory_content = str(contract.memory_content)
         self.aligned_phase_window = str(contract.aligned_phase_window)
         self.first_chunk = int(contract.first_chunk)   # the chunk an episode emits first (0: first-frame window)
+        self.causal_observation = bool(contract.causal_observation)
+        self.causal_state = bool(contract.causal_state)
 
         self.x_embedder = PatchEmbedMS3D(config.patch_size, config.in_channels, config.hidden_size)
         self.t_embedder = TimestepEmbedder(config.hidden_size)
@@ -186,14 +198,15 @@ class CausalPolicyModel(PolicyModel):
         frame_offset: int,
         step_offset: int,
         device: torch.device,
+        robot_step_start: int = 0,
     ) -> torch.Tensor:
         """Rotary table ``[B, 1, sum_v F*H_v*W_v + robot_rows, D/2]`` of one window on the physical clock.
 
         Video tokens in view-major order with the bidirectional policy's spatial ids (the plain grid for one view, the
         semantic 2x2 tiles for several) and time ``base_fps * phi / (fps / s)``, phi = ``frame_offset + j`` for the
-        window's frame j; robot row r: time ``base_fps * (step_offset + r) / (8 * fps)`` and spatial ids 0 (Sana
-        ``_causal_multiview_rope`` + ``_action_rope`` for one segment: row 0 is the state at the chunk's first step,
-        row j + 1 action j)."""
+        window's frame j; robot row r: time ``base_fps * (step_offset + robot_step_start + r) / (8 * fps)`` and spatial
+        ids 0 (Sana ``_causal_multiview_rope`` + ``_action_rope`` for one segment: row 0 is the state at the chunk's
+        first step, row j + 1 action j; a window of the action rows alone starts at row 1, Sana ``_robot_grid``)."""
 
         batch = fps.numel()
         fps_video = fps.to(device=device, dtype=torch.float64) / int(self.video_frame_stride)
@@ -215,7 +228,8 @@ class CausalPolicyModel(PolicyModel):
         ids = ids.clone()
         ids[..., 0] = rope.base_fps * phi[frame_of_token][None] / fps_video[:, None]
         if robot_rows:
-            steps = (int(step_offset) + torch.arange(robot_rows, device=device, dtype=torch.long)).to(torch.float64)
+            first = int(step_offset) + int(robot_step_start)
+            steps = (first + torch.arange(robot_rows, device=device, dtype=torch.long)).to(torch.float64)
             time_ids = rope.base_fps * steps[None] / (self.action_temporal_compression * fps.to(device=device)[:, None])
             robot = torch.stack((time_ids, torch.zeros_like(time_ids), torch.zeros_like(time_ids)), dim=-1)
             ids = torch.cat((ids, robot.expand(batch, -1, -1)), dim=1)
@@ -340,6 +354,7 @@ class CausalPolicyModel(PolicyModel):
         caches: Optional[Sequence[LayerCache]] = None,
         softmax_frame_offset: Optional[int] = None,
         softmax_step_offset: Optional[int] = None,
+        robot_form: str = ROBOT_FORM_CHUNK,
     ) -> dict[str, torch.Tensor]:
         """Evaluate one single-segment window: a chunk's denoising window [targets] + robot rows, the commit of an
         executed chunk [targets] (+ robot rows under ``memory_content`` video_and_action), or the sink commit (one
@@ -364,10 +379,13 @@ class CausalPolicyModel(PolicyModel):
                 ``state_mask80`` ``[B, 80]``, ``action80`` / ``action_mask80`` ``[B, C, 80]`` and ``action_timesteps``
                 ``[B, C]`` (raw).
             caches: None for a window that reads and writes nothing, else one ``LayerCache`` per block.
+            robot_form: which robot rows ``robot`` carries (``causal_state``, Sana ``robot_rows``): ``chunk`` the state
+                row and the C action rows; ``state`` the state row alone (the observation prefill's group, t = 0);
+                ``actions`` the C action rows alone (the denoise window, at rows 1..C of the chunk grid).
 
         Returns:
-            ``{}`` for a robotless window (nothing reads its prediction); else ``{"x": velocity in ``latent``'s
-            layout, "action_pred": [B, C, 80] velocity}``.
+            ``{}`` for a robotless window or the state row alone (nothing reads its prediction); else ``{"x": velocity
+            in ``latent``'s layout, "action_pred": [B, C, 80] velocity}``.
         """
 
         if self.training:
@@ -406,46 +424,51 @@ class CausalPolicyModel(PolicyModel):
         video_timestep = strip_to_view_tokens(
             self._to_model_t_domain(timesteps).repeat_interleave(self.h * self.w, dim=1), self.f, view_shapes
         )
+        if robot_form not in ROBOT_FORMS:
+            raise ValueError(f"robot_form must be one of {ROBOT_FORMS}, got {robot_form!r}")
+        if robot_form != ROBOT_FORM_CHUNK and (robot is None or not self.causal_state):
+            raise ValueError(f"robot_form {robot_form!r} is a causal_state window with robot rows")
+        robot_step_start = 1 if robot_form == ROBOT_FORM_ACTIONS else 0
+        action_mask = None
         if robot is None:
             tokens = video
             token_timestep = video_timestep.unsqueeze(1)
             robot_rows = 0
-            action_mask = None
         else:
-            action = torch.as_tensor(robot["action80"]).to(device)
-            action_mask = torch.as_tensor(robot["action_mask80"]).to(device=device, dtype=torch.bool)
-            state = torch.as_tensor(robot["state80"]).to(device).reshape(batch, -1)
-            state_mask = torch.as_tensor(robot["state_mask80"]).to(device=device, dtype=torch.bool).reshape(batch, -1)
-            action_steps = action.shape[1]
-            if action_steps != self.chunk_actions:
-                raise ValueError(f"a window carries {self.chunk_actions} action rows, got {action_steps}")
-            action_t = torch.as_tensor(robot["action_timesteps"], device=device).reshape(batch, -1)
-            if action_t.shape[1] == 1:
-                action_t = action_t.expand(-1, action_steps)
-            if bool((action_t != action_t[:, :1]).any()):
-                raise ValueError("the action rows of one chunk share one timestep")
-            robot_tokens = torch.cat(
-                (
-                    self.state_embed(state.to(dtype=video.dtype), state_mask).unsqueeze(1),
-                    self.action_embed(action.to(dtype=video.dtype), action_mask),
-                ),
-                dim=1,
-            )
+            parts, row_timesteps = [], []
+            if robot_form != ROBOT_FORM_ACTIONS:
+                state = torch.as_tensor(robot["state80"]).to(device).reshape(batch, -1)
+                state_mask = torch.as_tensor(robot["state_mask80"]).to(device=device, dtype=torch.bool).reshape(batch, -1)
+                parts.append(self.state_embed(state.to(dtype=video.dtype), state_mask).unsqueeze(1))
+                row_timesteps.append(video_timestep.new_zeros(batch, 1))   # the state row is always clean
+            if robot_form != ROBOT_FORM_STATE:
+                action = torch.as_tensor(robot["action80"]).to(device)
+                action_mask = torch.as_tensor(robot["action_mask80"]).to(device=device, dtype=torch.bool)
+                action_steps = action.shape[1]
+                if action_steps != self.chunk_actions:
+                    raise ValueError(f"a window carries {self.chunk_actions} action rows, got {action_steps}")
+                action_t = torch.as_tensor(robot["action_timesteps"], device=device).reshape(batch, -1)
+                if action_t.shape[1] == 1:
+                    action_t = action_t.expand(-1, action_steps)
+                if bool((action_t != action_t[:, :1]).any()):
+                    raise ValueError("the action rows of one chunk share one timestep")
+                parts.append(self.action_embed(action.to(dtype=video.dtype), action_mask))
+                row_timesteps.append(self._to_model_t_domain(action_t))
+            robot_tokens = torch.cat(parts, dim=1)
             tokens = torch.cat((video, robot_tokens), dim=1)
-            token_timestep = torch.cat(
-                (video_timestep, video_timestep.new_zeros(batch, 1), self._to_model_t_domain(action_t)), dim=1
-            ).unsqueeze(1)
-            robot_rows = 1 + action_steps
+            token_timestep = torch.cat([video_timestep] + row_timesteps, dim=1).unsqueeze(1)
+            robot_rows = int(robot_tokens.shape[1])
 
         fps = PhysicalTimeWanRotaryPosEmbed._normalize_fps(model_fps, batch, device)
         rope_linear = self.window_rope(
-            self.rope_linear, fps, self.f, view_shapes, view_slot_ids, robot_rows, frame_offset, step_offset, device
+            self.rope_linear, fps, self.f, view_shapes, view_slot_ids, robot_rows, frame_offset, step_offset, device,
+            robot_step_start,
         )
         rope_softmax = self.window_rope(
             self.rope_softmax, fps, self.f, view_shapes, view_slot_ids, robot_rows,
             frame_offset if softmax_frame_offset is None else softmax_frame_offset,
             step_offset if softmax_step_offset is None else softmax_step_offset,
-            device,
+            device, robot_step_start,
         )
         time_embedding = self.t_embedder(token_timestep.flatten()).unflatten(0, token_timestep.shape)
         modulation = self.t_block(time_embedding)
@@ -461,11 +484,12 @@ class CausalPolicyModel(PolicyModel):
             rope_softmax,
             caches,
         )
-        if robot is None:
+        if robot is None or robot_form == ROBOT_FORM_STATE:
             return {}
         video_tokens = self.final_layer(tokens[:, :n_video], time_embedding[:, :, :n_video])
         video_tokens = view_to_strip_tokens(video_tokens, self.f, view_shapes)
-        action_pred = self.action_head(tokens[:, n_video + 1 :], time_embedding[:, :, n_video + 1 :]).masked_fill(
+        first_action = n_video + (0 if robot_form == ROBOT_FORM_ACTIONS else 1)
+        action_pred = self.action_head(tokens[:, first_action:], time_embedding[:, :, first_action:]).masked_fill(
             ~action_mask, 0
         )
         return {"x": self.unpatchify(video_tokens), "action_pred": action_pred}
@@ -485,4 +509,14 @@ def build_causal_policy(
     return model.to(device=device, dtype=dtype).eval()
 
 
-__all__ = ["CausalPolicyModel", "GDN_RECURRENCE_KEYS", "ViewShapes", "build_causal_policy", "view_token_counts"]
+__all__ = [
+    "CausalPolicyModel",
+    "GDN_RECURRENCE_KEYS",
+    "ROBOT_FORMS",
+    "ROBOT_FORM_ACTIONS",
+    "ROBOT_FORM_CHUNK",
+    "ROBOT_FORM_STATE",
+    "ViewShapes",
+    "build_causal_policy",
+    "view_token_counts",
+]

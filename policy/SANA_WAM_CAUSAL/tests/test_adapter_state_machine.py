@@ -57,10 +57,12 @@ class FakeSession:
         self.log.append(("commit_sink", float(latent.flatten()[0])))
         self.has_sink = True
 
-    def generate_chunk(self, *, anchor_state, anchor_state_mask, action_mask, generator, gripper_bounds):
+    def generate_chunk(self, *, anchor_state, anchor_state_mask, action_mask, generator, gripper_bounds, **observation):
         # the real session's rule: every chunk reads the sink, from the first emitted chunk on
         assert self.has_sink and self.chunk_idx >= self.first_chunk
         self.log.append(("generate", self.chunk_idx, anchor_state.clone(), action_mask.clone()))
+        if observation:
+            self.log.append(("observation", self.chunk_idx, float(observation["observation"].flatten()[0])))
         action = torch.zeros(1, C, 80)
         action[..., 10] = 1.0   # rot6d column 1 = x axis
         action[..., 14] = 1.0   # column 2 = y axis
@@ -92,6 +94,11 @@ class FakeStreams:
         ticks = [_tick(frame) for frame in frames_per_view[0]]
         self.log.append(("stream_chunk", ticks))
         return torch.full((1, 4, 1, 3, 4), float(sum(ticks)))
+
+    def encode_observation(self, views):
+        tick = _tick(views[0])
+        self.log.append(("stream_observation", tick))
+        return torch.full((1, 4, 1, 3, 4), 2000.0 + tick)
 
 
 class FakeRuntime:
@@ -152,6 +159,7 @@ def model():
     m.memory_mode = "full"
     m.memory_content = "video_and_action"
     m.first_chunk = 1
+    m.causal_observation = False
     m.max_chunks_per_episode = None
     m.log_world_model_error = True
     m.attention_dump_dir, m._probe = None, None
@@ -436,3 +444,46 @@ def test_memory_mode_none_on_a_first_frame_window_emits_chunk_0_every_time(model
     opening = ["stream_start", "reset_memory", "commit_sink", "generate"]
     assert [entry[0] for entry in m.log] == ["new_session"] + opening + ["stream_chunk"] + opening
     assert [entry[1] for entry in m.log if entry[0] == "generate"] == [0, 0]
+
+
+@pytest.mark.parametrize("first_chunk", [0, 1], ids=["first-frame", "padded"])
+def test_a_causal_observation_policy_reads_the_sink_then_every_chunks_start_frame_alone(model, first_chunk):
+    """causal_observation: the first emitted chunk's observation latent is the sink's (its start frame is the first
+    frame), every later chunk's its own start frame -- the last frame of the chunk just executed -- encoded alone on
+    fresh streams, after that chunk is streamed and committed; memory_mode none reopens on the sink every chunk."""
+
+    m = model
+    if first_chunk == 0:
+        _first_frame(m)
+    m.causal_observation = True
+    m.update_obs(_obs(0))
+    m.get_action()
+    for start in (0, C):
+        _run_chunk(m, start)
+        m.get_action()
+    kinds = [entry[0] for entry in m.log]
+    observations = [entry for entry in m.log if entry[0] == "observation"]
+    assert [entry[2] for entry in observations] == [0.0, 2000.0 + C, 2000.0 + 2 * C]   # the sink, then ticks C, 2C
+    assert [entry[1] for entry in m.log if entry[0] == "stream_observation"] == [C, 2 * C]
+    for index in (1, 2):   # the start frame is encoded after the executed chunk is streamed and committed
+        position = [i for i, kind in enumerate(kinds) if kind == "stream_observation"][index - 1]
+        assert kinds[position - 2 : position] == ["stream_chunk", "commit_chunk"]
+        assert kinds[position + 1] == "generate"
+    m.reset()
+    m.log.clear()
+    m.memory_mode = "none"
+    m.update_obs(_obs(0))
+    m.get_action()
+    _run_chunk(m, 0)
+    m.get_action()
+    assert "stream_observation" not in [entry[0] for entry in m.log]
+    assert [entry[2] for entry in m.log if entry[0] == "observation"] == [0.0, float(C)]   # each reopening's sink
+
+
+def test_a_policy_without_causal_observation_passes_no_observation(model):
+    m = model
+    m.update_obs(_obs(0))
+    m.get_action()
+    _run_chunk(m, 0)
+    m.get_action()
+    assert not [entry for entry in m.log if entry[0] in ("observation", "stream_observation")]
