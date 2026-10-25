@@ -163,6 +163,7 @@ def model():
     m.max_chunks_per_episode = None
     m.log_world_model_error = True
     m.attention_dump_dir, m._probe = None, None
+    m.prediction_latent_dir = None
     m.diffusion_seed_base, m.eval_seed = 1, 0
     m._episode_index = 0
     m._size_warned = True
@@ -487,3 +488,30 @@ def test_a_policy_without_causal_observation_passes_no_observation(model):
     _run_chunk(m, 0)
     m.get_action()
     assert not [entry for entry in m.log if entry[0] in ("observation", "stream_observation")]
+
+
+def test_the_prediction_dump_writes_every_chunk_predicted_then_observed(model, tmp_path):
+    """prediction_latent_dir: every decision writes its generated latents after the chunk's observation latent (the sink
+    at the opening, then the start frame encoded alone), the next decision the chunk's streamed latents after the same
+    observation latent; ticks and chunk indices follow the decisions."""
+
+    m = model
+    _first_frame(m)
+    m.runtime.contract.visual_layout = "sana_pixel_canvas"
+    m.prediction_latent_dir = tmp_path
+    m.update_obs(_obs(0))
+    m.get_action()
+    for start in (0, C):
+        _run_chunk(m, start)
+        m.get_action()
+    names = sorted(p.name for p in tmp_path.glob("*.npz"))
+    expected = [f"ep0001_env00_chunk00{c}.npz" for c in range(3)] + [f"ep0001_env00_chunk00{c}_observed.npz" for c in range(2)]
+    assert names == sorted(expected)   # the last chunk has no observed latents yet (its frames come after it)
+    for c in range(3):
+        with np.load(tmp_path / f"ep0001_env00_chunk00{c}.npz") as d:
+            assert int(d["chunk"]) == c and int(d["tick"]) == c * C and not bool(d["observed"])
+            assert d["video_latent"].shape[2] == 2                       # [observation | the chunk's target latent]
+            first = float(d["video_latent"][0, 0, 0, 0, 0])
+            assert first == (0.0 if c == 0 else 2000.0 + c * C)          # the sink, then the start frame alone
+    with np.load(tmp_path / "ep0001_env00_chunk001_observed.npz") as d:
+        assert bool(d["observed"]) and float(d["video_latent"][0, 0, 1, 0, 0]) == float(sum(range(C + S, 2 * C + 1, S)))

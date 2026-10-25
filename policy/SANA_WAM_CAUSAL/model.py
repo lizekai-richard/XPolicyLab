@@ -258,6 +258,15 @@ class Model(ModelTemplate):
         self.max_chunks_per_episode = _optional_int(cfg.get("max_chunks_per_episode"))
         self.log_world_model_error = _is_true(cfg.get("log_world_model_error", True))
         self.attention_dump_dir = str(cfg.get("attention_dump_dir") or "").strip() or None
+        # Diagnostic predicted-video dump (null = off): per decision the chunk's generated target latents and, at the next
+        # decision, its observed (streamed) target latents, each after the chunk's observation latent (its start frame
+        # encoded alone) so the causal VAE decodes them on their own -> <dir>/ep<E>_env00_chunk<C>.npz /
+        # ep<E>_env00_chunk<C>_observed.npz (fp16, packed and normalized like training); decode offline with
+        # tools/decode_prediction_latents.py (no decode inside the timed inference)
+        raw_dump = str(cfg.get("prediction_latent_dir") or "").strip()
+        self.prediction_latent_dir = None if raw_dump.lower() in ("", "null", "none", "false", "off") else Path(raw_dump)
+        if self.prediction_latent_dir is not None:
+            self.prediction_latent_dir.mkdir(parents=True, exist_ok=True)
         self.allow_donor_checkpoint = _is_true(cfg.get("allow_donor_checkpoint", False))
         self.kinematics = ArxX5Kinematics(cfg.get("urdf_path") or None)
         self.world_from_base = root_transforms(cfg.get("robot_root_poses") or None)
@@ -323,6 +332,7 @@ class Model(ModelTemplate):
             f"flow_shift={frontend.flow_shift} action_flow_shift={frontend.action_flow_shift} "
             f"view_resize={frontend.view_resize} ({frontend.view_resize_source}) commit_actions={self.commit_actions} "
             f"memory_mode={self.memory_mode} attention_dump_dir={self.attention_dump_dir} "
+            f"prediction_latent_dir={self.prediction_latent_dir} "
             f"gdn_recurrence={report.get('gdn_recurrence')} normalization_sha256={self.normalization.sha256} "
             f"run_record={report.get('run_record')} device={self.device} action_type={self.action_type}",
             flush=True,
@@ -445,6 +455,8 @@ class Model(ModelTemplate):
         if not commit and not self.log_world_model_error:
             return None, gap
         latent, timings["stream_s"] = timed(self._streams.encode_chunk, self._chunk_views())
+        if self.prediction_latent_dir is not None and pending.get("dump_observation") is not None:
+            self._dump_latent(pending["decision"], pending["dump_observation"], latent, observed=True)
         wm_error = None
         if self.log_world_model_error and pending.get("predicted_latent") is not None:
             wm_error = relative_rmse(pending["predicted_latent"], latent)
@@ -459,6 +471,32 @@ class Model(ModelTemplate):
             action_mask=pending["action_mask"],
         )
         return wm_error, gap
+
+    def _dump_latent(self, decision: int, observation: torch.Tensor, target: torch.Tensor, *, observed: bool) -> None:
+        """``prediction_latent_dir``: write one chunk's latents [observation | targets] (fp16, packed and normalized like
+        training) with what the offline decoder needs: the decision, the control tick the chunk starts at, its executed
+        ticks, the per-view latent shapes, the layout and the video frame stride. ``observed`` selects the streamed
+        (real) targets over the generated ones."""
+
+        name = f"ep{int(self._episode_index):04d}_env00_chunk{int(decision):03d}" + ("_observed" if observed else "")
+        latent = torch.cat((observation.to(target.dtype), target), dim=2).detach().to(device="cpu", dtype=torch.float16)
+        shapes = self._streams.view_shapes if self.runtime.strip else ((int(latent.shape[-2]), int(latent.shape[-1])),)
+        out, tmp = self.prediction_latent_dir / f"{name}.npz", self.prediction_latent_dir / f"{name}.tmp.npz"
+        np.savez_compressed(
+            tmp,
+            video_latent=latent.numpy(),
+            episode=np.int64(self._episode_index),
+            env=np.int64(0),
+            chunk=np.int64(decision),
+            tick=np.int64(decision * self.chunk_actions),
+            executed=np.int64(self.chunk_actions),
+            view_latent_shapes=np.asarray(shapes, dtype=np.int64),
+            visual_layout=np.asarray(str(self.runtime.contract.visual_layout)),
+            video_frame_stride=np.int64(self.frame_stride),
+            observed=np.bool_(observed),
+            instruction=np.asarray(str(self._instruction)),
+        )
+        os.replace(tmp, out)
 
     def _open_memory(self, views: list[torch.Tensor], anchor_raw: np.ndarray, anchor_norm: torch.Tensor,
                      action_mask: torch.Tensor, timings: dict) -> torch.Tensor:
@@ -527,6 +565,7 @@ class Model(ModelTemplate):
             # chunk's observation is the sink, the first frame encoded alone
             sink = self._open_memory(views, anchor_raw, anchor_norm, action_mask, timings)
         observation_kwargs = {}
+        dump_observation = None
         if self.causal_observation:
             # the chunk's own observation latent: its start frame encoded alone, i.e. the sink's latent at the frame the
             # memory (re)opened at, else this frame on fresh streams of its own (Sana encode_observation)
@@ -534,6 +573,10 @@ class Model(ModelTemplate):
             if observation is None:
                 observation, timings["observation_encode_s"] = timed(self._streams.encode_observation, views)
             observation_kwargs["observation"] = observation
+            dump_observation = observation
+        if self.prediction_latent_dir is not None and dump_observation is None:
+            # the decoder's first latent: the chunk's start frame encoded alone (the sink at an opening)
+            dump_observation = sink if sink is not None else self._streams.encode_observation(views)
         chunk = self._session.chunk_idx   # the training chunk this window is (the first emitted one at the first frame)
         expected = self.first_chunk if self.memory_mode == "none" else decision + self.first_chunk
         if chunk != expected:
@@ -558,6 +601,8 @@ class Model(ModelTemplate):
                  "chunk_observation": False, "decision": int(decision), "diffusion_seed": int(seed),
                  "checkpoint": str(self.ckpt_dir)},
             )
+        if self.prediction_latent_dir is not None:
+            self._dump_latent(decision, dump_observation, predicted_latent, observed=False)
         mask_cpu = action_mask[0].detach().cpu()
         action_raw = model_action_to_absolute(
             action_norm[0].detach().to(device="cpu", dtype=torch.float32), mask_cpu, self.normalization, anchor_raw, anchor_mask
@@ -580,6 +625,8 @@ class Model(ModelTemplate):
             "predicted_latent": predicted_latent.detach() if self.log_world_model_error else None,
             "executed_raw": executed_raw,
             "mask_cpu": mask_cpu,
+            "decision": decision,
+            "dump_observation": None if dump_observation is None else dump_observation.detach(),
         }
         self._frames = {}
         self._reached = {}

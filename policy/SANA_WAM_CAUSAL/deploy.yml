@@ -70,6 +70,11 @@ log_world_model_error: true
 # the memory (softmax attention mass on the sink and per committed chunk / segment, GDN past-vs-window readout); null =
 # off
 attention_dump_dir: null
+# Diagnostics: a directory -> per decision ep{E}_env00_chunk{C}.npz (the generated target latents after the chunk's
+# observation latent) and, at the next decision, ep{E}_env00_chunk{C}_observed.npz (its streamed latents); decode with
+# tools/decode_prediction_latents.py (real | VAE reconstruction | prediction); the eval worker's @ATTEMPT_DIR@ token puts
+# it in the unit attempt; null = off
+prediction_latent_dir: null
 # null = stretch (the only SFT view resize of the causal line's donors); a contradicting value is refused
 view_resize: null
 diffusion_seed_base: 20261003
