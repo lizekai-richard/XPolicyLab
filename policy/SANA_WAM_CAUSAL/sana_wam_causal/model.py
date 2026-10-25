@@ -131,6 +131,7 @@ class CausalPolicyModel(PolicyModel):
         self.first_chunk = int(contract.first_chunk)   # the chunk an episode emits first (0: first-frame window)
         self.causal_observation = bool(contract.causal_observation)
         self.causal_state = bool(contract.causal_state)
+        self.physical_rope = bool(contract.physical_rope)
 
         self.x_embedder = PatchEmbedMS3D(config.patch_size, config.in_channels, config.hidden_size)
         self.t_embedder = TimestepEmbedder(config.hidden_size)
@@ -218,7 +219,8 @@ class CausalPolicyModel(PolicyModel):
                 frames, view_shapes, view_slot_ids, fps_video, rope.base_fps, self.multiview_spatial_rope_tile_shape,
                 device,
             )
-        phi = int(frame_offset) + torch.arange(frames, dtype=torch.float64, device=device)
+        # physical_rope: the frame offset may be fractional (a target latent at the middle of its frames)
+        phi = float(frame_offset) + torch.arange(frames, dtype=torch.float64, device=device)
         frame_of_token = torch.cat(
             [
                 torch.arange(frames, device=device, dtype=torch.long).repeat_interleave(int(height) * int(width))
@@ -239,7 +241,7 @@ class CausalPolicyModel(PolicyModel):
         self,
         *,
         frames: int,
-        frame_offset: int,
+        frame_offset: float,
         robot_rows: int,
         step_offset: int,
         model_fps: Any,
@@ -253,9 +255,19 @@ class CausalPolicyModel(PolicyModel):
 
         fps = PhysicalTimeWanRotaryPosEmbed._normalize_fps(model_fps, 1, device)
         return self.window_rope(
-            self.rope_softmax, fps, int(frames), view_shapes, view_slot_ids, int(robot_rows), int(frame_offset),
+            self.rope_softmax, fps, int(frames), view_shapes, view_slot_ids, int(robot_rows), float(frame_offset),
             int(step_offset), device,
         )
+
+    def target_frame_offset(self) -> float:
+        """Where chunk c's target latents start on the video clock, after its start instant c * f_c: one frame later on
+        the latent-slot clock (the latent's last frame), ``latent_centre_offset`` = (8 + 1) / (2 * 8) = 0.5625 later under
+        ``physical_rope`` (the middle of the frames it covers; Sana ``causal_rwm_train.latent_centre_offset``)."""
+
+        if not self.physical_rope:
+            return 1.0
+        stride = int(self.action_temporal_compression)
+        return (stride + 1) / (2 * stride)
 
     def chunk_robot_rows(self) -> int:
         """Robot rows a committed chunk keeps: its state and C actions under video_and_action, none under video_only."""

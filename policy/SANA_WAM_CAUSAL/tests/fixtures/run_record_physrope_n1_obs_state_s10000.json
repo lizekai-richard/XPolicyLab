@@ -1,0 +1,21 @@
+{
+ "hf_repo": "zekaili/causal_robodojo_sana_latent_mixv4_capv3_obssc19000_physrope_f33fps8_episode_n1_obs_state_nsc",
+ "step": 10000,
+ "epoch": 22,
+ "source_commit": "6e91eaf2a + c414e9b32 code + 02aebea6e/c4d1d246d + the recipe and config.py overlays",
+ "config_sha256": "bc90e613516124dc0eb0e1a909b166f844d849badad3fc71c104adccfea22046",
+ "chunk_observation": false,
+ "aligned_phase_window": "first_frame",
+ "memory_content": "video_only",
+ "multiview": "sana_latent",
+ "normalization_sha256": "1fe3b7e72e8fa93eca5efb8a8deeace1daf4434b4b97e9f4445670ac758287ed",
+ "deploy": {
+  "causal_observation": true,
+  "causal_state": true,
+  "memory_content": "video_only",
+  "memory_gdn_output_normalizer": false,
+  "note": "Steps up to 1095 trained with the GDN denominator (normalizer true); this snapshot needs false.",
+  "physical_rope": true,
+  "sliding_window_chunks": 1
+ }
+}

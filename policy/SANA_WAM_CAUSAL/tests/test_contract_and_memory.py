@@ -51,6 +51,9 @@ FIRST_FRAME_NOOBS = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_epi
 OBSERVATION_S1000 = os.path.join(_paths.FIXTURES, "config_causal_pantheon33k_episode_n24_videoonly_s1000.yaml")
 # the released mix-v3 dense sana_latent N1-obs checkpoint (step 15000): causal_observation + causal_state, numerator-only GDN
 N1_OBS_S15000 = os.path.join(_paths.FIXTURES, "config_causal_mixv3_dense14k_sana_latent_episode_n1_obs_videoonly_s15000.yaml")
+# the physical-RoPE mix-v4 capv3 sana_latent N1-obs+state checkpoint (step 10000) and its run record (deploy block)
+PHYSROPE_S10000 = os.path.join(_paths.FIXTURES, "config_causal_mixv4_capv3_sana_latent_physrope_episode_n1_obs_state_s10000.yaml")
+RECORD_PHYSROPE_S10000 = os.path.join(_paths.FIXTURES, "run_record_physrope_n1_obs_state_s10000.json")
 RECORD_S1000 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_s1000.json")
 RECORD_NOOBS_S3324 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_noobs_s3324.json")
 SINKLESS_VA = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
@@ -199,15 +202,41 @@ def test_the_causal_observation_switches_resolve(observation, state, expected):
         ({"causal_state": True}, "set causal_observation: true"),
         ({"causal_observation": "true"}, "causal_observation='true': must be true or false"),
         ({"causal_observation": True, "causal_state": 1}, "causal_state=1: must be true or false"),
-        ({"physical_rope": True}, "physical_rope=True: the deploy clock does not follow it"),
+        ({"physical_rope": "true"}, "physical_rope='true': must be true or false"),
     ],
-    ids=["state-without-observation", "observation-string", "state-int", "physical-rope"],
+    ids=["state-without-observation", "observation-string", "state-int", "physical-rope-string"],
 )
 def test_the_causal_observation_switches_are_refused_outside_their_contract(edit, match):
     cfg = copy.deepcopy(_load(RECIPE_PIXEL_N2))
     _policy(cfg).update(edit)
     with pytest.raises((ValueError, NotImplementedError), match=match):
         resolve_causal_contract(cfg)
+
+
+def test_the_physical_rope_checkpoint_resolves_and_its_record_is_accepted():
+    """The real config.yaml of the physical-RoPE mix-v4 capv3 sana_latent N1-obs+state checkpoint (Sana 6e91eaf2a): the
+    physical clock with the observation latent and its state row, numerator-only GDN, bf16 softmax attention; its run
+    record's deploy block names the same switches."""
+
+    contract = resolve_causal_contract(_load(PHYSROPE_S10000))
+    assert (contract.physical_rope, contract.causal_observation, contract.causal_state) == (True, True, True)
+    assert (contract.gdn_output_normalizer, contract.sliding_window_chunks, contract.memory_content) == (False, 1, MEMORY_VIDEO_ONLY)
+    assert " rope=aligned physical_rope=True aligned_phase_window=first_frame " in contract.describe()
+    check_run_record(_record(RECORD_PHYSROPE_S10000), contract, source="RUN_ID.json")
+    plain = resolve_causal_contract(_load(N1_OBS_S15000))
+    assert plain.physical_rope is False and " physical_rope=False " in plain.describe()
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [("physical_rope", False), ("causal_state", False), ("sliding_window_chunks", 2), ("memory_gdn_output_normalizer", True)],
+)
+def test_a_run_records_deploy_block_contradicting_the_config_is_refused(key, value):
+    contract = resolve_causal_contract(_load(PHYSROPE_S10000))
+    record = _record(RECORD_PHYSROPE_S10000)
+    record["deploy"] = {**record["deploy"], key: value}
+    with pytest.raises(ValueError, match=f"records deploy.{key}="):
+        check_run_record(record, contract)
 
 
 def test_a_run_record_contradicting_the_observation_switches_is_refused():

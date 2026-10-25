@@ -36,8 +36,14 @@ one latent frame after the most recent memory latent: it reads the sink, the sof
 never its chunk's targets or robot rows, and is never committed; the chunk's targets (one frame after it) and robot
 rows (C / f_c steps later) read it besides the window. ``causal_state`` (Sana ``afc9874b6``, deploy ``8b599e49d``; false
 when absent, true only with ``causal_observation``) joins the chunk's state row to o_c's group: the denoise window then
-carries the targets and the C action rows alone. ``physical_rope`` (Sana ``6e91eaf2a``) is refused: Sana's cached
-session refuses it too.
+carries the targets and the C action rows alone.
+
+``model.extra.chunk_causal_policy.physical_rope`` (Sana ``6e91eaf2a``; false when absent, ``rope: aligned`` only) puts
+every token at its physical instant: a target latent (committed or generated) at the middle of the frames it covers, c *
+f_c + i + 0.5625 (``latent_centre_offset``, (8 + 1) / 16 for the VAE's 8), an observation latent at its chunk's start c *
+f_c, the state row and action j at their steps c * C and c * C + j (no observation shift), the sink at 0; a softmax read
+numbered from its window start (the sink rotated there) then sees a one-chunk window at 0 / 0.5625 / 1 / 1.5625. Sana's
+own cached session refuses it (posttrain_causal_handoff 11, R4); this adapter serves it.
 
 ``model.memory_gdn_output_normalizer`` (Sana ``c414e9b32``; ``true`` when absent) decides every GDN layer's readout: true
 divides the numerator ``q (gS + K^T diag(beta) V)`` by the denominator ``ReLU(q) . (gz + K_den^T beta) + eps``, false
@@ -121,6 +127,7 @@ class CausalContract:
     gdn_output_normalizer: bool = True  # false: every GDN layer reads its numerator alone (memory_gdn_output_normalizer)
     causal_observation: bool = False    # every noisy chunk opens with its own observation latent, read causally
     causal_state: bool = False          # the chunk's state row joins its observation latent (causal_observation only)
+    physical_rope: bool = False         # every token at its physical instant (target latents at their frames' middle)
 
     @property
     def first_chunk(self) -> int:
@@ -136,7 +143,8 @@ class CausalContract:
             f"sliding_window_chunks={window} memory_content={self.memory_content} "
             f"chunk_observation=False causal_observation={self.causal_observation} causal_state={self.causal_state} "
             f"multiview={self.multiview} visual_layout={self.visual_layout} "
-            f"rope={self.rope} aligned_phase_window={self.aligned_phase_window} first_chunk={self.first_chunk} "
+            f"rope={self.rope} physical_rope={self.physical_rope} aligned_phase_window={self.aligned_phase_window} "
+            f"first_chunk={self.first_chunk} "
             f"gdn_output_normalizer={self.gdn_output_normalizer}"
         )
 
@@ -234,6 +242,17 @@ def resolve_causal_state(value: Any, observation: bool) -> bool:
     return value
 
 
+def resolve_physical_rope(value: Any) -> bool:
+    """``physical_rope`` as Sana reads it (``causal_rwm_train.resolve_physical_rope``, 6e91eaf2a): None -> false, a yaml
+    boolean otherwise (it needs ``rope: aligned``, the only RoPE mode this adapter serves)."""
+
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"model.extra.chunk_causal_policy.physical_rope={value!r}: must be true or false")
+    return value
+
+
 def refuse_chunk_observation(value: Any) -> None:
     """``chunk_observation`` as Sana reads it since 4bd6eca83 (``causal_rwm_train.refuse_chunk_observation``): chunk
     observations are retired, every noisy chunk reads its observation from the memory; absent or ``false`` is accepted
@@ -269,8 +288,10 @@ def load_run_records(directory: str | Path) -> list[tuple[Path, Mapping[str, Any
 def check_run_record(record: Mapping[str, Any], contract: CausalContract, source: str = "the run record") -> None:
     """Refuse a checkpoint whose run record contradicts the contract its config resolves to: a run that trained chunk
     observations (``chunk_observation`` anything but false: its config may lack the key, which the single form reads
-    as false) and a recorded ``aligned_phase_window`` / ``memory_content`` / ``memory_gdn_output_normalizer`` other
-    than the config's. Keys the record does not carry are not checked."""
+    as false) and a recorded ``aligned_phase_window`` / ``memory_content`` / ``memory_gdn_output_normalizer`` /
+    ``causal_observation`` / ``causal_state`` / ``physical_rope`` / ``sliding_window_chunks`` other than the config's, at
+    the record's top level or in its ``deploy`` block (the record of the physical-RoPE line). Keys the record does not
+    carry are not checked."""
 
     observation = record.get("chunk_observation")
     if observation is not None and observation is not False:
@@ -279,19 +300,23 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
             "run trained chunk observations, which a config from before Sana 4bd6eca83 need not declare and this adapter "
             "would serve as the single form without them; it is served by SANA_WAM_CAUSAL up to XPolicyLab d57a617"
         )
+    deploy = record.get("deploy") if isinstance(record.get("deploy"), Mapping) else {}
     for key, resolved in (
         ("aligned_phase_window", contract.aligned_phase_window),
         ("memory_content", contract.memory_content),
         ("memory_gdn_output_normalizer", contract.gdn_output_normalizer),
         ("causal_observation", contract.causal_observation),
         ("causal_state", contract.causal_state),
+        ("physical_rope", contract.physical_rope),
+        ("sliding_window_chunks", contract.sliding_window_chunks),
     ):
-        recorded = record.get(key)
-        if recorded is not None and recorded != resolved:
-            raise ValueError(
-                f"{source} records {key}={recorded!r} but config.yaml resolves to {resolved!r}: the record and the "
-                "config describe different runs"
-            )
+        for where, block in (("", record), ("deploy.", deploy)):
+            recorded = block.get(key)
+            if recorded is not None and recorded != resolved:
+                raise ValueError(
+                    f"{source} records {where}{key}={recorded!r} but config.yaml resolves to {resolved!r}: the record "
+                    "and the config describe different runs"
+                )
 
 
 def describe_run_records(records: list[tuple[Path, Mapping[str, Any]]], config_path: str | Path) -> str:
@@ -407,12 +432,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
     refuse_chunk_observation(options.get("chunk_observation"))
     causal_observation = resolve_causal_observation(options.get("causal_observation"))
     causal_state = resolve_causal_state(options.get("causal_state"), causal_observation)
-    physical_rope = options.get("physical_rope")
-    if physical_rope is not None and physical_rope is not False:
-        raise NotImplementedError(
-            f"model.extra.chunk_causal_policy.physical_rope={physical_rope!r}: the deploy clock does not follow it (Sana's "
-            "cached session refuses it, posttrain_causal_handoff 01 section 5)"
-        )
+    physical_rope = resolve_physical_rope(options.get("physical_rope"))
     aligned_phase_window = resolve_aligned_phase_window(_extra(cfg.get("data")).get("aligned_phase_window"))
     window = options.get("sliding_window_chunks")
     window = None if window is None else int(window)
@@ -457,6 +477,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         gdn_output_normalizer=resolve_gdn_output_normalizer(model_cfg.get("memory_gdn_output_normalizer")),
         causal_observation=causal_observation,
         causal_state=causal_state,
+        physical_rope=physical_rope,
     )
 
 
@@ -487,5 +508,6 @@ __all__ = [
     "resolve_causal_observation",
     "resolve_causal_state",
     "resolve_gdn_output_normalizer",
+    "resolve_physical_rope",
     "resolve_memory_content",
 ]

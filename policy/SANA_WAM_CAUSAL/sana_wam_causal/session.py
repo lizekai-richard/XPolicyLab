@@ -36,6 +36,12 @@ reading the sink, the window, the GDN state and itself and writing nothing to th
 it besides the window (``LayerCache.observed``), its targets one frame later (c * f_c + 2 ..) and its robot rows
 C / f_c steps later (the C action rows alone under ``causal_state``). The commit is the policy's without the option.
 
+Under ``physical_rope`` (Sana 6e91eaf2a) every token sits at its physical instant: a chunk's target latents (generated
+or committed) at the middle of the frames they cover, c * f_c + i + 0.5625, its observation latent at its start instant
+c * f_c, its rows at their own steps c * C .. without the observation shift, the sink at 0; the softmax reads, numbered
+from their origin as below, then place the sink at the window's start instant (Sana's sink rotation to lo * f_c) and a
+one-chunk window at 0 / 0.5625 / 1 / 1.5625.
+
 Softmax read, W = ``sliding_window_chunks``: the forwards on chunk c (its denoising steps and its commit) read the sink
 and the newest ``min(c, W)`` committed chunks, ``c - W .. c - 1``. This is the two-stream training forward's rule (Sana
 ``CachedChunkCausalPolicySoftmaxAttention._two_stream_spans``: noisy chunk c reads the sink plus clean chunks
@@ -224,6 +230,8 @@ class CausalPolicySession:
         self.first_chunk = int(model.first_chunk)   # 1 after a padded window's frozen chunk 0, 0 on a first-frame window
         self.observation = bool(model.causal_observation)   # every chunk prefills its own observation latent
         self.causal_state = bool(model.causal_state)        # ... with the chunk's state row in its group
+        self.physical = bool(model.physical_rope)           # physical_rope: every token at its physical instant
+        self.target_offset = float(model.target_frame_offset())   # a chunk's targets after its start instant (1 / 0.5625)
         self.steps = int(steps)
         if self.steps <= 0:
             raise ValueError("steps must be positive")
@@ -309,7 +317,8 @@ class CausalPolicySession:
         if key not in self._rope_tables:
             device = next(self.model.parameters()).device
             self._rope_tables[key] = self.model.softmax_entry_rope(
-                frames=self.f_chunk, frame_offset=slot * self.f_chunk + 1, robot_rows=self.model.chunk_robot_rows(),
+                frames=self.f_chunk, frame_offset=slot * self.f_chunk + self.target_offset,
+                robot_rows=self.model.chunk_robot_rows(),
                 step_offset=slot * self.chunk_actions, model_fps=self.model_fps, view_shapes=self._views(),
                 view_slot_ids=self.view_slot_ids, device=device,
             )
@@ -346,14 +355,16 @@ class CausalPolicySession:
             softmax_step_offset=soft_step, robot_form=robot_form,
         )
 
-    def window_offsets(self) -> tuple[int, int]:
+    def window_offsets(self) -> tuple[float, int]:
         """(first target frame, first robot step) of chunk ``chunk_idx``'s denoising window on the physical clock: c *
         f_c + 1 and c * C; under ``causal_observation`` one latent frame later, c * f_c + 2 and c * C + C / f_c (the
-        observation latent sits at c * f_c + 1 and the state row at its instant; Sana ``forward_chunk``)."""
+        observation latent sits at c * f_c + 1 and the state row at its instant; Sana ``forward_chunk``). Under
+        ``physical_rope`` the targets sit at the middle of their frames, c * f_c + 0.5625, and the rows at their own
+        steps from c * C, with or without the observation (which sits at c * f_c; Sana 6e91eaf2a)."""
 
-        frame = self.chunk_idx * self.f_chunk + 1
+        frame = self.chunk_idx * self.f_chunk + self.target_offset
         step = self.chunk_idx * self.chunk_actions
-        if self.observation:
+        if self.observation and not self.physical:
             frame, step = frame + 1, step + self.chunk_actions // self.f_chunk
         return frame, step
 
@@ -376,9 +387,10 @@ class CausalPolicySession:
     ) -> list[LayerCache]:
         """Prefill chunk ``chunk_idx``'s observation latent ``[1, C_lat, 1, H, W]`` into one stream's read (Sana
         ``forward_observation``): one clean forward on video frame c * f_c + 1 (one frame after the most recent memory
-        latent), under ``causal_state`` with the chunk's state row at step c * C + C / f_c, reading the sink, the
-        softmax window, the GDN state and itself and writing nothing to the memory. Returns the caches of the chunk's
-        denoise reads, which read the observation besides the window (``LayerCache.observed``)."""
+        latent), under ``causal_state`` with the chunk's state row at step c * C + C / f_c -- under ``physical_rope`` at
+        the chunk's start instant, frame c * f_c and step c * C -- reading the sink, the softmax window, the GDN state
+        and itself and writing nothing to the memory. Returns the caches of the chunk's denoise reads, which read the
+        observation besides the window (``LayerCache.observed``)."""
 
         caches = self._caches(memory, commit=False)
         for cache in caches:
@@ -386,8 +398,8 @@ class CausalPolicySession:
         robot, form = None, ROBOT_FORM_CHUNK
         if self.causal_state:
             robot, form = {"state80": state, "state_mask80": state_mask}, ROBOT_FORM_STATE
-        frame = self.chunk_idx * self.f_chunk + 1
-        step = self.chunk_idx * self.chunk_actions + self.chunk_actions // self.f_chunk
+        frame = self.chunk_idx * self.f_chunk + (0 if self.physical else 1)
+        step = self.chunk_idx * self.chunk_actions + (0 if self.physical else self.chunk_actions // self.f_chunk)
         t = torch.zeros(1, 1, device=observation.device)
         self._forward(observation, t, caption, memory, frame_offset=frame, step_offset=step, robot=robot, caches=caches,
                       robot_form=form)
@@ -583,7 +595,7 @@ class CausalPolicySession:
                 "action_timesteps": torch.zeros(1, chunk, device=device),
             }
         video_t = torch.zeros(1, self.f_chunk, device=device)
-        frame_offset = self.chunk_idx * self.f_chunk + 1
+        frame_offset = self.chunk_idx * self.f_chunk + self.target_offset   # physical_rope: its frames' middle
         step_offset = self.chunk_idx * chunk
         with self._autocast(device):
             for caption, memory in self.streams:

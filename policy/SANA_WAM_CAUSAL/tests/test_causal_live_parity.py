@@ -116,13 +116,21 @@ def _require_live_causal_observation(state: bool = False):
         pytest.skip(f"{SANA_CAUSAL_REPO} predates causal_observation / causal_state (764ee2113 / afc9874b6)")
 
 
+def _require_live_physical_rope():
+    """Skip unless the live tree has physical_rope (Sana 6e91eaf2a) on its training canvas."""
+
+    _, crwm = _live_modules()
+    if not hasattr(crwm, "resolve_physical_rope"):
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates physical_rope (6e91eaf2a)")
+
+
 class Twins:
     """A tiny live causal policy and the mirror with the same weights (fp64), plus one random episode: the sink (the
     first frame, chunk 0's observation), clean targets and noisy targets."""
 
     def __init__(self, *, views=1, stride=4, chunk=32, window=None, separate=True, chunks=4, depth=4, seed=11,
                  fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, first_frame=False, normalizer=True,
-                 live_normalizer=None, observation=False, state=False):
+                 live_normalizer=None, observation=False, state=False, physical=False, live_physical=None):
         causal, self.crwm = _live_modules()
         # the mirror's GDN readout (contract.gdn_output_normalizer) and the live one (model.memory_gdn_output_normalizer;
         # live_normalizer differs only in the negative control)
@@ -147,6 +155,14 @@ class Twins:
         if observation:
             _require_live_causal_observation(state)
             options.update(causal_observation=True, causal_state=bool(state))
+        # physical_rope (Sana 6e91eaf2a) on the mirror and on the live policy (live_physical differs only in the negative
+        # control)
+        self.physical = bool(physical)
+        live_physical = self.physical if live_physical is None else bool(live_physical)
+        if self.physical or live_physical:
+            _require_live_physical_rope()
+        if live_physical:
+            options["physical_rope"] = True
         if window is not None:
             options["sliding_window_chunks"] = window
         multiview = "sana_pixel" if views == 1 else "sana_latent"
@@ -177,6 +193,7 @@ class Twins:
             dt_bias_init=-5.0, a_log_init=0.0, reset_legacy_beta=False,
             aligned_phase_window="first_frame" if first_frame else "padded",
             gdn_output_normalizer=normalizer, causal_observation=self.observation, causal_state=self.state,
+            physical_rope=self.physical,
         )
         policy_config = PolicyConfig.from_sana_kwargs(config=config, **kwargs)
         assert tuple(policy_config.multiview_spatial_rope_tile_shape) == (8, 16)
@@ -1166,3 +1183,104 @@ def test_an_observation_and_its_state_are_read_by_their_own_chunk_only(state):
             assert torch.equal(a, b)
     moved, _ = moved_chunks(("clean", 1, 1.0))
     assert moved == {2, 3}
+
+
+
+PHYSICAL_CASES = [
+    # views, stride, chunk, window, length, memory, first_frame, observation, state, normalizer
+    (3, 4, 32, 1, 5, MEMORY_VIDEO_ONLY, True, True, True, False),      # the released physical-RoPE checkpoint's contract
+    (1, 4, 32, 1, 5, MEMORY_VIDEO_ONLY, True, True, True, False),
+    (3, 4, 32, 2, 6, MEMORY_VIDEO_ONLY, True, True, False, True),
+    (3, 4, 32, 2, 6, MEMORY_VIDEO_ONLY, True, False, False, True),     # physical_rope without observation latents
+    (1, 4, 32, 2, 6, MEMORY_VIDEO_AND_ACTION, False, True, True, True),
+    (1, 4, 32, None, 4, MEMORY_VIDEO_AND_ACTION, False, False, False, True),
+    (3, 4, 32, 3, 6, MEMORY_VIDEO_AND_ACTION, True, True, True, True),
+    (1, 1, 16, 2, 5, MEMORY_VIDEO_ONLY, True, True, True, False),      # f_c = 2: targets at c * f_c + i + 0.5625
+    (1, 1, 16, 3, 6, MEMORY_VIDEO_AND_ACTION, False, False, False, True),
+]
+PHYSICAL_IDS = ["V3-W1-obs+state-ff-num", "V1-W1-obs+state-ff-num", "V3-W2-obs-ff", "V3-W2-noobs-ff", "V1-W2-va-obs+state-pad",
+                "V1-noW-va-noobs-pad", "V3-W3-va-obs+state-ff", "V1-s1c16-W2-obs+state-ff-num", "V1-s1c16-W3-va-noobs-pad"]
+
+
+@pytest.mark.parametrize("views,stride,chunk,window,length,memory,first_frame,observation,state,normalizer", PHYSICAL_CASES,
+                         ids=PHYSICAL_IDS)
+def test_a_physical_rope_deploy_chain_equals_two_stream_training_forward(views, stride, chunk, window, length, memory,
+                                                                        first_frame, observation, state, normalizer):
+    """physical_rope (Sana 6e91eaf2a): every noisy chunk of the training canvas on the physical clock (target latents at
+    their frames' middle, the observation at its chunk's start, the rows at their steps, an evicting reader's sink at its
+    window's start) == the deploy chain's chunk, its reads numbered from their origin; with and without observation
+    latents and their state rows, both memory contents and phase windows, windows 1 / 2 / 3 / none, f_c 1 and 2."""
+
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=length, memory=memory,
+                  first_frame=first_frame, normalizer=normalizer, observation=observation, state=state, physical=True)
+    assert twins.live.physical_rope and twins.mirror.physical_rope
+    training = twins.two_stream(length) if first_frame else twins.two_stream(length)[1:]
+    streaming = twins.streaming_first_frame(length) if first_frame else twins.streaming(length)
+    close = OBSERVED_CLOSE if observation else CLOSE
+    assert len(training) == len(streaming)
+    for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming)):
+        torch.testing.assert_close(x_ours, x_live, **close, msg=lambda m: f"chunk {k} video: {m}")
+        torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+
+
+@pytest.mark.parametrize("observation", [False, True], ids=["noobs", "obs+state"])
+@pytest.mark.parametrize("mirror_physical", [False, True], ids=["mirror-slots", "mirror-physical"])
+def test_the_wrong_clock_is_caught(observation, mirror_physical):
+    """Negative controls: the mirror on the latent-slot clock against a physical-RoPE policy, and the mirror on the
+    physical clock against a latent-slot policy, both miss the training forward -- the parity above can tell the clocks
+    apart."""
+
+    twins = Twins(views=3, window=2, chunks=4, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=observation,
+                  state=observation, physical=mirror_physical, live_physical=not mirror_physical)
+    training = twins.two_stream(4)
+    streaming = twins.streaming_first_frame(4)
+    gap = max(_max_abs(streaming[k][i], training[k][i]) for k in range(4) for i in (0, 1))
+    assert gap > 1e-6, gap
+
+
+def test_the_physical_clock_places_every_token_at_its_instant():
+    """The rotary positions every forward of a physical-RoPE observed episode uses, on the GDN (physical) clock and the
+    softmax (read) clock: the sink at 0; chunk c's observation prefill at frame c * f_c with its state row at step c * C;
+    its denoising window's targets at c * f_c + 0.5625 and its action rows at c * C + 1 ..; its commit at c * f_c +
+    0.5625; the softmax reads of an N = 1 window at sink / memory / observation / targets = 0 / 0.5625 / 1 / 1.5625."""
+
+    twins = Twins(views=3, window=1, chunks=4, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=True, state=True,
+                  physical=True)
+    mirror, chunk = twins.mirror, twins.chunk
+    calls = []
+    original = mirror.window_rope
+
+    def recording(rope, fps, frames, view_shapes, view_slot_ids, robot_rows, frame_offset, step_offset, device,
+                  robot_step_start=0):
+        calls.append(("soft" if rope is mirror.rope_softmax else "gdn", frames, robot_rows, float(frame_offset),
+                      int(step_offset) + int(robot_step_start)))
+        return original(rope, fps, frames, view_shapes, view_slot_ids, robot_rows, frame_offset, step_offset, device,
+                        robot_step_start)
+
+    mirror.window_rope = recording
+    session = twins.session()
+    session.commit_sink(twins.ours(twins.sink))
+    mask = torch.ones(1, chunk, 80, dtype=torch.bool)
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    for c in range(4):
+        calls.clear()
+        session.generate_chunk(anchor_state=twins.states[c], anchor_state_mask=state_mask, action_mask=mask,
+                               observation=twins.ours(twins.observations[c]))
+        gdn = [call for call in calls if call[0] == "gdn"]
+        # the window tables (robot rows: the prefill's state row, the denoise window's actions); the entry tables (the
+        # sink, the video_only committed chunks) carry no rows and are built once, at their first read
+        soft = [call for call in calls if call[0] == "soft" and call[2] > 0]
+        assert gdn[0] == ("gdn", 1, 1, float(c), c * chunk)                 # the prefill: its observation and state row
+        assert gdn[1] == ("gdn", 1, chunk, c + 0.5625, c * chunk + 1)        # a denoising step: targets and actions
+        origin = max(0, c - 1)
+        assert soft[0] == ("soft", 1, 1, float(c - origin), (c - origin) * chunk)
+        assert soft[1] == ("soft", 1, chunk, c - origin + 0.5625, (c - origin) * chunk + 1)
+        if c >= 1:   # N = 1: sink 0, memory 0.5625, observation 1, targets 1.5625 on the read's clock
+            assert (soft[0][3], soft[1][3]) == (1.0, 1.5625)
+        calls.clear()
+        twins.commit(session, c)
+        assert [call[3] for call in calls if call[0] == "gdn"] == [c + 0.5625]
+    tables = {key[1]: value for key, value in session._rope_tables.items() if key[0] == "chunk"}
+    reference = mirror.softmax_entry_rope(frames=1, frame_offset=0.5625, robot_rows=0, step_offset=0, model_fps=FPS,
+                                          view_shapes=twins.view_shapes, view_slot_ids=twins.slots, device="cpu")
+    torch.testing.assert_close(tables[0], reference, rtol=0, atol=0)   # the memory chunk of every N = 1 read at 0.5625
