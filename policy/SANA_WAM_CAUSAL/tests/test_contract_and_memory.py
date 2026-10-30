@@ -23,6 +23,7 @@ from sana_wam_causal.contract import (
     MEMORY_VIDEO_ONLY,
     CausalContract,
     bidirectional_view,
+    check_observation_form,
     check_run_record,
     describe_run_records,
     load_run_records,
@@ -54,6 +55,10 @@ N1_OBS_S15000 = os.path.join(_paths.FIXTURES, "config_causal_mixv3_dense14k_sana
 # the physical-RoPE mix-v4 capv3 sana_latent N1-obs+state checkpoint (step 10000) and its run record (deploy block)
 PHYSROPE_S10000 = os.path.join(_paths.FIXTURES, "config_causal_mixv4_capv3_sana_latent_physrope_episode_n1_obs_state_s10000.yaml")
 RECORD_PHYSROPE_S10000 = os.path.join(_paths.FIXTURES, "run_record_physrope_n1_obs_state_s10000.json")
+OBSBLOCK_PIXEL_S15000 = os.path.join(
+    _paths.FIXTURES, "config_causal_mixv4_capv3_obsblock_sana_pixel_physrope_episode_n1_obs_state_s15000.yaml"
+)
+RECORD_OBSBLOCK_PIXEL_S15000 = os.path.join(_paths.FIXTURES, "run_record_obsblock_sana_pixel_physrope_n1_obs_state_s15000.json")
 RECORD_S1000 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_s1000.json")
 RECORD_NOOBS_S3324 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_noobs_s3324.json")
 SINKLESS_VA = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
@@ -225,6 +230,44 @@ def test_the_physical_rope_checkpoint_resolves_and_its_record_is_accepted():
     check_run_record(_record(RECORD_PHYSROPE_S10000), contract, source="RUN_ID.json")
     plain = resolve_causal_contract(_load(N1_OBS_S15000))
     assert plain.physical_rope is False and " physical_rope=False " in plain.describe()
+
+
+def test_the_obs_block_sana_pixel_checkpoint_is_served_as_the_branch_form(tmp_path):
+    """The real config.yaml and RUN_ID.json of the sana_pixel obs-block N1 checkpoint (step 15000, trained on Sana
+    c6d008749 / ff004392a, after fd5261ff6): the one-view canvas on the physical clock with the observation latent and
+    its state row, numerator-only GDN; its record names no source_commit but its training segments, which make it the
+    branch form; the ready line names the newest segment."""
+
+    contract = resolve_causal_contract(_load(OBSBLOCK_PIXEL_S15000))
+    assert (contract.physical_rope, contract.causal_observation, contract.causal_state) == (True, True, True)
+    assert (contract.gdn_output_normalizer, contract.sliding_window_chunks, contract.memory_content) == (False, 1, MEMORY_VIDEO_ONLY)
+    assert " multiview=sana_pixel visual_layout=sana_pixel_canvas " in contract.describe()
+    record = _record(RECORD_OBSBLOCK_PIXEL_S15000)
+    check_run_record(record, contract, source="RUN_ID.json")
+    records = [(tmp_path / "RUN_ID.json", record)]
+    assert check_observation_form(records, contract) == "branch(fd5261ff6; trained on ff004392a)"
+    config = tmp_path / "config.yaml"
+    config.write_bytes(open(OBSBLOCK_PIXEL_S15000, "rb").read())
+    assert "step=15000 source_commit=ff004392a config_sha256=unrecorded)" in describe_run_records(records, config)
+
+
+def test_a_checkpoint_of_the_joint_observation_read_is_refused(tmp_path):
+    """No config key tells the GDN observation forms apart: the physical-RoPE sana_latent N1-obs+state record names
+    6e91eaf2a .. 35b423b3b (before fd5261ff6), so it is refused with the adapter that serves it; an observation
+    checkpoint without a record (the mix-v3 N1-obs s15000 directory) is refused unless it is a donor directory; a
+    checkpoint without causal_observation is not checked."""
+
+    contract = resolve_causal_contract(_load(PHYSROPE_S10000))
+    records = [(tmp_path / "RUN_ID.json", _record(RECORD_PHYSROPE_S10000))]
+    with pytest.raises(ValueError, match=r"before Sana fd5261ff6.*e35fcde"):
+        check_observation_form(records, contract)
+    plain = resolve_causal_contract(_load(N1_OBS_S15000))
+    with pytest.raises(ValueError, match="name no known training tree"):
+        check_observation_form([], plain)
+    assert check_observation_form([], plain, allow_unrecorded=True).startswith("branch(unrecorded")
+    mixed = [(tmp_path / "RUN_ID.json", {"scheme_history": [{"code": "6e91eaf2a"}, {"code": "c6d008749 (git archive)"}]})]
+    assert check_observation_form(mixed, contract) == "branch(fd5261ff6; trained on c6d008749)"
+    assert check_observation_form([], resolve_causal_contract(_load(FIRST_FRAME_NOOBS))) is None
 
 
 @pytest.mark.parametrize(

@@ -47,6 +47,7 @@ from .checkpoint import load_causal_weights  # noqa: E402
 from .contract import (  # noqa: E402
     CausalContract,
     bidirectional_view,
+    check_observation_form,
     check_run_record,
     describe_run_records,
     load_run_records,
@@ -96,6 +97,7 @@ class CausalRuntime:
         records = load_run_records(config_path.parent)
         for source, record in records:
             check_run_record(record, contract, source=str(source))
+        observation_form = check_observation_form(records, contract, allow_unrecorded=allow_donor_checkpoint)
         view = bidirectional_view(train_cfg)
         rope, legacy_origin, rope_label = resolve_rope_contract(view, None)
         policy_config = policy_config_from_train_config(view, rope=rope, legacy_origin=legacy_origin)
@@ -110,6 +112,7 @@ class CausalRuntime:
             model, str(checkpoint_dir), allow_missing_recurrence=allow_donor_checkpoint, device=device
         )
         load_report["run_record"] = describe_run_records(records, config_path)
+        load_report["gdn_observation"] = observation_form
         vae = load_vae(vae_path, device=device, dtype=torch.bfloat16)
         tokenizer, text_encoder = load_text_encoder(text_encoder_path, device=device)
         frontend = PolicyInferenceSession(

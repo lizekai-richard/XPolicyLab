@@ -1,0 +1,37 @@
+{
+  "run": "causal_robodojo_sana_pixel_320x512_mixv4_capv3_obsblock50000_physrope_f33fps8_episode_n1_obs_state_nsc_v2",
+  "repo": "zekaili/causal_robodojo_sana_pixel_mixv4_capv3_obsblock50000_physrope_f33fps8_episode_n1_obs_state_v2",
+  "step": 15000,
+  "epoch": 37,
+  "source_checkpoint": "/scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/output/causal_robodojo_vanilla_mixv4_capv3_obsblock50000_eefabs_f33fps8_sana_pixel_physrope_episode_n1_obs_state_nsc_videoonly/checkpoints/epoch_37_step_15000",
+  "weights_sha256": "453665b4d9b035ca2a22468c4c5bf0bbf797246f8add0d0cb0333d6c63a325bf",
+  "donor_weights_sha256": "80491e2f35937fb1f88bc2dec22e2e61b38435947451940dfd93cabf81d4e5bc",
+  "normalization_sha256": "1fe3b7e72e8fa93eca5efb8a8deeace1daf4434b4b97e9f4445670ac758287ed",
+  "scheme_history": [
+    {
+      "steps": "0-6530",
+      "change": "launch from the donor: video / action flow shift 5 / 3, OpenWAM min weight 0, AdamW betas (0.9, 0.999)",
+      "code": "c6d008749 (git archive)"
+    },
+    {
+      "steps": "6530-15000",
+      "change": "AdamW beta2 0.95 after a loss spike at step ~5060 that had recovered by itself; a resumed segment takes betas / eps from the yaml",
+      "code": "ff004392a"
+    }
+  ],
+  "speed_switches": [
+    "gdn_fused_two_stream",
+    "attn_res_fast_attend",
+    "attn_res_compiled_sum",
+    "softmax_varlen_attention",
+    "gdn_decay_matmul",
+    "gdn_fused_qk_rope",
+    "gdn_fused_output",
+    "row_modulation",
+    "row_modulation_fused_norm",
+    "row_modulation_bf16_input",
+    "cross_attn_kv_dedup",
+    "cross_attn_fused_qk_norm"
+  ],
+  "created_at_utc": "2026-10-30T09:16:48.869648+00:00"
+}

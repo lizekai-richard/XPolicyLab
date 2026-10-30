@@ -26,10 +26,14 @@ softmax reads only the window); present = a cached window that reads ``cache.gdn
 sink's write) / ``cache.softmax_context`` (the sink and the committed chunks of the read, already rotated) and,
 when ``cache.commit`` is set, leaves the next GDN state and this window's K/V in ``cache.gdn_next`` /
 ``cache.softmax_new`` for the session to keep. Under ``causal_observation`` (Sana 764ee2113) a chunk's observation
-prefill (``cache.observation_prefill``) reads like any window and leaves its read terms (``gdn_observation``,
-``softmax_observation``); the chunk's denoise reads (``LayerCache.observed``) take them besides the window: the GDN pools
-its decay and key scale with the observation's tokens and reads their terms besides the state (Sana
-``gdn_observed_read``), the softmax reads the observation's rotated K/V after the window.
+prefill (``cache.observation_prefill``) reads like any window and leaves what the chunk's denoise reads
+(``LayerCache.observed``) take: the GDN branch its observation group [o_c; s_c] writes into the carried state by the
+delta rule (``gdn_observation``, Sana fd5261ff6 ``gdn_observation_branch``: sana-rwm's two-stream obs-block), which a
+denoise read takes in place of the state under its own decay and key scale, and the observation's rotated K/V
+(``softmax_observation``), which the softmax reads after the window. Up to Sana fd5261ff6's parent the denoise reads
+pooled their decay and key scale with the observation's tokens and read its terms besides the state instead
+(``gdn_observed_read``); no config key tells the two apart, and checkpoints trained that way are served by
+SANA_WAM_CAUSAL up to XPolicyLab e35fcde (``contract.check_observation_form``).
 """
 
 from __future__ import annotations
@@ -61,14 +65,12 @@ SOFTMAX_KIND = "GatedSoftmaxAttention"
 
 @dataclass
 class GDNObservation:
-    """A chunk's observation latent as its denoise reads take it in one GDN layer (Sana ``CachedObservation``): its
-    layer inputs summed over its tokens in float32 or better (its share of the chunk's decay pool), its read terms
-    ``K^T diag(beta) V`` [B,H,D,D] and ``K_den^T beta`` [B,H,D] without the key scale (K rotated), and its token count."""
+    """The GDN branch of the chunk being generated in one layer (Sana ``ObservationBranch``, fd5261ff6): the carried
+    (S [B,H,D,D], z [B,H,D]) with the chunk's observation group written by the delta rule, in the compute dtype. Written
+    by the observation prefill, read by the chunk's denoise steps in place of the carried state, never committed."""
 
-    x_sum: torch.Tensor
-    kv: torch.Tensor
-    z: torch.Tensor
-    count: int
+    state: torch.Tensor
+    state_z: torch.Tensor
 
 
 @dataclass
@@ -84,13 +86,13 @@ class LayerCache:
     # causal_observation: the window is the chunk's observation prefill (reads like a denoise step, writes nothing to
     # the memory) and leaves its read terms here for the chunk's denoise reads
     observation_prefill: bool = False
-    gdn_observation: Optional[GDNObservation] = None                    # GDN: the observation a denoise read pools with
+    gdn_observation: Optional[GDNObservation] = None                    # GDN: the branch a denoise read takes
     softmax_observation: Optional[tuple[torch.Tensor, torch.Tensor]] = None  # softmax: its (k rotated, v) [B,T,H,D]
 
     def observed(self) -> "LayerCache":
         """The cache of the chunk's denoise reads after this observation prefill: the same read with the observation
         appended to the softmax context (Sana's store reads [sink | window | o_c | the denoise window]) and the GDN
-        observation terms."""
+        branch the observation wrote."""
 
         if not self.observation_prefill:
             raise RuntimeError("only an observation prefill leaves an observation for the denoise reads")
@@ -159,13 +161,18 @@ class CausalGDNAttention(GatedDeltaNet):
         gate = self.gate_proj(x.mean(dim=1)).float()
         return (-self.A_log.float().exp() * F.softplus(gate + self.dt_bias.float())).exp()
 
-    def observed_decay(self, x: torch.Tensor, observation: GDNObservation) -> torch.Tensor:
-        """``[B, H]`` decay of a denoise window pooled with its chunk's observation latent: the mean of the window's and
-        the observation's inputs in float32 or better (Sana ``_observed_decay``)."""
+    @staticmethod
+    def delta_write(k_c, v_c, k_den_c, beta_c, decayed_state, decayed_z) -> tuple[torch.Tensor, torch.Tensor]:
+        """The delta-rule write of one window into the decayed carry (``gdn_scan``): S' = gS + K^T diag(beta) (V - K gS)
+        and z likewise, keys already scaled."""
 
-        pooled = (observation.x_sum + x.to(observation.x_sum.dtype).sum(dim=1)) / float(x.shape[1] + observation.count)
-        gate = self.gate_proj(pooled.to(x.dtype)).float()
-        return (-self.A_log.float().exp() * F.softplus(gate + self.dt_bias.float())).exp()
+        v_pred = torch.einsum("bhld,bhdv->bhlv", k_c, decayed_state)
+        dv = (v_c - v_pred) * beta_c[..., None]
+        state_new = decayed_state + torch.einsum("bhld,bhlv->bhdv", k_c, dv)
+        z_pred = torch.einsum("bhld,bhd->bhl", k_den_c, decayed_z)
+        dz = (1.0 - z_pred) * beta_c
+        z_new = decayed_z + torch.einsum("bhld,bhl->bhd", k_den_c, dz)
+        return state_new, z_new
 
     def forward(  # type: ignore[override]
         self,
@@ -188,16 +195,16 @@ class CausalGDNAttention(GatedDeltaNet):
         if rotary_emb is not None:
             q_num = rope_bhnd_complex64(q_num, rotary_emb)
             k_num = rope_bhnd_complex64(k_num, rotary_emb)
-        # causal_observation: a prefill reads like any window and leaves its observation terms; a denoise read after it
-        # pools the decay and the key scale with the observation and reads its terms besides the state (Sana
-        # ``gdn_observed_read``: gdn_two_stream's noisy segment with its observation tokens cached)
+        # causal_observation (Sana fd5261ff6, sana-rwm's two-stream obs-block): a prefill reads like any window and
+        # writes its branch of the carried state by the delta rule; a denoise read after it reads that branch in place
+        # of the state, under the window's own decay and key scale (Sana ``gdn_read`` seeded with the branch)
         prefill = cache is not None and cache.observation_prefill
         observed = None if cache is None else cache.gdn_observation
         if (prefill or observed is not None) and cache.commit:
             raise RuntimeError("an observation prefill and the reads after it write nothing to the memory")
         if prefill and observed is not None:
             raise RuntimeError("an observation prefill reads no earlier observation")
-        decay_raw = self.chunk_decay(x) if observed is None else self.observed_decay(x, observed)
+        decay_raw = self.chunk_decay(x)
 
         compute = torch.float64 if q_num.dtype == torch.float64 else torch.float32
         q_c = q_num.to(compute)
@@ -206,21 +213,18 @@ class CausalGDNAttention(GatedDeltaNet):
         q_den_c = q_den.to(compute)
         k_den_c = k_den.to(compute)
         beta_c = beta.to(compute)
-        if prefill:
-            cache.gdn_observation = GDNObservation(
-                x_sum=x.to(torch.promote_types(x.dtype, torch.float32)).sum(dim=1),
-                kv=torch.einsum("bhld,bhl,bhlv->bhdv", k_c, beta_c, v_c),
-                z=torch.einsum("bhld,bhl->bhd", k_den_c, beta_c),
-                count=int(tokens),
-            )
-        n_valid = torch.full((batch,), float(tokens + (0 if observed is None else observed.count)), dtype=compute,
-                             device=x.device)
+        # the read's key scale as Sana's gdn_read takes it (a tensor rsqrt), the branch write's as gdn_observation_branch
+        # (a Python float): equal up to rounding
+        n_valid = torch.full((batch,), float(tokens), dtype=compute, device=x.device)
         key_scale = (self.dim * n_valid).rsqrt()[:, None, None, None]
+        k_raw_c, k_den_raw_c = k_c, k_den_c
         k_c = k_c * key_scale
         k_den_c = k_den_c * key_scale
         decay = decay_raw.to(compute)
 
-        seed = None if cache is None else cache.gdn_state
+        seed = None if cache is None else (
+            cache.gdn_state if observed is None else (observed.state, observed.state_z)
+        )
         if seed is None:
             state = torch.zeros(batch, self.heads, self.dim, self.dim, dtype=compute, device=x.device)
             state_z = torch.zeros(batch, self.heads, self.dim, dtype=compute, device=x.device)
@@ -228,9 +232,12 @@ class CausalGDNAttention(GatedDeltaNet):
             state, state_z = seed[0].to(compute), seed[1].to(compute)
         decayed_state = state * decay[..., None, None]
         decayed_z = state_z * decay[..., None]
-        if observed is not None:
-            decayed_state = decayed_state + key_scale * observed.kv.to(compute)
-            decayed_z = decayed_z + key_scale[..., 0] * observed.z.to(compute)
+        if prefill:
+            write_scale = float(self.dim * tokens) ** -0.5
+            branch, branch_z = self.delta_write(
+                k_raw_c * write_scale, v_c, k_den_raw_c * write_scale, beta_c, decayed_state, decayed_z
+            )
+            cache.gdn_observation = GDNObservation(branch.detach(), branch_z.detach())
 
         # _readout: the decayed past plus the chunk's own beta-gated sum-linear attention, over the denominator unless
         # the checkpoint reads the numerator alone
@@ -246,12 +253,7 @@ class CausalGDNAttention(GatedDeltaNet):
             self.probe.gdn(self.probe_layer, q_c, decayed_state, intra_read, q_den_c, decayed_z, intra_z, self.eps)
 
         if cache is not None and cache.commit:
-            v_pred = torch.einsum("bhld,bhdv->bhlv", k_c, decayed_state)
-            dv = (v_c - v_pred) * beta_c[..., None]
-            state_new = decayed_state + torch.einsum("bhld,bhlv->bhdv", k_c, dv)
-            z_pred = torch.einsum("bhld,bhd->bhl", k_den_c, decayed_z)
-            dz = (1.0 - z_pred) * beta_c
-            z_new = decayed_z + torch.einsum("bhld,bhl->bhd", k_den_c, dz)
+            state_new, z_new = self.delta_write(k_c, v_c, k_den_c, beta_c, decayed_state, decayed_z)
             cache.gdn_next = (state_new.detach(), z_new.detach())
 
         out = out.permute(0, 1, 3, 2)

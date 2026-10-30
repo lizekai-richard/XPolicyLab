@@ -62,6 +62,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -104,6 +105,17 @@ ALIGNED_PHASE_WINDOWS = (ALIGNED_PHASE_PADDED, ALIGNED_PHASE_FIRST_FRAME)
 # the run record a Hub upload of the causal line writes next to config.yaml (RUN_ID.json; upload_manifest.json carries
 # the same keys): the run's protocol switches, which a config from before Sana 4bd6eca83 need not declare
 RUN_RECORD_NAMES = ("RUN_ID.json", "upload_manifest.json")
+# The GDN of a causal_observation chunk's observation group [o_c; s_c]: since Sana fd5261ff6 (sana-rwm's two-stream
+# obs-block) it writes a branch of the carried state that the chunk's prediction tokens read; up to its parent the whole
+# noisy segment read the state under one decay and key scale and the observation wrote nothing. No config key tells the
+# two apart, so the run record's training trees decide (``check_observation_form``). Trees known to train the branch
+# (fd5261ff6 and descendants; add a newer one after `git merge-base --is-ancestor fd5261ff6 <tree>`):
+OBSERVATION_BRANCH_TREES = ("fd5261ff6", "c6d008749", "ff004392a")
+# trees known to train the joint read (764ee2113 .. fd5261ff6^): served by SANA_WAM_CAUSAL up to XPolicyLab e35fcde
+OBSERVATION_JOINT_TREES = (
+    "764ee2113", "afc9874b6", "6e91eaf2a", "c414e9b32", "02aebea6e", "c4d1d246d", "c601aae6e", "bf824fbf0", "35b423b3b",
+    "db2149f09", "872303bd7",
+)
 
 
 @dataclass(frozen=True)
@@ -319,6 +331,54 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
                 )
 
 
+def record_trees(record: Mapping[str, Any]) -> list[str]:
+    """The training trees a run record names, oldest first: the hex commit ids (7+ digits) of its ``source_commit`` and
+    of every ``scheme_history`` segment's ``code``."""
+
+    texts = [str(record.get("source_commit") or "")]
+    history = record.get("scheme_history")
+    if isinstance(history, list):
+        texts += [str(segment.get("code") or "") for segment in history if isinstance(segment, Mapping)]
+    return [tree for text in texts for tree in re.findall(r"\b[0-9a-f]{7,40}\b", text)]
+
+
+def _known(tree: str, known: tuple[str, ...]) -> bool:
+    return any(tree.startswith(k) or k.startswith(tree) for k in known)
+
+
+def check_observation_form(
+    records: list[tuple[Path, Mapping[str, Any]]], contract: CausalContract, allow_unrecorded: bool = False
+) -> Optional[str]:
+    """The GDN observation form of a ``causal_observation`` checkpoint, from its run records' training trees
+    (``OBSERVATION_BRANCH_TREES``): this adapter serves the branch of Sana fd5261ff6 only. Refuses a record naming a
+    joint-read tree and no branch tree (served up to XPolicyLab e35fcde) and, unless ``allow_unrecorded`` (a step-0
+    donor directory), a checkpoint whose records name no known tree. Returns the ready-report label (``None`` without
+    causal_observation)."""
+
+    if not contract.causal_observation:
+        return None
+    trees = [tree for _, record in records for tree in record_trees(record)]
+    branch = [tree for tree in trees if _known(tree, OBSERVATION_BRANCH_TREES)]
+    if branch:
+        return f"branch(fd5261ff6; trained on {branch[-1]})"
+    joint = [tree for tree in trees if _known(tree, OBSERVATION_JOINT_TREES)]
+    if joint:
+        raise ValueError(
+            f"the run record names training trees {joint} from before Sana fd5261ff6: the checkpoint learned the joint GDN "
+            "read of its observation group (one decay and key scale over the whole noisy segment, nothing written), "
+            "which no config key declares; this adapter serves the branch form (sana-rwm's two-stream obs-block). Serve "
+            "it with SANA_WAM_CAUSAL up to XPolicyLab e35fcde"
+        )
+    if allow_unrecorded:
+        return "branch(unrecorded: donor directory)"
+    raise ValueError(
+        f"causal_observation checkpoint whose run records ({[str(path.name) for path, _ in records] or 'none'}) name no "
+        f"known training tree ({trees or 'none'}): the GDN form of its observation group (branch since Sana fd5261ff6, "
+        "joint before) cannot be told from the config. If the tree is fd5261ff6 or a descendant, add it to "
+        "OBSERVATION_BRANCH_TREES; if older, serve it with SANA_WAM_CAUSAL up to XPolicyLab e35fcde"
+    )
+
+
 def describe_run_records(records: list[tuple[Path, Mapping[str, Any]]], config_path: str | Path) -> str:
     """One line for the ready report: the records read, the protocol they declare and whether the config is the one
     they recorded (``config_sha256``)."""
@@ -331,6 +391,8 @@ def describe_run_records(records: list[tuple[Path, Mapping[str, Any]]], config_p
     shas = {str(r["config_sha256"]) for _, r in records if r.get("config_sha256")}
     match = "unrecorded" if not shas else ("match" if shas == {config_sha} else "differs")
     commit = str(record.get("source_commit") or "")[:9] or None
+    if commit is None and record_trees(record):
+        commit = record_trees(record)[-1][:9]   # a record without source_commit: its newest training segment
     return (
         f"{names}(chunk_observation={record.get('chunk_observation')} "
         f"aligned_phase_window={record.get('aligned_phase_window')} memory_content={record.get('memory_content')} "
@@ -496,6 +558,7 @@ __all__ = [
     "RUN_RECORD_NAMES",
     "SERVED_VISUAL_LAYOUTS",
     "bidirectional_view",
+    "check_observation_form",
     "check_run_record",
     "chunk_causal_options",
     "describe_run_records",

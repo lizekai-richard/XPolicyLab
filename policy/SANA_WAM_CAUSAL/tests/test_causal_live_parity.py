@@ -1,7 +1,9 @@
 """Live parity of the causal mirror against Sana's chunk-causal policy on the episode protocol in its single form
-(``SANA_CAUSAL_REPO``: Sana rwm/zekai-merge at or after 4bd6eca83, checked at 7de7711c2, b297028fe and c4d1d246d; no
+(``SANA_CAUSAL_REPO``: Sana rwm/zekai-merge at or after 4bd6eca83, checked at 7de7711c2, b297028fe, c4d1d246d and
+ff004392a; no
 chunk observations, the sink on every canvas). The numerator-only GDN readout (``model.memory_gdn_output_normalizer:
-false``) needs a tree at or after c414e9b32; those tests skip on an older one.
+false``) needs a tree at or after c414e9b32; those tests skip on an older one. The observation tests need a tree at or
+after fd5261ff6 (the GDN branch of the observation group, sana-rwm's two-stream obs-block) and skip on an older one.
 
 The live class and the mirror get identical random weights (tiny dims, fp64, CPU, xformers off, ``flash_attn`` bound to
 an fp64 reference varlen as Sana's own tests do). The decisive check is the teacher-forced deploy contract: the
@@ -34,7 +36,7 @@ from sana_wam_causal.model import CausalPolicyModel
 from sana_wam_causal.session import Caption, CausalMemory, CausalPolicySession
 from sana_wam_min.policy_model.config import PolicyConfig
 
-SANA_CAUSAL_REPO = os.path.expanduser(os.environ.get("SANA_CAUSAL_REPO", "~/zekail/Sana_zekai_merge_c4d1d246d"))
+SANA_CAUSAL_REPO = os.path.expanduser(os.environ.get("SANA_CAUSAL_REPO", "~/zekail/Sana_zekai_merge_ff004392a"))
 FPS = 16.0
 C_LAT = 4
 VIEW = (3, 4)
@@ -109,11 +111,16 @@ def _require_live_gdn_normalizer():
 
 def _require_live_causal_observation(state: bool = False):
     """Skip unless the live tree serves causal_observation (Sana 764ee2113) and, for ``state``, causal_state
-    (afc9874b6) in its cached session."""
+    (afc9874b6) in its cached session, with the GDN branch of the observation group (fd5261ff6), the form this adapter
+    serves."""
 
     _, crwm = _live_modules()
     if not hasattr(crwm, "resolve_causal_observation") or (state and not hasattr(crwm, "resolve_causal_state")):
         pytest.skip(f"{SANA_CAUSAL_REPO} predates causal_observation / causal_state (764ee2113 / afc9874b6)")
+    from dev.rwm.diffusion.model.layers import chunk_causal_gdn
+
+    if not hasattr(chunk_causal_gdn, "gdn_observation_branch"):
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates the GDN branch of the observation group (fd5261ff6)")
 
 
 def _require_live_physical_rope():
@@ -1032,8 +1039,8 @@ def test_every_forward_of_an_observed_episode_reads_exactly_its_causal_set(state
     (the observation latent of every view, plus the state row under causal_state) -- no target or action key exists in
     it; every denoising step reads the sink, the window, the prefill's observation K/V (exactly the tensors the prefill
     left) and its own targets and rows; the commit reads the sink, the window and its own targets, no observation. GDN:
-    the prefill and the denoise reads write nothing, the denoise reads pool with the observation's tokens, the commit
-    neither reads an observation nor skips its write."""
+    the prefill and the denoise reads write nothing to the memory, the prefill leaves its branch and every denoise read
+    takes that branch (the very tensors), the commit neither reads a branch nor skips its write."""
 
     from sana_wam_causal.layers import CausalGDNAttention, CausalSoftmaxAttention
 
@@ -1044,7 +1051,7 @@ def test_every_forward_of_an_observed_episode_reads_exactly_its_causal_set(state
     width, chunk = twins.width, twins.chunk
     n_obs = width + int(state)
     n_denoise = width + chunk + (0 if state else 1)
-    soft, gdn, phase = [], [], {"name": None}
+    soft, gdn, branches, phase = [], [], [], {"name": None}
     run_attention = CausalSoftmaxAttention._run_attention
     gdn_forward = CausalGDNAttention.forward
 
@@ -1053,12 +1060,14 @@ def test_every_forward_of_an_observed_episode_reads_exactly_its_causal_set(state
         return run_attention(self, q, k, v)
 
     def record_gdn(self, x, rotary_emb=None, cache=None):
-        observed = cache.gdn_observation   # what the forward READS (a prefill leaves its own terms here afterwards)
+        observed = cache.gdn_observation   # what the forward READS (a prefill leaves its branch here afterwards)
         out = gdn_forward(self, x, rotary_emb=rotary_emb, cache=cache)
-        gdn.append((phase["name"], x.shape[1], bool(cache.observation_prefill), None if observed is None else observed.count,
+        gdn.append((phase["name"], x.shape[1], bool(cache.observation_prefill), None if observed is None else observed,
                     cache.commit, cache.gdn_next is not None))
         if cache.observation_prefill:
-            assert cache.gdn_observation is not None and cache.gdn_observation.count == x.shape[1]
+            branch = cache.gdn_observation
+            assert branch is not None and branch.state.shape[-2:] == (self.dim, self.dim) and branch.state_z.shape[-1] == self.dim
+            branches.append(branch)
         return out
 
     prefill = session.prefill_observation
@@ -1078,7 +1087,7 @@ def test_every_forward_of_an_observed_episode_reads_exactly_its_causal_set(state
         session.commit_sink(twins.ours(twins.sink))
         for c in range(chunks):
             n_window = min(c, window) * width
-            soft.clear(), gdn.clear()
+            soft.clear(), gdn.clear(), branches.clear()
             phase["name"] = "generate"
             session.generate_chunk(anchor_state=twins.states[c], anchor_state_mask=state_mask, action_mask=mask,
                                    observation=twins.ours(twins.observations[c]))
@@ -1100,14 +1109,19 @@ def test_every_forward_of_an_observed_episode_reads_exactly_its_causal_set(state
                                                rtol=0, atol=0)
             gdn_prefill = [entry for entry in gdn if entry[2]]
             gdn_denoise = [entry for entry in gdn if not entry[2]]
-            assert all(t == n_obs and count is None and not commit and not wrote for _, t, _, count, commit, wrote in gdn_prefill)
-            assert all(t == n_denoise and count == n_obs and not commit and not wrote
-                       for _, t, _, count, commit, wrote in gdn_denoise)
+            assert all(t == n_obs and read is None and not commit and not wrote for _, t, _, read, commit, wrote in gdn_prefill)
+            assert all(t == n_denoise and not commit and not wrote for _, t, _, read, commit, wrote in gdn_denoise)
+            # every denoise read takes the branch its stream's prefill left in that layer (the prefills run stream by
+            # stream; every denoising step runs both streams, layer by layer)
+            n_gdn = len(gdn_prefill) // 2
+            for i, (_, _, _, read, _, _) in enumerate(gdn_denoise):
+                stream = (i // n_gdn) % 2
+                assert read is branches[stream * n_gdn + i % n_gdn]
             soft.clear(), gdn.clear()
             phase["name"] = "commit"
             twins.commit(session, c)
             assert all(q == width and k.shape[1] == width + n_window + width for _, q, k, _v in soft)
-            assert all(count is None and commit and wrote and not pre for _, t, pre, count, commit, wrote in gdn)
+            assert all(read is None and commit and wrote and not pre for _, t, pre, read, commit, wrote in gdn)
     finally:
         CausalSoftmaxAttention._run_attention, CausalGDNAttention.forward = run_attention, gdn_forward
 
@@ -1116,7 +1130,7 @@ def test_every_forward_of_an_observed_episode_reads_exactly_its_causal_set(state
 def test_an_observation_and_its_state_are_read_by_their_own_chunk_only(state):
     """Who reads whom, on the deploy chain's outputs: moving chunk 1's observation latent (or its anchor state) moves
     chunk 1's generation and no other chunk's -- nothing of it reaches the memory; moving chunk 1's noisy targets moves
-    chunk 1 only and leaves the observation's prefill terms as they were (the observation never reads its targets);
+    chunk 1 only and leaves the observation's prefill branch as it was (the observation never reads its targets);
     moving the clean chunk 1 committed to the memory moves the chunks after it and none before."""
 
     chunks = 4
@@ -1136,7 +1150,7 @@ def test_an_observation_and_its_state_are_read_by_their_own_chunk_only(state):
 
         def recording(caption, memory, observation, **kwargs):
             caches = prefill(caption, memory, observation, **kwargs)
-            terms.append([(c.gdn_observation.kv.clone() if c.gdn_observation is not None else c.softmax_context[0][:, -1:].clone())
+            terms.append([(c.gdn_observation.state.clone() if c.gdn_observation is not None else c.softmax_context[0][:, -1:].clone())
                           for c in caches])
             return caches
 
