@@ -7,9 +7,9 @@
 - Training support: full | eval-only (training release ETA: ...)
 
 ## Components
-- [ ] install.sh
+- [ ] install.sh (or upstream-native install, documented in the policy README)
 - [ ] model.py (+ __init__.py)
-- [ ] images: only decode_image_bit is supported (legacy layouts → RGB), no channel swaps (see README)
+- [ ] images: only decode_image_bit / encode_image_bit are supported (two byte formats → RGB), no channel swaps (see README)
 - [ ] deploy.yml (standard key set incl. protocol: ws / host / port, policy_name matches the directory)
 - [ ] deploy.py aligned with demo_policy (or divergence explained)
 - [ ] eval.sh + setup_eval_policy_server.sh + setup_eval_env_client.sh
@@ -18,7 +18,7 @@
 
 ## Testing
 - [ ] bash -n + py_compile pass
-- [ ] decode grep: only decode_image_bit on XPolicyLab data
+- [ ] decode/encode grep: only decode_image_bit and encode_image_bit on XPolicyLab data
 - [ ] EVAL_ENV_TYPE=debug closed loop passes (paste the log tail)
 - [ ] Simulator eval: task=..., success=... (if available)
 

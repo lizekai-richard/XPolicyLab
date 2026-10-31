@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+/data/
+/results/
+/checkpoints/
+/eval_logs/
+/starVLA.egg-info/
+/.generated/
+.pip_tmp/*

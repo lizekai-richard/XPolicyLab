@@ -1,0 +1,40 @@
+policy_name: ViGAR
+protocol: ws
+host: localhost
+port: null
+bench_name: null
+task_name: null
+ckpt_name: null
+env_cfg_type: null
+seed: null
+action_type: null
+gpu_id: null
+eval_batch: false
+
+# Model loading and the first query take minutes; give clients that read
+# deploy.yml more time than the 120 s default.
+request_timeout_s: 600.0
+
+# ViGAR checkout from install.sh (relative paths resolve from this directory).
+vigar_root: source_vigar
+vigar_python: null              # default: <vigar_root>/.venv-model/bin/python
+# Bundle with weights/policy/robotwin_c2r and weights/subgoal_planner/robotwin_subgoal_planner;
+# null resolves it from ckpt_name (download_checkpoint.sh writes checkpoints/ViGAR).
+checkpoint_path: null
+planner_gpu_id: null            # physical GPU for the planner; default: first id of policy_gpu_id
+log_dir: logs
+server_startup_timeout_s: 1800
+model_request_timeout_s: 600
+
+# Published RoboTwin inference settings.
+replan_steps: 32                # of 48 predicted actions
+generation_seed: 9000
+policy_sampling:
+  num_steps: 10
+  guidance: 1.0
+  shift: 2.0
+goal_refresh_mode: sync_current
+# The released policy checkpoint was trained on BGR camera frames; the planner
+# always receives RGB. Keep bgr for the released checkpoint.
+input_color_order: bgr
+fast_inference: false
