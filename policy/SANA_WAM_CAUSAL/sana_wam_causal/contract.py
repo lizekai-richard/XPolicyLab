@@ -45,6 +45,13 @@ f_c, the state row and action j at their steps c * C and c * C + j (no observati
 numbered from its window start (the sink rotated there) then sees a one-chunk window at 0 / 0.5625 / 1 / 1.5625. Sana's
 own cached session refuses it (posttrain_causal_handoff 11, R4); this adapter serves it.
 
+From Sana ``0c88c11ab`` on (yuyang's two-stream pretrain clock, "no switch kept") the physical clock is the only one --
+``physical_rope`` is no longer read, so the recipes drop it -- and a softmax reader in chunk c (its observation, its
+denoising window, its commit) reads the sink at the instant chunk max(0, c - 7) starts (``SINK_HORIZON_CHUNKS``, Sana
+``causal_rwm_train.sink_read_chunks``) instead of at its window's start: chunks 0..7 read it in place, later ones never
+farther than 7 chunks away; the GDN keeps the absolute clock, and a window above 7 chunks is refused. No config key
+tells the two sink rules apart, so the run record's training trees decide (``resolve_rope_clock``).
+
 ``model.memory_gdn_output_normalizer`` (Sana ``c414e9b32``; ``true`` when absent) decides every GDN layer's readout: true
 divides the numerator ``q (gS + K^T diag(beta) V)`` by the denominator ``ReLU(q) . (gz + K_den^T beta) + eps``, false
 returns the numerator alone (z is still carried, so a commit writes the same state either way). The per-head RMSNorm
@@ -63,7 +70,7 @@ import copy
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -115,14 +122,21 @@ RUN_RECORD_NAMES = ("RUN_ID.json", "upload_manifest.json", "RUN_ID.local.json")
 OBSERVATION_BRANCH_TREES = (
     "fd5261ff6", "c6d008749", "ff004392a", "53234167c", "a5ae8cf8f", "c2b32227e", "020582851", "9a1b3e33d",
 )
-# Sana 0c88c11ab retired the window-start softmax sink and the integer clock (the physical clock is the only one, the
-# sink read at chunk max(0, c - 7), physical_rope dropped from the recipes): trees from it on train a clock this adapter
-# does not serve (``check_rope_clock``); their checkpoints' configs no longer declare physical_rope.
-SINK_HORIZON_TREES = ("0c88c11ab", "e6c386907")
 # trees known to train the joint read (764ee2113 .. fd5261ff6^): served by SANA_WAM_CAUSAL up to XPolicyLab e35fcde
 OBSERVATION_JOINT_TREES = (
     "764ee2113", "afc9874b6", "6e91eaf2a", "c414e9b32", "02aebea6e", "c4d1d246d", "c601aae6e", "bf824fbf0", "35b423b3b",
     "db2149f09", "872303bd7",
+)
+# Sana 0c88c11ab: a softmax reader in chunk c reads the sink at the instant chunk max(0, c - H) starts, H = 7 (Sana
+# ``causal_rwm_train.SINK_HORIZON_CHUNKS``), on the physical clock, the only one from that tree on (physical_rope is no
+# longer read). Trees known to train it (0c88c11ab and descendants; add a newer one after
+# `git merge-base --is-ancestor 0c88c11ab <tree>`):
+SINK_HORIZON_CHUNKS = 7
+SINK_HORIZON_TREES = ("0c88c11ab", "e6c386907", "6cf45c1ae", "7ed0d28bf")
+# trees known to train the sink at the reader's window start on the clock physical_rope declares (not descendants of
+# 0c88c11ab): the observation trees above and the no-observation runs served so far (N2 / N4 p14k-pretrain)
+WINDOW_START_SINK_TREES = OBSERVATION_BRANCH_TREES + OBSERVATION_JOINT_TREES + (
+    "7de7711c2", "b297028fe", "bfbdcb1b2", "11117d192",
 )
 
 
@@ -149,6 +163,9 @@ class CausalContract:
     causal_state: bool = False          # the chunk's state row joins its observation latent (causal_observation only)
     physical_rope: bool = False         # every token at its physical instant (target latents at their frames' middle)
     use_attn_res: bool = True           # false: the block stack is a plain residual, no AttnRes (Sana 53234167c)
+    # H: a softmax reader in chunk c reads the sink at chunk max(0, c - H)'s start (Sana 0c88c11ab, H = 7); None: at the
+    # start of its window, chunk max(0, c - W) (the trees before it). Set from the run record (``resolve_rope_clock``).
+    sink_horizon: Optional[int] = None
 
     @property
     def first_chunk(self) -> int:
@@ -166,7 +183,8 @@ class CausalContract:
             f"multiview={self.multiview} visual_layout={self.visual_layout} "
             f"rope={self.rope} physical_rope={self.physical_rope} aligned_phase_window={self.aligned_phase_window} "
             f"first_chunk={self.first_chunk} "
-            f"gdn_output_normalizer={self.gdn_output_normalizer} use_attn_res={self.use_attn_res}"
+            f"gdn_output_normalizer={self.gdn_output_normalizer} use_attn_res={self.use_attn_res} "
+            f"sink_horizon={self.sink_horizon}"
         )
 
 
@@ -275,8 +293,9 @@ def resolve_causal_state(value: Any, observation: bool) -> bool:
 
 
 def resolve_physical_rope(value: Any) -> bool:
-    """``physical_rope`` as Sana reads it (``causal_rwm_train.resolve_physical_rope``, 6e91eaf2a): None -> false, a yaml
-    boolean otherwise (it needs ``rope: aligned``, the only RoPE mode this adapter serves)."""
+    """``physical_rope`` as Sana reads it (``causal_rwm_train.resolve_physical_rope``, 6e91eaf2a .. 0c88c11ab^): None ->
+    false, a yaml boolean otherwise (it needs ``rope: aligned``, the only RoPE mode this adapter serves). A checkpoint
+    trained from 0c88c11ab on runs the physical clock whatever it says (``resolve_rope_clock``)."""
 
     if value is None:
         return False
@@ -317,13 +336,9 @@ def load_run_records(directory: str | Path) -> list[tuple[Path, Mapping[str, Any
     return records
 
 
-def check_run_record(record: Mapping[str, Any], contract: CausalContract, source: str = "the run record") -> None:
-    """Refuse a checkpoint whose run record contradicts the contract its config resolves to: a run that trained chunk
-    observations (``chunk_observation`` anything but false: its config may lack the key, which the single form reads
-    as false) and a recorded ``aligned_phase_window`` / ``memory_content`` / ``memory_gdn_output_normalizer`` /
-    ``causal_observation`` / ``causal_state`` / ``physical_rope`` / ``sliding_window_chunks`` other than the config's, at
-    the record's top level or in its ``deploy`` block (the record of the physical-RoPE line). Keys the record does not
-    carry are not checked."""
+def refuse_recorded_chunk_observation(record: Mapping[str, Any], source: str = "the run record") -> None:
+    """Refuse a run that trained chunk observations (``chunk_observation`` anything but false: its config may lack the
+    key, which the single form reads as false)."""
 
     observation = record.get("chunk_observation")
     if observation is not None and observation is not False:
@@ -332,6 +347,16 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
             "run trained chunk observations, which a config from before Sana 4bd6eca83 need not declare and this adapter "
             "would serve as the single form without them; it is served by SANA_WAM_CAUSAL up to XPolicyLab d57a617"
         )
+
+
+def check_run_record(record: Mapping[str, Any], contract: CausalContract, source: str = "the run record") -> None:
+    """Refuse a checkpoint whose run record contradicts the contract it resolves to (``resolve_rope_clock`` completes
+    the config's): a run that trained chunk observations (``refuse_recorded_chunk_observation``) and a recorded
+    ``aligned_phase_window`` / ``memory_content`` / ``memory_gdn_output_normalizer`` / ``causal_observation`` /
+    ``causal_state`` / ``physical_rope`` / ``sliding_window_chunks`` other than the contract's, at the record's top level
+    or in its ``deploy`` block (the record of the physical-RoPE line). Keys the record does not carry are not checked."""
+
+    refuse_recorded_chunk_observation(record, source)
     deploy = record.get("deploy") if isinstance(record.get("deploy"), Mapping) else {}
     for key, resolved in (
         ("aligned_phase_window", contract.aligned_phase_window),
@@ -370,15 +395,15 @@ def check_observation_form(
     records: list[tuple[Path, Mapping[str, Any]]], contract: CausalContract, allow_unrecorded: bool = False
 ) -> Optional[str]:
     """The GDN observation form of a ``causal_observation`` checkpoint, from its run records' training trees
-    (``OBSERVATION_BRANCH_TREES``): this adapter serves the branch of Sana fd5261ff6 only. Refuses a record naming a
-    joint-read tree and no branch tree (served up to XPolicyLab e35fcde) and, unless ``allow_unrecorded`` (a step-0
-    donor directory), a checkpoint whose records name no known tree. Returns the ready-report label (``None`` without
-    causal_observation)."""
+    (``OBSERVATION_BRANCH_TREES``, and ``SINK_HORIZON_TREES``, its descendants): this adapter serves the branch of Sana
+    fd5261ff6 only. Refuses a record naming a joint-read tree and no branch tree (served up to XPolicyLab e35fcde) and,
+    unless ``allow_unrecorded`` (a step-0 donor directory), a checkpoint whose records name no known tree. Returns the
+    ready-report label (``None`` without causal_observation)."""
 
     if not contract.causal_observation:
         return None
     trees = [tree for _, record in records for tree in record_trees(record)]
-    branch = [tree for tree in trees if _known(tree, OBSERVATION_BRANCH_TREES)]
+    branch = [tree for tree in trees if _known(tree, OBSERVATION_BRANCH_TREES + SINK_HORIZON_TREES)]
     if branch:
         return f"branch(fd5261ff6; trained on {branch[-1]})"
     joint = [tree for tree in trees if _known(tree, OBSERVATION_JOINT_TREES)]
@@ -399,19 +424,44 @@ def check_observation_form(
     )
 
 
-def check_rope_clock(records: list[tuple[Path, Mapping[str, Any]]]) -> None:
-    """Refuse a checkpoint whose run records name a training tree of ``SINK_HORIZON_TREES``: from Sana 0c88c11ab on the
-    softmax sink is read at chunk max(0, c - 7) and the physical clock is the only one, while this adapter reads the
-    sink at the window's start and takes the integer clock for a config without physical_rope."""
+def resolve_rope_clock(
+    records: list[tuple[Path, Mapping[str, Any]]], contract: CausalContract, allow_unrecorded: bool = False
+) -> tuple[CausalContract, str]:
+    """The RoPE clock and softmax sink rule a checkpoint trained, from its run records' training trees, and the
+    ready-report label. A tree of ``SINK_HORIZON_TREES`` (Sana 0c88c11ab on) serves the physical clock whatever the
+    config says of physical_rope (no longer read there) with the sink at chunk max(0, c - ``SINK_HORIZON_CHUNKS``)
+    (``sink_horizon``); a tree of ``WINDOW_START_SINK_TREES`` serves the sink at the reader's window start on the clock
+    the config's physical_rope declares (the contract unchanged). Refuses a horizon checkpoint whose softmax window is
+    unbounded or above the horizon (Sana refuses both), records that name no known tree, and, unless
+    ``allow_unrecorded`` (a step-0 donor directory, served on the window-start rule), a checkpoint without a record."""
 
     trees = [tree for _, record in records for tree in record_trees(record)]
     horizon = [tree for tree in trees if _known(tree, SINK_HORIZON_TREES)]
+    window_start = [tree for tree in trees if _known(tree, WINDOW_START_SINK_TREES)]
     if horizon:
-        raise ValueError(
-            f"the run record names training trees {horizon} from Sana 0c88c11ab on: the checkpoint learned the softmax "
-            "sink at chunk max(0, c - 7) on the physical clock, which this adapter does not serve yet (it reads the sink "
-            "at the window's start, the trees up to a5ae8cf8f)"
-        )
+        window = contract.sliding_window_chunks
+        if window is None or window > SINK_HORIZON_CHUNKS:
+            raise ValueError(
+                f"sliding_window_chunks={window} on a checkpoint trained on Sana {horizon[-1]} (the sink at chunk "
+                f"max(0, c - {SINK_HORIZON_CHUNKS})): the policy refuses a window above the sink horizon, and a reader "
+                "past the horizon without a window"
+            )
+        resumed = f"; earlier segments on {window_start[-1]}" if window_start else ""
+        label = f"physical+sink_horizon{SINK_HORIZON_CHUNKS}(0c88c11ab; trained on {horizon[-1]}{resumed})"
+        return replace(contract, physical_rope=True, sink_horizon=SINK_HORIZON_CHUNKS), label
+    clock = "physical" if contract.physical_rope else "latent_slots"
+    if window_start:
+        return contract, f"{clock}+sink_window_start(trained on {window_start[-1]})"
+    if allow_unrecorded and not trees:
+        return contract, f"{clock}+sink_window_start(unrecorded: donor directory)"
+    raise ValueError(
+        f"the run records ({[str(path.name) for path, _ in records] or 'none'}) name no known training tree "
+        f"({trees or 'none'}): the softmax sink rule (at the window's start up to Sana 0c88c11ab^, at chunk "
+        f"max(0, c - {SINK_HORIZON_CHUNKS}) on the physical clock from 0c88c11ab on) cannot be told from the config. "
+        "Add the tree to SINK_HORIZON_TREES if `git merge-base --is-ancestor 0c88c11ab <tree>` holds, else to "
+        "WINDOW_START_SINK_TREES; a checkpoint whose Hub repo ships no record takes a RUN_ID.local.json naming the "
+        "tree its README gives"
+    )
 
 
 def describe_run_records(records: list[tuple[Path, Mapping[str, Any]]], config_path: str | Path) -> str:
@@ -596,8 +646,10 @@ __all__ = [
     "RUN_RECORD_NAMES",
     "SERVED_VISUAL_LAYOUTS",
     "bidirectional_view",
+    "SINK_HORIZON_CHUNKS",
+    "SINK_HORIZON_TREES",
+    "WINDOW_START_SINK_TREES",
     "check_observation_form",
-    "check_rope_clock",
     "check_run_record",
     "chunk_causal_options",
     "describe_run_records",
@@ -606,11 +658,13 @@ __all__ = [
     "resolve_actions_per_chunk",
     "resolve_aligned_phase_window",
     "refuse_chunk_observation",
+    "refuse_recorded_chunk_observation",
     "resolve_causal_contract",
     "resolve_causal_observation",
     "resolve_causal_state",
     "resolve_gdn_output_normalizer",
     "resolve_physical_rope",
+    "resolve_rope_clock",
     "resolve_memory_content",
     "resolve_use_attn_res",
 ]

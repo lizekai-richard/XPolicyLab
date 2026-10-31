@@ -23,12 +23,15 @@ from sana_wam_causal.contract import (
     MEMORY_VIDEO_ONLY,
     CausalContract,
     bidirectional_view,
+    SINK_HORIZON_CHUNKS,
+    SINK_HORIZON_TREES,
+    WINDOW_START_SINK_TREES,
     check_observation_form,
-    check_rope_clock,
     check_run_record,
     describe_run_records,
     load_run_records,
     resolve_causal_contract,
+    resolve_rope_clock,
 )
 from sana_wam_causal.checkpoint import load_causal_state_dict
 from sana_wam_causal.layers import LayerCache
@@ -67,6 +70,11 @@ NOATTNRES_S10000 = os.path.join(
     _paths.FIXTURES, "config_causal_mixv4_capv3_obsblock_sana_latent_physrope_n1_obs_state_noattnres_s10000.yaml"
 )
 RECORD_LOCAL_NOATTNRES_S10000 = os.path.join(_paths.FIXTURES, "run_record_local_obsblock_sana_latent_noattnres_s10000.json")
+# the sana_latent no-AttnRes N1 recipe of Sana 7ed0d28bf, on the 0c88c11ab clock (the physical clock only, the softmax
+# sink at chunk max(0, c - 7)): it no longer declares physical_rope
+RECIPE_HORIZON_NOATTNRES = os.path.join(
+    _paths.FIXTURES, "recipe_causal_mixv4_capv3_obsblock_sana_latent_noattnres_episode_n1_obs_state_7ed0d28bf.yaml"
+)
 RECORD_S1000 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_s1000.json")
 RECORD_NOOBS_S3324 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_noobs_s3324.json")
 SINKLESS_VA = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
@@ -165,7 +173,7 @@ def test_the_gdn_output_normalizer_switch_resolves(value, expected):
         cfg["model"]["memory_gdn_output_normalizer"] = value
     contract = resolve_causal_contract(cfg)
     assert contract.gdn_output_normalizer is expected
-    assert contract.describe().endswith(f"first_chunk=0 gdn_output_normalizer={expected} use_attn_res=True")
+    assert contract.describe().endswith(f"first_chunk=0 gdn_output_normalizer={expected} use_attn_res=True sink_horizon=None")
 
 
 @pytest.mark.parametrize("value", ["false", 0, 1])
@@ -191,7 +199,7 @@ def test_the_released_n1_obs_checkpoint_resolves_with_its_observation_and_state(
     assert (contract.multiview, contract.visual_layout) == ("sana_latent", "three_view_strip")
     text = contract.describe()
     assert " chunk_observation=False causal_observation=True causal_state=True multiview=sana_latent " in text
-    assert text.endswith("first_chunk=0 gdn_output_normalizer=False use_attn_res=True")
+    assert text.endswith("first_chunk=0 gdn_output_normalizer=False use_attn_res=True sink_horizon=None")
 
 
 @pytest.mark.parametrize(
@@ -289,7 +297,7 @@ def test_the_attn_res_switch_resolves_and_the_view_keeps_the_mirror_config(value
     else:
         cfg["model"]["use_attn_res"] = value
     contract = resolve_causal_contract(cfg)
-    assert contract.use_attn_res is expected and contract.describe().endswith(f" use_attn_res={expected}")
+    assert contract.use_attn_res is expected and contract.describe().endswith(f" use_attn_res={expected} sink_horizon=None")
     view = bidirectional_view(cfg)
     assert view["model"]["use_attn_res"] is True and cfg["model"].get("use_attn_res", None) is value
     policy_config_from_train_config(view)
@@ -313,7 +321,7 @@ def test_the_sana_latent_checkpoint_without_attn_res_resolves_and_its_local_reco
     assert [path.name for path, _ in records] == ["RUN_ID.local.json"]
     for source, record in records:
         check_run_record(record, contract, source=str(source))
-    check_rope_clock(records)
+    assert resolve_rope_clock(records, contract) == (contract, "physical+sink_window_start(trained on a5ae8cf8f)")
     assert check_observation_form(records, contract) == "branch(fd5261ff6; trained on a5ae8cf8f)"
     assert "step=10000 source_commit=a5ae8cf8f" in describe_run_records(records, tmp_path / "config.yaml")
     view = bidirectional_view(_load(NOATTNRES_S10000))
@@ -341,20 +349,79 @@ def test_the_attn_res_form_of_the_weights_must_match_the_contract():
         load_causal_state_dict(with_attn_res, dict(plain.state_dict()))
 
 
-def test_the_trees_after_the_attn_res_switch_are_branch_trees_and_the_sink_horizon_clock_is_refused(tmp_path):
-    """53234167c .. 9a1b3e33d descend from fd5261ff6 (the observation branch) and keep the window-start sink; from
-    0c88c11ab on the sink sits at chunk max(0, c - 7), which this adapter refuses for every checkpoint."""
+def test_the_trees_after_the_attn_res_switch_keep_the_window_start_sink(tmp_path):
+    """53234167c .. 9a1b3e33d descend from fd5261ff6 (the observation branch) and read the softmax sink at the reader's
+    window start, on the clock physical_rope declares: the contract is served as the config resolves it."""
 
     contract = resolve_causal_contract(_load(OBSBLOCK_PIXEL_S15000))
     for tree in ("53234167c", "a5ae8cf8f", "020582851", "9a1b3e33d"):
         records = [(tmp_path / "RUN_ID.json", {"scheme_history": [{"code": "ff004392a"}, {"code": tree}]})]
         assert check_observation_form(records, contract) == f"branch(fd5261ff6; trained on {tree})"
-        check_rope_clock(records)
-    for tree in ("0c88c11ab", "e6c386907"):
-        records = [(tmp_path / "RUN_ID.json", {"source_commit": f"{tree}0000", "scheme_history": [{"code": "9a1b3e33d"}]})]
-        with pytest.raises(ValueError, match="0c88c11ab on.*max\\(0, c - 7\\)"):
-            check_rope_clock(records)
-    check_rope_clock([])
+        assert resolve_rope_clock(records, contract) == (contract, f"physical+sink_window_start(trained on {tree})")
+    slots = resolve_causal_contract(_load(FIRST_FRAME_NOOBS))
+    records = [(tmp_path / "RUN_ID.json", {"source_commit": "b297028fe"})]
+    assert resolve_rope_clock(records, slots) == (slots, "latent_slots+sink_window_start(trained on b297028fe)")
+    assert not set(SINK_HORIZON_TREES) & set(WINDOW_START_SINK_TREES)
+
+
+@pytest.mark.parametrize("tree", SINK_HORIZON_TREES)
+def test_a_checkpoint_of_the_sink_horizon_trees_runs_the_physical_clock_with_the_sink_at_chunk_c_minus_7(tree, tmp_path):
+    """From Sana 0c88c11ab on the physical clock is the only one and the recipes drop physical_rope (the 7ed0d28bf
+    sana_latent no-AttnRes N1 recipe declares none, so its config alone resolves to the latent-slot clock): a run record
+    naming such a tree serves the physical clock with the softmax sink at chunk max(0, c - 7), the GDN observation
+    branch, and a record that names the clock is checked against the completed contract."""
+
+    config = resolve_causal_contract(_load(RECIPE_HORIZON_NOATTNRES))
+    assert (config.physical_rope, config.sink_horizon, config.use_attn_res) == (False, None, False)
+    records = [(tmp_path / "RUN_ID.json", {"source_commit": f"{tree}0", "deploy": {"physical_rope": True}})]
+    contract, label = resolve_rope_clock(records, config)
+    assert (contract.physical_rope, contract.sink_horizon) == (True, SINK_HORIZON_CHUNKS) == (True, 7)
+    assert contract == CausalContract(**{**config.__dict__, "physical_rope": True, "sink_horizon": 7})
+    assert label == f"physical+sink_horizon7(0c88c11ab; trained on {tree}0)"
+    assert contract.describe().endswith(" use_attn_res=False sink_horizon=7")
+    check_run_record(records[0][1], contract)
+    with pytest.raises(ValueError, match="records deploy.physical_rope=True"):
+        check_run_record(records[0][1], config)
+    assert check_observation_form(records, contract) == f"branch(fd5261ff6; trained on {tree}0)"
+    # a run resumed onto the horizon tree: the newest segment's rule, the earlier one named
+    resumed = [(tmp_path / "RUN_ID.json", {"scheme_history": [{"code": "9a1b3e33d"}, {"code": tree}]})]
+    assert resolve_rope_clock(resumed, config)[1].endswith(f"trained on {tree}; earlier segments on 9a1b3e33d)")
+    view = bidirectional_view(_load(RECIPE_HORIZON_NOATTNRES))
+    model = CausalPolicyModel(policy_config_from_train_config(view), contract)
+    assert (model.physical_rope, model.sink_horizon, model.target_frame_offset()) == (True, 7, 0.5625)
+
+
+@pytest.mark.parametrize("window,ok", [(None, False), (1, True), (7, True), (8, False)])
+def test_a_sink_horizon_checkpoint_needs_a_softmax_window_within_the_horizon(window, ok, tmp_path):
+    """Sana refuses sliding_window_chunks above the sink horizon, and a reader past it without a window."""
+
+    cfg = copy.deepcopy(_load(RECIPE_HORIZON_NOATTNRES))
+    _policy(cfg)["sliding_window_chunks"] = window
+    records = [(tmp_path / "RUN_ID.json", {"source_commit": "7ed0d28bf"})]
+    if ok:
+        assert resolve_rope_clock(records, resolve_causal_contract(cfg))[0].sliding_window_chunks == window
+    else:
+        with pytest.raises(ValueError, match=f"sliding_window_chunks={window} on a checkpoint trained on Sana 7ed0d28bf"):
+            resolve_rope_clock(records, resolve_causal_contract(cfg))
+    view = bidirectional_view(cfg)
+    contract = CausalContract(**{**resolve_causal_contract(cfg).__dict__, "physical_rope": True, "sink_horizon": 7})
+    if not ok:
+        with pytest.raises(ValueError, match="softmax window of at most 7 chunks"):
+            CausalPolicyModel(policy_config_from_train_config(view), contract)
+
+
+def test_a_checkpoint_whose_records_name_no_known_tree_is_refused(tmp_path):
+    """No config key tells the sink rules apart: records naming only unknown trees are refused, and so is a checkpoint
+    without a record unless it is a donor directory (served on the window-start rule); a donor directory whose record
+    names an unknown tree is refused too."""
+
+    contract = resolve_causal_contract(_load(RECIPE_HORIZON_NOATTNRES))
+    unknown = [(tmp_path / "RUN_ID.json", {"source_commit": "0123abcde", "scheme_history": [{"code": "fedcba987"}]})]
+    for records, donor in ((unknown, False), (unknown, True), ([], False)):
+        with pytest.raises(ValueError, match="name no known training tree.*SINK_HORIZON_TREES.*RUN_ID.local.json"):
+            resolve_rope_clock(records, contract, allow_unrecorded=donor)
+    assert resolve_rope_clock([], contract, allow_unrecorded=True) == (
+        contract, "latent_slots+sink_window_start(unrecorded: donor directory)")
 
 
 @pytest.mark.parametrize(
@@ -515,8 +582,9 @@ class _Cfg(SimpleNamespace):
 
 
 class _Model:
-    def __init__(self, kinds):
+    def __init__(self, kinds, sink_horizon=None):
         self.blocks = [type("B", (), {"attn_type": kind})() for kind in kinds]
+        self.sink_horizon = sink_horizon
 
 
 def _entry_caches(memory: CausalMemory, value: float) -> list[LayerCache]:
@@ -616,6 +684,36 @@ def test_every_read_is_numbered_from_zero_at_its_oldest_chunk(window, chunks, id
 
     memory.layer_caches(commit=False, rope_of=rope_of, sink_rope=_identity_rope())
     assert asked == list(range(len(ids)))
+
+
+@pytest.mark.parametrize(
+    "window,chunks,ids,origin",
+    [
+        (1, 0, [], 0),             # chunks 0..7 read the sink in place
+        (1, 1, [0], 0),
+        (1, 7, [6], 0),            # chunk 7's read: chunk 6 in slot 6, chunk 7 itself in slot 7
+        (1, 8, [7], 1),            # past the horizon the sink is read at chunk c - 7: chunk 8 reads it at chunk 1
+        (1, 30, [29], 23),
+        (2, 12, [10, 11], 5),
+        (7, 7, [0, 1, 2, 3, 4, 5, 6], 0),
+        (7, 12, [5, 6, 7, 8, 9, 10, 11], 5),   # W = H: the horizon is the window's start
+    ],
+)
+def test_a_sink_horizon_read_is_numbered_from_the_chunk_its_sink_is_read_at(window, chunks, ids, origin):
+    """Sana 0c88c11ab: a reader in chunk c reads the sink at the instant chunk max(0, c - 7) starts; the read is
+    numbered from that chunk, its window in slots c - W - O .. c - 1 - O and the reader in slot c - O <= 7."""
+
+    memory = CausalMemory(_Model(["GatedSoftmaxAttention"], sink_horizon=7), window)
+    _fill(memory, chunks)
+    assert memory.read_plan() == (ids, origin) and origin == max(0, chunks - 7)
+    asked = []
+
+    def rope_of(slot):
+        asked.append(slot)
+        return _identity_rope(slot)
+
+    memory.layer_caches(commit=False, rope_of=rope_of, sink_rope=_identity_rope())
+    assert asked == [chunk - origin for chunk in ids] and chunks - origin <= 7
 
 
 def test_reads_rotate_the_pre_rope_keys_at_their_slots():

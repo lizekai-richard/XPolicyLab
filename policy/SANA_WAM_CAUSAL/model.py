@@ -335,6 +335,7 @@ class Model(ModelTemplate):
             f"prediction_latent_dir={self.prediction_latent_dir} "
             f"gdn_recurrence={report.get('gdn_recurrence')} normalization_sha256={self.normalization.sha256} "
             f"run_record={report.get('run_record')} gdn_observation={report.get('gdn_observation')} "
+            f"rope_clock={report.get('rope_clock')} "
             f"device={self.device} action_type={self.action_type}",
             flush=True,
         )
@@ -583,7 +584,7 @@ class Model(ModelTemplate):
         if chunk != expected:
             raise RuntimeError(f"{TAG} the session is at chunk {chunk} for decision {decision} (expected {expected})")
         read_ids = self._session.read_chunk_ids()
-        origin = self._session.softmax_origin()   # the read is numbered from 0 here, the sink one frame before it
+        origin = self._session.softmax_origin()   # the read is numbered from 0 here, where the sink is read
         seed = derive_diffusion_seed(self.diffusion_seed_base, self.eval_seed, self._episode_index, decision)
         generator = torch.Generator(device=device).manual_seed(seed)
         (action_norm, predicted_latent), timings["generate_s"] = timed(

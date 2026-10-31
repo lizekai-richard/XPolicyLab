@@ -1,8 +1,10 @@
 """Live parity of the causal mirror against Sana's chunk-causal policy on the episode protocol in its single form
 (``SANA_CAUSAL_REPO``: Sana rwm/zekai-merge at or after 4bd6eca83, checked at 7de7711c2, b297028fe, c4d1d246d,
-ff004392a and 9a1b3e33d; no chunk observations, the sink on every canvas). The plain-residual tests (``model.use_attn_res:
-false``) need a tree at or after 53234167c and skip on an older one; trees from 0c88c11ab on (the sink at chunk
-max(0, c - 7)) are not served. The numerator-only GDN readout (``model.memory_gdn_output_normalizer:
+ff004392a, 9a1b3e33d and 7ed0d28bf; no chunk observations, the sink on every canvas). The plain-residual tests
+(``model.use_attn_res: false``) need a tree at or after 53234167c and skip on an older one. A tree from 0c88c11ab on
+reads the softmax sink at chunk max(0, c - 7) on the physical clock only: the sink-horizon tests run on it and every
+test of the window-start sink skips, and the other way round on an older tree, so the file runs once per rule (e.g.
+9a1b3e33d, then 7ed0d28bf). The numerator-only GDN readout (``model.memory_gdn_output_normalizer:
 false``) needs a tree at or after c414e9b32; those tests skip on an older one. The observation tests need a tree at or
 after fd5261ff6 (the GDN branch of the observation group, sana-rwm's two-stream obs-block) and skip on an older one.
 
@@ -140,6 +142,22 @@ def _require_live_physical_rope():
         pytest.skip(f"{SANA_CAUSAL_REPO} predates physical_rope (6e91eaf2a)")
 
 
+def _live_sink_horizon() -> bool:
+    """Whether the live tree reads the softmax sink at chunk max(0, c - 7) (Sana 0c88c11ab: ``sink_read_chunks``)."""
+
+    _, crwm = _live_modules()
+    return hasattr(crwm, "sink_read_chunks")
+
+
+def _require_live_sink_rule(horizon: bool):
+    """Skip unless the live tree reads the softmax sink by the rule asked: at chunk max(0, c - 7) on the physical clock
+    (Sana 0c88c11ab on) or at the reader's window start (before it)."""
+
+    if _live_sink_horizon() != bool(horizon):
+        rule = "the sink horizon (0c88c11ab on)" if horizon else "the window-start sink (before 0c88c11ab)"
+        pytest.skip(f"{SANA_CAUSAL_REPO} does not train {rule}; run this file on such a tree too")
+
+
 class Twins:
     """A tiny live causal policy and the mirror with the same weights (fp64), plus one random episode: the sink (the
     first frame, chunk 0's observation), clean targets and noisy targets."""
@@ -147,8 +165,13 @@ class Twins:
     def __init__(self, *, views=1, stride=4, chunk=32, window=None, separate=True, chunks=4, depth=4, seed=11,
                  fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, first_frame=False, normalizer=True,
                  live_normalizer=None, observation=False, state=False, physical=False, live_physical=None,
-                 attn_res=True):
+                 attn_res=True, horizon=False, live_horizon=None):
         causal, self.crwm = _live_modules()
+        # the softmax sink rule (Sana 0c88c11ab: at chunk max(0, c - 7), the physical clock only) of the mirror and of
+        # the live tree (live_horizon differs only in the negative control)
+        self.horizon = bool(horizon)
+        live_horizon = self.horizon if live_horizon is None else bool(live_horizon)
+        _require_live_sink_rule(live_horizon)
         # the mirror's GDN readout (contract.gdn_output_normalizer) and the live one (model.memory_gdn_output_normalizer;
         # live_normalizer differs only in the negative control)
         live_normalizer = normalizer if live_normalizer is None else live_normalizer
@@ -174,12 +197,13 @@ class Twins:
             options.update(causal_observation=True, causal_state=bool(state))
         # physical_rope (Sana 6e91eaf2a) on the mirror and on the live policy (live_physical differs only in the negative
         # control)
-        self.physical = bool(physical)
+        self.physical = bool(physical) or self.horizon
         live_physical = self.physical if live_physical is None else bool(live_physical)
-        if self.physical or live_physical:
-            _require_live_physical_rope()
-        if live_physical:
-            options["physical_rope"] = True
+        if not live_horizon:   # a horizon tree runs the physical clock without the key
+            if self.physical or live_physical:
+                _require_live_physical_rope()
+            if live_physical:
+                options["physical_rope"] = True
         if window is not None:
             options["sliding_window_chunks"] = window
         # model.use_attn_res false (Sana 53234167c): both block stacks a plain residual
@@ -215,7 +239,7 @@ class Twins:
             dt_bias_init=-5.0, a_log_init=0.0, reset_legacy_beta=False,
             aligned_phase_window="first_frame" if first_frame else "padded",
             gdn_output_normalizer=normalizer, causal_observation=self.observation, causal_state=self.state,
-            physical_rope=self.physical, use_attn_res=self.attn_res,
+            physical_rope=self.physical, use_attn_res=self.attn_res, sink_horizon=7 if self.horizon else None,
         )
         policy_config = PolicyConfig.from_sana_kwargs(config=config, **kwargs)
         assert tuple(policy_config.multiview_spatial_rope_tile_shape) == (8, 16)
@@ -1414,3 +1438,109 @@ def test_a_plain_residual_mirror_is_not_the_attn_res_stack():
     streaming = twins.streaming_first_frame(4)
     gap = max(_max_abs(streaming[k][i], training[k][i]) for k in range(4) for i in (0, 1))
     assert gap > 1e-6, gap
+
+
+HORIZON_CASES = [
+    # views, stride, chunk, window, length, memory, first_frame, observation, state, normalizer, attn_res
+    (3, 4, 32, 1, 10, MEMORY_VIDEO_ONLY, True, True, True, False, False),       # the 7ed0d28bf sana_latent no-AttnRes N1
+    (1, 4, 32, 1, 10, MEMORY_VIDEO_ONLY, True, True, True, False, True),        # the sana_pixel obs-block N1 recipe
+    (3, 4, 32, 2, 11, MEMORY_VIDEO_ONLY, True, False, False, False, True),      # no observation latents
+    (1, 4, 32, 3, 11, MEMORY_VIDEO_AND_ACTION, False, True, True, True, True),  # padded window, video_and_action
+    (3, 4, 32, 7, 10, MEMORY_VIDEO_ONLY, True, True, False, True, True),        # W = H: the horizon is the window's start
+    (1, 1, 16, 2, 10, MEMORY_VIDEO_ONLY, True, True, True, False, False),       # f_c = 2
+]
+HORIZON_IDS = ["V3-W1-obs+state-num-plain", "V1-W1-obs+state-num", "V3-W2-noobs-num", "V1-W3-va-obs+state-pad",
+               "V3-W7-obs", "V1-s1c16-W2-obs+state-num-plain"]
+
+
+@pytest.mark.parametrize("views,stride,chunk,window,length,memory,first_frame,observation,state,normalizer,attn_res",
+                         HORIZON_CASES, ids=HORIZON_IDS)
+def test_a_sink_horizon_deploy_chain_equals_two_stream_training_forward(views, stride, chunk, window, length, memory,
+                                                                       first_frame, observation, state, normalizer,
+                                                                       attn_res):
+    """Sana 0c88c11ab: every noisy chunk of the training canvas on the physical clock with the softmax sink read at
+    chunk max(0, c - 7) (``_sink_shift_phases`` over ``sink_read_chunks``) == the deploy chain's chunk, its reads
+    numbered from that chunk; past the horizon (chunks 8 ..) included, windows 1 / 2 / 3 / 7, with and without
+    observation latents and their state rows, both memory contents and phase windows, f_c 1 and 2, AttnRes or not."""
+
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=length, memory=memory,
+                  first_frame=first_frame, normalizer=normalizer, observation=observation, state=state,
+                  attn_res=attn_res, horizon=True)
+    assert twins.live.sink_horizon == twins.mirror.sink_horizon == 7 and twins.mirror.physical_rope
+    training = twins.two_stream(length) if first_frame else twins.two_stream(length)[1:]
+    streaming = twins.streaming_first_frame(length) if first_frame else twins.streaming(length)
+    close = OBSERVED_CLOSE if observation else CLOSE
+    assert len(training) == len(streaming) and length - 1 > 7
+    for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming)):
+        torch.testing.assert_close(x_ours, x_live, **close, msg=lambda m: f"chunk {k} video: {m}")
+        torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+
+
+@pytest.mark.parametrize("window", [1, 7])
+def test_the_window_start_sink_is_caught_on_a_sink_horizon_policy(window):
+    """Negative control: the mirror reading the sink at its window's start (the trees before 0c88c11ab, on the physical
+    clock) against a sink-horizon policy. With W = 1 the two rules agree on chunks 0 and 1 only and the parity misses
+    every later chunk; with W = 7 the horizon is the window's start and they agree everywhere."""
+
+    length = 10
+    twins = Twins(views=3, window=window, chunks=length, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=True,
+                  state=True, physical=True, horizon=False, live_horizon=True)
+    assert twins.mirror.sink_horizon is None and twins.live.sink_horizon == 7
+    training = twins.two_stream(length)
+    streaming = twins.streaming_first_frame(length)
+    passes = [all(torch.allclose(streaming[k][i], training[k][i], **OBSERVED_CLOSE) for i in (0, 1)) for k in range(length)]
+    gaps = [max(_max_abs(streaming[k][i], training[k][i]) for i in (0, 1)) for k in range(length)]
+    assert passes == ([True] * length if window == 7 else [True, True] + [False] * (length - 2)), gaps
+
+
+HORIZON_SESSION_CASES = [
+    # views, memory, video_cfg, action_cfg, position mode, observation, state, normalizer, attn_res
+    (3, MEMORY_VIDEO_ONLY, 6.0, 1.0, "rank", True, True, False, False),
+    (1, MEMORY_VIDEO_ONLY, 6.0, 1.0, "absolute", True, True, False, True),
+    (3, MEMORY_VIDEO_AND_ACTION, 2.5, 1.7, "rank", False, False, True, True),
+]
+
+
+@pytest.mark.parametrize("views,memory,video_cfg,action_cfg,position_mode,observation,state,normalizer,attn_res",
+                         HORIZON_SESSION_CASES)
+def test_a_sink_horizon_session_matches_the_live_deploy_session_at_a_seven_chunk_window(
+        views, memory, video_cfg, action_cfg, position_mode, observation, state, normalizer, attn_res):
+    """Sana's cached forms run a sink-horizon policy only at W = 7, where its store's window-start sink is the horizon:
+    a first-frame episode of the mirror's session == Sana's CausalPolicyChunkSession past chunk 7, per-stream CFG."""
+
+    steps, chunks = 2, 10
+    twins = Twins(views=views, window=7, chunks=chunks, memory=memory, first_frame=True, observation=observation,
+                  state=state, normalizer=normalizer, attn_res=attn_res, horizon=True)
+    live = _live_session(twins, steps, video_cfg, action_cfg, position_mode)
+    ours = twins.session(steps=steps, video_cfg=video_cfg, action_cfg=action_cfg)
+    close = OBSERVED_CLOSE if observation else CLOSE
+    mask = torch.ones(1, twins.chunk, 80, dtype=torch.bool)
+    mask[..., 60:] = False
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    live.commit_sink(twins.sink)
+    ours.commit_sink(twins.ours(twins.sink))
+    g = torch.Generator().manual_seed(31)
+    origins = []
+    for k in range(chunks):
+        origins.append(ours.softmax_origin())
+        video_noise = torch.randn(1, C_LAT, twins.f_chunk, 1, twins.width, generator=g, dtype=torch.float64)
+        action_noise = torch.randn(1, twins.chunk, 80, generator=g, dtype=torch.float64)
+        extra_live, extra_ours = {}, {}
+        if observation:
+            seen = twins.sink if k == 0 else twins.observations[k]   # chunk 0's observation is the sink's latent
+            extra_live, extra_ours = {"observation": seen}, {"observation": twins.ours(seen)}
+        a_live, v_live = live.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask, video_noise=video_noise,
+            action_noise=action_noise, **extra_live,
+        )
+        a_ours, v_ours = ours.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask,
+            video_noise=twins.ours(video_noise), action_noise=action_noise, **extra_ours,
+        )
+        torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+        torch.testing.assert_close(v_ours, twins.ours(v_live), **close, msg=lambda m: f"chunk {k} video: {m}")
+        live.commit_chunk(twins.clean[k], twins.a_clean[k], anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask)
+        ours.commit_chunk(twins.ours(twins.clean[k]), twins.a_clean[k], anchor_state=twins.states[k],
+                          anchor_state_mask=state_mask, action_mask=mask)
+    assert ours.chunk_idx == live.chunk_idx == chunks
+    assert origins == [max(0, k - 7) for k in range(chunks)]

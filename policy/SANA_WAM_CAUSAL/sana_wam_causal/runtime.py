@@ -48,11 +48,12 @@ from .contract import (  # noqa: E402
     CausalContract,
     bidirectional_view,
     check_observation_form,
-    check_rope_clock,
     check_run_record,
     describe_run_records,
     load_run_records,
+    refuse_recorded_chunk_observation,
     resolve_causal_contract,
+    resolve_rope_clock,
 )
 from .model import CausalPolicyModel, build_causal_policy  # noqa: E402
 from .session import Caption, CausalPolicySession  # noqa: E402
@@ -88,8 +89,8 @@ class CausalRuntime:
         view_resize: Optional[str] = None,
         allow_donor_checkpoint: bool = False,
     ) -> "CausalRuntime":
-        """Load in the validated order: yaml -> contract and the run record next to the yaml (refusals before any
-        weight) -> normalization -> bf16 causal model + weights -> VAE -> Gemma -> the shared front-end."""
+        """Load in the validated order: yaml -> contract, completed by the run record next to the yaml (the sink rule of
+        its training tree; refusals before any weight) -> normalization -> bf16 causal model + weights -> VAE -> Gemma -> the shared front-end."""
 
         device = torch.device(device)
         config_path = find_train_config(checkpoint_dir)
@@ -97,8 +98,11 @@ class CausalRuntime:
         contract = resolve_causal_contract(train_cfg)
         records = load_run_records(config_path.parent)
         for source, record in records:
+            refuse_recorded_chunk_observation(record, source=str(source))
+        # the training tree decides the sink rule (and from Sana 0c88c11ab on the clock) before the record is checked
+        contract, rope_clock = resolve_rope_clock(records, contract, allow_unrecorded=allow_donor_checkpoint)
+        for source, record in records:
             check_run_record(record, contract, source=str(source))
-        check_rope_clock(records)
         observation_form = check_observation_form(records, contract, allow_unrecorded=allow_donor_checkpoint)
         view = bidirectional_view(train_cfg)
         rope, legacy_origin, rope_label = resolve_rope_contract(view, None)
@@ -115,6 +119,7 @@ class CausalRuntime:
         )
         load_report["run_record"] = describe_run_records(records, config_path)
         load_report["gdn_observation"] = observation_form
+        load_report["rope_clock"] = rope_clock
         vae = load_vae(vae_path, device=device, dtype=torch.bfloat16)
         tokenizer, text_encoder = load_text_encoder(text_encoder_path, device=device)
         frontend = PolicyInferenceSession(

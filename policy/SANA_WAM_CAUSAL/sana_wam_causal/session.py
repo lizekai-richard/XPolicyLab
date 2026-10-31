@@ -40,7 +40,10 @@ Under ``physical_rope`` (Sana 6e91eaf2a) every token sits at its physical instan
 or committed) at the middle of the frames they cover, c * f_c + i + 0.5625, its observation latent at its start instant
 c * f_c, its rows at their own steps c * C .. without the observation shift, the sink at 0; the softmax reads, numbered
 from their origin as below, then place the sink at the window's start instant (Sana's sink rotation to lo * f_c) and a
-one-chunk window at 0 / 0.5625 / 1 / 1.5625.
+one-chunk window at 0 / 0.5625 / 1 / 1.5625. From Sana 0c88c11ab on (``sink_horizon`` H = 7, the physical clock only) a
+reader in chunk c reads the sink at the instant chunk max(0, c - H) starts (Sana ``sink_read_chunks``): the read is
+numbered from that chunk instead, so chunks 0..H read the sink in place and a later one sees it H chunks before its own
+start, its window (W <= H chunks) in between.
 
 Softmax read, W = ``sliding_window_chunks``: the forwards on chunk c (its denoising steps and its commit) read the sink
 and the newest ``min(c, W)`` committed chunks, ``c - W .. c - 1``. This is the two-stream training forward's rule (Sana
@@ -55,7 +58,10 @@ window of chunk c at slot c - O (its targets from frame ``(c - O) * f_c + 1``) a
 before the earliest frame the read takes: the training canvas's StreamingLLM sink, which an evicting reader takes next
 to its window (``_sink_shift_phases``), and Sana's deploy KV store, which puts it at the first read frame - 1
 (``kv_position_mode="absolute"``) or at 0 (``"rank"``); the relative RoPE of the aligned clock sees one common shift
-between the three. The GDN layers are never windowed: their state keeps keys rotated at the physical
+between the three. Under a sink horizon H (Sana 0c88c11ab) the origin is O = max(0, c - H) instead, the chunk at
+whose start the training canvas rotates the sink for a reader in chunk c (``_sink_shift_phases`` over
+``sink_read_chunks``): the sink at frame 0 is then that instant, the chunks read sit at slots c - W - O .. c - 1 - O
+and the reader at slot c - O <= H. The GDN layers are never windowed: their state keeps keys rotated at the physical
 positions of the whole episode (the sink at frame 0), and their windows run on that clock.
 
 Conditional and unconditional text streams hold separate memories (the caption reaches every layer through
@@ -106,6 +112,7 @@ class CausalMemory:
         }
         self.has_sink = False
         self.committed = 0
+        self.sink_horizon = model.sink_horizon   # None: the sink at the read's window start; H: at chunk max(0, c - H)
 
     def read_chunk_ids(self) -> list[int]:
         """Committed chunks the next forward reads besides the sink and its own window, oldest first."""
@@ -114,10 +121,14 @@ class CausalMemory:
         return ids if self.window is None else ids[-self.window :]
 
     def read_plan(self) -> tuple[list[int], int]:
-        """(chunks read, origin O): O = the oldest chunk read (the forward's own chunk when none is). The read is
-        numbered from 0 at O: chunk k at slot k - O, the forward's own chunk c at slot c - O, the sink at frame 0."""
+        """(chunks read, origin O): O = the oldest chunk read (the forward's own chunk when none is), or under a sink
+        horizon H the chunk max(0, c - H) whose start the sink is read at, c = the forward's own chunk (the committed
+        count; W <= H keeps every chunk read at or after it). The read is numbered from 0 at O: chunk k at slot k - O,
+        the forward's own chunk c at slot c - O, the sink at frame 0."""
 
         ids = self.read_chunk_ids()
+        if self.sink_horizon is not None:
+            return ids, max(0, self.committed - self.sink_horizon)
         return ids, (ids[0] if ids else self.committed)
 
     def layer_caches(
@@ -308,7 +319,8 @@ class CausalPolicySession:
         return self.memories[0].read_chunk_ids()
 
     def softmax_origin(self) -> int:
-        """The next read's origin O (the oldest chunk read): the softmax layers number that read from 0 there."""
+        """The next read's origin O (the oldest chunk read, or under a sink horizon the chunk the sink is read at): the
+        softmax layers number that read from 0 there."""
 
         return self.memories[0].read_plan()[1]
 

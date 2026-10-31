@@ -29,7 +29,9 @@ tiles for three, Sana ``_video_position_ids``) with the time column on the physi
 ``base_fps * phi / (fps / s)`` (s = the video frame stride), robot step n at ``base_fps * n / (8 * fps)`` with spatial
 ids 0. The sink sits at frame 0, chunk c's targets at ``c * f_chunk + 1`` onwards (its observation instant
 ``c * f_chunk`` is the frame of chunk c - 1's last target, or of the sink), its state row at step ``c * C`` and its actions at steps
-``c * C + 1 .. c * C + C`` (Sana ``_causal_multiview_rope``, ``forward_sink``, ``forward_chunk``). Text: one prompt row
+``c * C + 1 .. c * C + C`` (Sana ``_causal_multiview_rope``, ``forward_sink``, ``forward_chunk``); under
+``physical_rope`` (the only clock from Sana 0c88c11ab on) every token at its physical instant (``target_frame_offset``),
+and the softmax reads on the session's read clock (``session.py``, "Positions"). Text: one prompt row
 (G = 1) for the canvas, G = V + 1 rows for the strip (one per view, then the robot tail; a robotless window reads the V
 view rows only, Sana ``_grouped_query_sublens``).
 """
@@ -132,6 +134,15 @@ class CausalPolicyModel(PolicyModel):
         self.causal_observation = bool(contract.causal_observation)
         self.causal_state = bool(contract.causal_state)
         self.physical_rope = bool(contract.physical_rope)
+        # Sana 0c88c11ab: a softmax reader in chunk c reads the sink at chunk max(0, c - H)'s start (None: its window's)
+        self.sink_horizon = None if contract.sink_horizon is None else int(contract.sink_horizon)
+        if self.sink_horizon is not None:
+            window = contract.sliding_window_chunks
+            if not self.physical_rope or window is None or window > self.sink_horizon:
+                raise ValueError(
+                    f"the sink horizon {self.sink_horizon} runs on the physical clock with a softmax window of at most "
+                    f"{self.sink_horizon} chunks; got physical_rope={self.physical_rope}, sliding_window_chunks={window}"
+                )
 
         self.x_embedder = PatchEmbedMS3D(config.patch_size, config.in_channels, config.hidden_size)
         self.t_embedder = TimestepEmbedder(config.hidden_size)

@@ -2,7 +2,9 @@
 episode canvas in its single form (no chunk observations; the live tree must be at or after Sana 4bd6eca83). A
 ``causal_observation`` checkpoint (Sana 764ee2113, causal_state afc9874b6; a live tree at or after them) runs with every
 chunk's own observation latent -- its start frame encoded alone -- on both sides: [o_c | targets] on the canvas, the
-session's observation prefill before the chunk's window on the chain.
+session's observation prefill before the chunk's window on the chain. A checkpoint whose run record names a tree from
+Sana 0c88c11ab on (the softmax sink at chunk max(0, c - 7), the physical clock only) needs a live tree at or after it;
+``--chunks`` above 8 takes the chain past the horizon, which the summary reports apart.
 
 The same checkpoint and the same inputs go through two implementations of one prediction:
 
@@ -55,7 +57,7 @@ sys.path.insert(0, str(POLICY_DIR))
 
 from sana_wam_causal import shared  # noqa: E402,F401
 from sana_wam_causal.checkpoint import load_causal_weights  # noqa: E402
-from sana_wam_causal.contract import bidirectional_view, resolve_causal_contract  # noqa: E402
+from sana_wam_causal.contract import bidirectional_view  # noqa: E402
 from sana_wam_causal.model import build_causal_policy  # noqa: E402
 from sana_wam_causal.runtime import CausalRuntime  # noqa: E402
 from sana_wam_causal.session import Caption, CausalPolicySession  # noqa: E402
@@ -374,16 +376,17 @@ def main() -> int:
     t0 = time.perf_counter()
 
     cfg = load_train_config(str(find_train_config(args.checkpoint_dir)))
-    contract = resolve_causal_contract(cfg)
-    L, f_c, chunk, stride = args.chunks, contract.latent_frames_per_chunk, contract.actions_per_chunk, contract.video_frame_stride
-    window = contract.sliding_window_chunks
-    first = contract.first_chunk   # 1: a padded window's chunk 0 is frozen (memory only); 0: a first-frame window
-    print(f"[tf-parity] contract {contract.describe()} | L={L} window={window}", flush=True)
 
     # 1. inputs through the adapter's own front-end (canvas, VAE, Gemma prompt)
     runtime = CausalRuntime.from_paths(args.checkpoint_dir, text_encoder_path=args.text_encoder_path, vae_path=args.vae_path,
                                        device=device, steps=10, cfg_scale=6.0, action_cfg_scale=1.0,
                                        allow_donor_checkpoint=args.allow_donor_checkpoint)
+    contract = runtime.contract   # the config's, completed by the run record (the sink rule of its training tree)
+    L, f_c, chunk, stride = args.chunks, contract.latent_frames_per_chunk, contract.actions_per_chunk, contract.video_frame_stride
+    window = contract.sliding_window_chunks
+    first = contract.first_chunk   # 1: a padded window's chunk 0 is frozen (memory only); 0: a first-frame window
+    print(f"[tf-parity] contract {contract.describe()} rope_clock={runtime.load_report.get('rope_clock')} | L={L} "
+          f"window={window}", flush=True)
     # emitted chunk k (from `first` on) starts at episode tick (k - first) * C; its targets are the frames after it up to
     # the next decision
     ticks = list(range(0, (L - first) * chunk + 1, stride))
@@ -496,6 +499,14 @@ def main() -> int:
         post = [x for c, x in enumerate(report[k], start=first) if window is not None and c > window]
         fmt = lambda xs, f: f"{max(x[f] for x in xs):.2e}" if xs else "-"
         print(f"  {k:22s} video {fmt(pre, 'video_rel')} / {fmt(post, 'video_rel')}   action {fmt(pre, 'action_rel')} / {fmt(post, 'action_rel')}")
+    horizon = contract.sink_horizon
+    if horizon is not None:
+        print(f"[tf-parity] summary: max relative error over chunks within / past the sink horizon (chunk > {horizon}: the "
+              "sink read at chunk c - horizon)")
+        for k in keys:
+            pre = [x for c, x in enumerate(report[k], start=first) if c <= horizon]
+            post = [x for c, x in enumerate(report[k], start=first) if c > horizon]
+            print(f"  {k:22s} video {fmt(pre, 'video_rel')} / {fmt(post, 'video_rel')}   action {fmt(pre, 'action_rel')} / {fmt(post, 'action_rel')}")
     if args.out:
         os.makedirs(args.out, exist_ok=True)
         json.dump({"args": vars(args), "reads": reads, "report": report, "sink_gap": sink_gap},

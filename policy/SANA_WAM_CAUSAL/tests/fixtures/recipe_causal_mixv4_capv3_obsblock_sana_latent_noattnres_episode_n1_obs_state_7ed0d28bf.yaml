@@ -1,0 +1,251 @@
+# Sana rwm/zekai-merge 7ed0d28bf dev/rwm/configs/causal/robot_pretrain/causal_robodojo_vanilla_mixv4_capv3_obsblock50000_eefabs_f33fps8_sana_latent_noattnres_episode_n1_obs_state_videoonly_nsc.yaml
+# (the sana_latent no-AttnRes N1 recipe on the 0c88c11ab clock: no physical_rope key, the sink at chunk max(0, c - 7)), copied verbatim below this header.
+# RoboDojo episode N1 SFT, sana_latent, chunk-causal with causal observation latents and the causal state, WITHOUT
+# AttnRes (user 2026-10-31: "现在准备sana latent N1关掉attnres的训练recipe"; obs + state as the sana_pixel N1, on NSC).
+# The sana_pixel obs-block N1 recipe (causal_robodojo_vanilla_mixv4_capv3_obsblock50000_..._sana_pixel_..._nsc.yaml, run
+# _v2, stopped at 22,500) with:
+# - sana_latent: multiview sana_latent, ASPECT_RATIO_VIDEO_320_ROBOT, the three views stretched to 256 x 320 each
+#   (AGENTS.md 2026-10-02), the NSC phase store v2-f33-vs4-phase-stretch-ae44f4a5961380ab (240 tokens a latent frame);
+#   no sana_pixel_pad;
+# - model.use_attn_res: false (rwm/zekai-merge 53234167c): the causal block stack as a plain residual, each block adding
+#   its attention delta (self-attention, then cross-attention on h after it) and its MLP delta to h. The donor's three
+#   AttnRes queries are dropped on load (model.remove_state_dict_keys). The obs-block donor was trained with AttnRes, so
+#   it starts broken without it (the no-obs smoke: step-1 loss 2.61 instead of 0.37; posttrain handoff 04);
+#   attn_res_fast_attend / attn_res_compiled_sum have nothing to act on and are off;
+# - the critical-phase loss weight kept (user 2026-10-31: "算了，加上critical phase的loss weight吧", over the earlier
+#   "这次我们关掉critical phase的loss weight吧"): gripper_transition_weighting true, each chunk's loss weighted by VPP2's
+#   critical-phase density, as the pixel N1;
+# - everything else as the pixel recipe: the obs-block donor epoch_5_step_50000 (user: "用zekaili/SANA_Vanilla_Pretrain_
+#   256px_abs_mix_v4_capv3_twostream_obsblock_from_ts3500_s15000_ws256这个donor"; its HF repo at 396a8cff, raw weights
+#   pinned in the warm-start vault, sha256 80491e2f...), the other ten training speed switches on, numerator-only GDN, the obs-block GDN of the
+#   observation group (fd5261ff6), the pretrain's RoPE clock and softmax sink horizon (0c88c11ab), action flow shift 3 /
+#   OpenWAM min_weight 0, AdamW betas (0.9, 0.95), warmup 1,000 then cosine to 1e-6 at 50,000 steps, batch tiers
+#   b = floor(160 / L) on 32 ranks (8 nodes).
+# Data: the CW RoboDojo release with organize_table's official instruction of 2026-10-18, the CW JSON cache,
+# normalization 1fe3b7e7.
+task: ltx
+report_to: wandb
+tracker_project_name: sana-rwm
+name: causal_robodojo_sana_latent_mixv4_capv3_obsblock50000_noattnres_f33fps8_episode_n1_obs_state_nsc
+work_dir: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/output/causal_robodojo_vanilla_mixv4_capv3_obsblock50000_eefabs_f33fps8_sana_latent_noattnres_episode_n1_obs_state_nsc_videoonly
+
+data:
+  data_dir:
+    RoboDojo-ARX-X5: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/RoboDojo/converted/RoboDojo/arx-x5_zip_nrt_instr20261018
+  dataset_repeats:
+    RoboDojo-ARX-X5: 1
+  image_size: 320
+  json_cache_dir: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/data_cache_rwm_zekail_absolute_aligned
+  caption_proportion:
+    detailed_caption: 1
+  embodiment_type_only: false
+  external_data_filter:
+    RoboDojo-ARX-X5:
+      _model_fps: {min: 25, max: 25}
+  load_text_feat: false
+  transform: default_train_video
+  type: CausalRoboDojoSFTDataset
+  extra:
+    multiview: sana_latent
+    actions_per_chunk: {"25": 32}
+    aligned_phase_window: first_frame
+    require_video_target: true
+    gripper_transition_weighting: true
+    action_representation: current_anchor_qwen
+    action_mode_sample_ratio: [0.0, 1.0, 0.0]
+    joint_target_mode: absolute
+    eef_target_mode: absolute
+    camera_conditioning: true
+    recaption_instruction: false
+    robot_sft:
+      tasks: null
+      splits: [default]
+      holdout_episodes_per_task_split: 0
+      holdout_mode: train
+      tier_num_frames: 33
+      instruction_source: dataset_seen
+      normalization_num_frames: 33
+      normalization_sha256: 1fe3b7e72e8fa93eca5efb8a8deeace1daf4434b4b97e9f4445670ac758287ed
+      vae_latent_cache_dir: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_data_cache/sft_vae_latents_nsc_torch210
+      allow_online_encode: false
+      tail_windows:
+        enabled: true
+        min_rows: 2
+        padding: freeze
+      video_fps: 8
+    use_mobile_base: false
+  num_frames: 1569
+  aspect_ratio_type: ASPECT_RATIO_VIDEO_320_ROBOT
+  sort_dataset: false
+  shuffle_dataset: false
+  resample_fps: false
+  multi_fps:
+    "25": [33, 65, 97, 129, 161, 193, 225, 257, 289, 321, 353, 385, 417, 449, 481, 513, 545, 577, 609, 641, 673, 705, 737, 769, 801, 833, 865, 897, 929, 961, 993, 1025, 1057, 1089, 1121, 1153, 1185, 1217, 1249, 1281, 1313, 1345, 1377, 1409, 1441, 1473, 1505, 1537, 1569]
+  load_vae_feat: false
+
+model:
+  model: SanaRWMVideoQwenNextSubAttnResV2SelfFlowWorldModelCameraConditionMultiViewCausal_5B_P1_D36
+  extra:
+    action_dim: 80
+    state_dim: 80
+    rope: aligned
+    chunk_causal_policy:
+      actions_per_chunk: {"25": 32}
+      sliding_window_chunks: 1
+      memory_content: video_only
+      causal_observation: true
+      causal_state: true
+      gdn_fused_two_stream: true
+      # no AttnRes module (use_attn_res false): nothing for these two to act on
+      attn_res_fast_attend: false
+      attn_res_compiled_sum: false
+      # 2026-10-24 (user: "好的，那我们就换FA2的varlen吧"): the softmax layers' two-stream attention as packed FlashAttention-2
+      # varlen groups instead of FlexAttention (audit causal_softmax_varlen_switch_20261025T030044Z)
+      softmax_varlen_attention: true
+      # 2026-10-25 (user: "好的，现在切换N1"): the GDN decay matmul and the fused GDN prologue / epilogue
+      # (rwm/zekai-merge bf824fbf0 / 35b423b3b; audits causal_gdn_decay_matmul_20261025T071042Z,
+      # causal_gdn_fused_io_20261025T081501Z)
+      gdn_decay_matmul: true
+      gdn_fused_qk_rope: true
+      gdn_fused_output: true
+      # 2026-10-25 (user: "好的，现在切换N1"): adaLN modulation rows per distinct timestep and the cross-attention caption
+      # K/V once per row with fused q / k RMSNorm (rwm/zekai-merge db2149f09; audits causal_rowmod_xattn_switch_20261025T190211Z,
+      # causal_sana_latent_n1_rowmod_xattn_switch_20261025T194528Z)
+      row_modulation: true
+      row_modulation_fused_norm: true
+      row_modulation_bf16_input: true
+      cross_attn_kv_dedup: true
+      cross_attn_fused_qk_norm: true
+  image_size: 320
+  mixed_precision: bf16
+  fp32_attention: false
+  load_from: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/warmstart_ckpt_vault/sana_rwm_pretrained_vanilla_mixv4_capv3_twostream_obsblock_e5s50000
+  multi_scale: true
+  softmax_ratio: 0.25
+  linear_attn_type: GatedDeltaNet
+  softmax_attn_type: GatedSoftmaxAttention
+  memory_gdn_output_normalizer: false
+  linear_head_dim: 128
+  softmax_head_dim: 256
+  ffn_type: SwiGLU
+  mlp_ratio: 4.0
+  use_pe: true
+  pos_embed_type: wan_rope
+  qk_norm: true
+  cross_norm: true
+  class_dropout_prob: 0.1
+  # plain residual stack (53234167c); the donor's AttnRes queries are dropped on load
+  use_attn_res: false
+  remove_state_dict_keys:
+    - attn_res.attn_proj.weight
+    - attn_res.mlp_proj.weight
+    - attn_res.final_proj.weight
+  use_time_conditioning: false
+  attn_res_block_size: 8
+
+vae:
+  vae_type: LTX2VAE_diffusers
+  vae_pretrained: Efficient-Large-Model/LTX-2.3-Diffusers
+  weight_dtype: bfloat16
+  vae_latent_dim: 128
+  vae_downsample_rate: 32
+  vae_stride:
+    - 8
+    - 32
+    - 32
+  cache_dir: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/vae_cache
+  if_cache: false
+  use_causal_encode: true
+
+text_encoder:
+  text_encoder_name: gemma-2-2b-it-local
+  y_norm: true
+  y_norm_scale_factor: 0.01
+  model_max_length: 300
+  chi_prompt: []
+
+scheduler:
+  predict_flow_v: true
+  noise_schedule: linear_flow
+  pred_sigma: false
+  flow_shift: 5.0
+  action_flow_shift: 3.0
+  flow_shift_by_token_count: null
+  flow_shift_type: standard
+  inference_flow_shift: 5.0
+  inference_action_flow_shift: 3.0
+  inference_cfg_scale: 6.0
+  min_train_timestep: 1
+  weighting_scheme: uniform
+  logit_mean: 0.0
+  logit_std: 0.95
+  tail_floor_left: 0.12
+  tail_floor_right: 0.16
+  tail_floor_power: 1.2
+  tail_floor_body_weight: 0.925
+
+train:
+  timestep_loss_weighting: openwam
+  min_weight: 0.0
+  global_distributed_multiframe: true
+  null_embed_root: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/pretrained_embeds
+  valid_prompt_embed_root: /scratch/fsw/portfolios/nvr/projects/nvr_elm_llm/users/lezhao/zekail/sana_wam_runs/tmp_embed
+  use_fsdp: true
+  num_workers: 10
+  seed: 1
+  train_batch_size: 3
+  num_epochs: 100
+  gradient_accumulation_steps: 1
+  grad_checkpointing: true
+  gradient_clip: 1.0
+  optimizer:
+    betas:
+      - 0.9
+      - 0.95
+    eps: 1.0e-10
+    lr: 1.0e-4
+    type: AdamW
+    weight_decay: 1.0e-4
+    paramwise_cfg:
+      bias_decay_mult: 0.0
+      norm_decay_mult: 0.0
+  auto_lr: null
+  lr_schedule: cosine
+  lr_schedule_args:
+    num_warmup_steps: 1000
+    num_training_steps: 50000
+    final_lr: 0.01
+  max_train_steps: 50000
+  local_save_vis: true
+  visualize: false
+  eval_sampling_steps: 1000000000
+  log_interval: 10
+  save_model_epochs: 5
+  save_model_steps: 250
+  load_from_optimizer: false
+  load_from_lr_scheduler: false
+  ema_update: false
+  deterministic_validation: false
+  joint_training_interval: 0
+  ltx_image_condition_prob: 1.0
+  extra:
+    rwm_task: policy
+    instruction_dropout_probability: 0.1
+    action_loss_weight: 1.0
+    max_save_limit: 3
+    keep_milestone_steps: 2500
+    rwm_validation_steps: 50
+    rwm_validation_seed: 1
+    rwm_validation_samples_per_dataset: 10
+    rwm_validation_video_samples_per_dataset: 4
+    rwm_validation_action_overlay: false
+    causal_rwm:
+      enabled: true
+      min_num_chunks: 0
+      max_num_chunks: 48
+      # 32 GB300 ranks (8 nodes, user 2026-10-22: "不用降batch size"): 4x the 64-rank tiers of the CW recipe, twice its
+      # global batch
+      # 2026-10-24 (user: "就用160吧"): load-balanced tiers b = floor(160 / L), not powers of two; every rank holds
+      # at most 160 chunks (148 on average, was 130 with up to 196). 1-node A/B: x1.18 throughput (audit
+      # causal_batch_tiers_m160_1node_20261024T195811Z); the window-length mix is unchanged.
+      local_batch_sizes: [[1, 40], [5, 32], [6, 26], [7, 22], [8, 20], [9, 17], [10, 16], [11, 14], [12, 13], [13, 12], [14, 11], [15, 10], [17, 9], [18, 8], [21, 7], [23, 6], [27, 5], [33, 4], [41, 3]]
