@@ -24,11 +24,13 @@ from sana_wam_causal.contract import (
     CausalContract,
     bidirectional_view,
     check_observation_form,
+    check_rope_clock,
     check_run_record,
     describe_run_records,
     load_run_records,
     resolve_causal_contract,
 )
+from sana_wam_causal.checkpoint import load_causal_state_dict
 from sana_wam_causal.layers import LayerCache
 from sana_wam_causal.model import CausalPolicyModel
 from sana_wam_causal.session import Caption, CausalMemory, CausalPolicySession
@@ -59,6 +61,12 @@ OBSBLOCK_PIXEL_S15000 = os.path.join(
     _paths.FIXTURES, "config_causal_mixv4_capv3_obsblock_sana_pixel_physrope_episode_n1_obs_state_s15000.yaml"
 )
 RECORD_OBSBLOCK_PIXEL_S15000 = os.path.join(_paths.FIXTURES, "run_record_obsblock_sana_pixel_physrope_n1_obs_state_s15000.json")
+# the sana_latent obs-block N1-obs+state checkpoint trained without AttnRes (step 10000, Sana a5ae8cf8f); its Hub repo ships
+# no run record, the local one names the README's training tree
+NOATTNRES_S10000 = os.path.join(
+    _paths.FIXTURES, "config_causal_mixv4_capv3_obsblock_sana_latent_physrope_n1_obs_state_noattnres_s10000.yaml"
+)
+RECORD_LOCAL_NOATTNRES_S10000 = os.path.join(_paths.FIXTURES, "run_record_local_obsblock_sana_latent_noattnres_s10000.json")
 RECORD_S1000 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_s1000.json")
 RECORD_NOOBS_S3324 = os.path.join(_paths.FIXTURES, "run_record_episode_n24_videoonly_noobs_s3324.json")
 SINKLESS_VA = os.path.join(_paths.FIXTURES, "config_causal_pantheon14k_m48n24_videoandaction_s5000.yaml")
@@ -157,7 +165,7 @@ def test_the_gdn_output_normalizer_switch_resolves(value, expected):
         cfg["model"]["memory_gdn_output_normalizer"] = value
     contract = resolve_causal_contract(cfg)
     assert contract.gdn_output_normalizer is expected
-    assert contract.describe().endswith(f"first_chunk=0 gdn_output_normalizer={expected}")
+    assert contract.describe().endswith(f"first_chunk=0 gdn_output_normalizer={expected} use_attn_res=True")
 
 
 @pytest.mark.parametrize("value", ["false", 0, 1])
@@ -183,7 +191,7 @@ def test_the_released_n1_obs_checkpoint_resolves_with_its_observation_and_state(
     assert (contract.multiview, contract.visual_layout) == ("sana_latent", "three_view_strip")
     text = contract.describe()
     assert " chunk_observation=False causal_observation=True causal_state=True multiview=sana_latent " in text
-    assert text.endswith("first_chunk=0 gdn_output_normalizer=False")
+    assert text.endswith("first_chunk=0 gdn_output_normalizer=False use_attn_res=True")
 
 
 @pytest.mark.parametrize(
@@ -268,6 +276,85 @@ def test_a_checkpoint_of_the_joint_observation_read_is_refused(tmp_path):
     mixed = [(tmp_path / "RUN_ID.json", {"scheme_history": [{"code": "6e91eaf2a"}, {"code": "c6d008749 (git archive)"}]})]
     assert check_observation_form(mixed, contract) == "branch(fd5261ff6; trained on c6d008749)"
     assert check_observation_form([], resolve_causal_contract(_load(FIRST_FRAME_NOOBS))) is None
+
+
+@pytest.mark.parametrize("value,expected", [(None, True), (True, True), (False, False)], ids=["absent", "true", "false"])
+def test_the_attn_res_switch_resolves_and_the_view_keeps_the_mirror_config(value, expected):
+    """model.use_attn_res (Sana 53234167c on the causal policy): absent -> true, a yaml boolean otherwise; the contract
+    carries it, and the bidirectional view pins it true so the shared policy config still builds."""
+
+    cfg = copy.deepcopy(_load(OBSBLOCK_PIXEL_S15000))
+    if value is None:
+        cfg["model"].pop("use_attn_res", None)
+    else:
+        cfg["model"]["use_attn_res"] = value
+    contract = resolve_causal_contract(cfg)
+    assert contract.use_attn_res is expected and contract.describe().endswith(f" use_attn_res={expected}")
+    view = bidirectional_view(cfg)
+    assert view["model"]["use_attn_res"] is True and cfg["model"].get("use_attn_res", None) is value
+    policy_config_from_train_config(view)
+
+
+def test_the_sana_latent_checkpoint_without_attn_res_resolves_and_its_local_record_is_read(tmp_path):
+    """The real config.yaml of the sana_latent obs-block N1-obs+state checkpoint trained without AttnRes (step 10000, Sana
+    a5ae8cf8f): the plain residual stack on the physical clock with the observation latent and its state row,
+    numerator-only GDN; RUN_ID.local.json (the README's training tree) is read next to the config and makes it the
+    branch form; the model it builds has no AttnRes."""
+
+    contract = resolve_causal_contract(_load(NOATTNRES_S10000))
+    assert contract.use_attn_res is False
+    assert (contract.physical_rope, contract.causal_observation, contract.causal_state) == (True, True, True)
+    assert (contract.gdn_output_normalizer, contract.sliding_window_chunks, contract.memory_content) == (False, 1, MEMORY_VIDEO_ONLY)
+    assert (contract.multiview, contract.visual_layout, contract.aligned_phase_window) == (
+        "sana_latent", "three_view_strip", ALIGNED_PHASE_FIRST_FRAME)
+    (tmp_path / "config.yaml").write_bytes(open(NOATTNRES_S10000, "rb").read())
+    (tmp_path / "RUN_ID.local.json").write_bytes(open(RECORD_LOCAL_NOATTNRES_S10000, "rb").read())
+    records = load_run_records(tmp_path)
+    assert [path.name for path, _ in records] == ["RUN_ID.local.json"]
+    for source, record in records:
+        check_run_record(record, contract, source=str(source))
+    check_rope_clock(records)
+    assert check_observation_form(records, contract) == "branch(fd5261ff6; trained on a5ae8cf8f)"
+    assert "step=10000 source_commit=a5ae8cf8f" in describe_run_records(records, tmp_path / "config.yaml")
+    view = bidirectional_view(_load(NOATTNRES_S10000))
+    model = CausalPolicyModel(policy_config_from_train_config(view), contract)
+    assert model.attn_res is None and not any(key.startswith("attn_res.") for key in model.state_dict())
+
+
+def test_an_attn_res_switch_that_is_not_a_boolean_is_refused():
+    cfg = copy.deepcopy(_load(OBSBLOCK_PIXEL_S15000))
+    cfg["model"]["use_attn_res"] = "false"
+    with pytest.raises(ValueError, match="use_attn_res must be true or false"):
+        resolve_causal_contract(cfg)
+
+
+def test_the_attn_res_form_of_the_weights_must_match_the_contract():
+    """A mirror without AttnRes models no attn_res.* tensor: the strict load refuses an AttnRes checkpoint into it and
+    a checkpoint without AttnRes into an AttnRes mirror (a config / weights mismatch never serves)."""
+
+    with_attn_res, plain = _tiny_model(), _tiny_model(attn_res=False)
+    assert plain.attn_res is None and not any(key.startswith("attn_res.") for key in plain.state_dict())
+    load_causal_state_dict(plain, dict(_tiny_model(attn_res=False).state_dict()))
+    with pytest.raises(RuntimeError, match="does not model.*attn_res"):
+        load_causal_state_dict(plain, dict(with_attn_res.state_dict()))
+    with pytest.raises(RuntimeError, match="misses policy tensors.*attn_res"):
+        load_causal_state_dict(with_attn_res, dict(plain.state_dict()))
+
+
+def test_the_trees_after_the_attn_res_switch_are_branch_trees_and_the_sink_horizon_clock_is_refused(tmp_path):
+    """53234167c .. 9a1b3e33d descend from fd5261ff6 (the observation branch) and keep the window-start sink; from
+    0c88c11ab on the sink sits at chunk max(0, c - 7), which this adapter refuses for every checkpoint."""
+
+    contract = resolve_causal_contract(_load(OBSBLOCK_PIXEL_S15000))
+    for tree in ("53234167c", "a5ae8cf8f", "020582851", "9a1b3e33d"):
+        records = [(tmp_path / "RUN_ID.json", {"scheme_history": [{"code": "ff004392a"}, {"code": tree}]})]
+        assert check_observation_form(records, contract) == f"branch(fd5261ff6; trained on {tree})"
+        check_rope_clock(records)
+    for tree in ("0c88c11ab", "e6c386907"):
+        records = [(tmp_path / "RUN_ID.json", {"source_commit": f"{tree}0000", "scheme_history": [{"code": "9a1b3e33d"}]})]
+        with pytest.raises(ValueError, match="0c88c11ab on.*max\\(0, c - 7\\)"):
+            check_rope_clock(records)
+    check_rope_clock([])
 
 
 @pytest.mark.parametrize(
@@ -557,7 +644,7 @@ def test_reads_rotate_the_pre_rope_keys_at_their_slots():
 # -- the session on a tiny model -----------------------------------------------------------------------------------------
 
 
-def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION, phase=ALIGNED_PHASE_PADDED):
+def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION, phase=ALIGNED_PHASE_PADDED, attn_res=True):
     config = PolicyConfig.from_sana_kwargs(
         depth=4, hidden_size=64, patch_size=(1, 1, 1), num_heads=2, in_channels=4, caption_channels=16,
         model_max_length=7, linear_head_dim=32, softmax_head_dim=32, softmax_ratio=0.5, attn_res_block_size=2,
@@ -568,7 +655,7 @@ def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION, phase=ALIGNED_
         actions_per_chunk=32, video_frame_stride=4, latent_frames_per_chunk=1, sliding_window_chunks=window,
         memory_content=memory_content, model_fps=25.0, tier_num_frames=33,
         multiview="sana_pixel", visual_layout="sana_pixel_canvas", rope="aligned", dt_bias_init=-5.0, a_log_init=0.0,
-        reset_legacy_beta=False, aligned_phase_window=phase,
+        reset_legacy_beta=False, aligned_phase_window=phase, use_attn_res=attn_res,
     )
     torch.manual_seed(0)
     model = CausalPolicyModel(config, contract)

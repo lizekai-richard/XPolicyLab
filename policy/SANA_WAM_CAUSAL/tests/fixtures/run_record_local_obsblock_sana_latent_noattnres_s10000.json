@@ -1,0 +1,8 @@
+{
+  "provenance": "written on x5 2026-10-31 (UTC) for the XPolicyLab SANA_WAM_CAUSAL adapter: the Hub repo zekaili/causal_robodojo_sana_latent_mixv4_capv3_obsblock50000_physrope_f33fps8_n1_obs_state_noattnres @ f5b591f6de2c ships no run record; source_commit is the 'code' row of its README.md ('rwm/zekai-merge a5ae8cf8f + the recipe and launcher in recipe.yaml'), step its 'checkpoint' row (epoch_15_step_10000). The switches below are not recorded here; config.yaml carries them.",
+  "repo": "zekaili/causal_robodojo_sana_latent_mixv4_capv3_obsblock50000_physrope_f33fps8_n1_obs_state_noattnres",
+  "hf_revision": "f5b591f6de2c4a9d3f234984b6c0c2c146312149",
+  "run_name": "causal_robodojo_sana_latent_256x320_mixv4_capv3_obsblock50000_physrope_f33fps8_episode_n1_obs_state_noattnres_h200",
+  "source_commit": "a5ae8cf8f",
+  "step": 10000
+}

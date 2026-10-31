@@ -48,6 +48,7 @@ from .contract import (  # noqa: E402
     CausalContract,
     bidirectional_view,
     check_observation_form,
+    check_rope_clock,
     check_run_record,
     describe_run_records,
     load_run_records,
@@ -97,6 +98,7 @@ class CausalRuntime:
         records = load_run_records(config_path.parent)
         for source, record in records:
             check_run_record(record, contract, source=str(source))
+        check_rope_clock(records)
         observation_form = check_observation_form(records, contract, allow_unrecorded=allow_donor_checkpoint)
         view = bidirectional_view(train_cfg)
         rope, legacy_origin, rope_label = resolve_rope_contract(view, None)

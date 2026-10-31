@@ -1,7 +1,8 @@
 """Live parity of the causal mirror against Sana's chunk-causal policy on the episode protocol in its single form
-(``SANA_CAUSAL_REPO``: Sana rwm/zekai-merge at or after 4bd6eca83, checked at 7de7711c2, b297028fe, c4d1d246d and
-ff004392a; no
-chunk observations, the sink on every canvas). The numerator-only GDN readout (``model.memory_gdn_output_normalizer:
+(``SANA_CAUSAL_REPO``: Sana rwm/zekai-merge at or after 4bd6eca83, checked at 7de7711c2, b297028fe, c4d1d246d,
+ff004392a and 9a1b3e33d; no chunk observations, the sink on every canvas). The plain-residual tests (``model.use_attn_res:
+false``) need a tree at or after 53234167c and skip on an older one; trees from 0c88c11ab on (the sink at chunk
+max(0, c - 7)) are not served. The numerator-only GDN readout (``model.memory_gdn_output_normalizer:
 false``) needs a tree at or after c414e9b32; those tests skip on an older one. The observation tests need a tree at or
 after fd5261ff6 (the GDN branch of the observation group, sana-rwm's two-stream obs-block) and skip on an older one.
 
@@ -36,7 +37,7 @@ from sana_wam_causal.model import CausalPolicyModel
 from sana_wam_causal.session import Caption, CausalMemory, CausalPolicySession
 from sana_wam_min.policy_model.config import PolicyConfig
 
-SANA_CAUSAL_REPO = os.path.expanduser(os.environ.get("SANA_CAUSAL_REPO", "~/zekail/Sana_zekai_merge_ff004392a"))
+SANA_CAUSAL_REPO = os.path.expanduser(os.environ.get("SANA_CAUSAL_REPO", "~/zekail/Sana_zekai_merge_9a1b3e33d"))
 FPS = 16.0
 C_LAT = 4
 VIEW = (3, 4)
@@ -123,6 +124,14 @@ def _require_live_causal_observation(state: bool = False):
         pytest.skip(f"{SANA_CAUSAL_REPO} predates the GDN branch of the observation group (fd5261ff6)")
 
 
+def _require_live_plain_residual():
+    """Skip unless the live tree runs the causal block stack without AttnRes (Sana 53234167c, ``use_attn_res`` false)."""
+
+    causal, _ = _live_modules()
+    if not hasattr(causal, "_plain_layer_step"):
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates use_attn_res false on the causal policy (53234167c)")
+
+
 def _require_live_physical_rope():
     """Skip unless the live tree has physical_rope (Sana 6e91eaf2a) on its training canvas."""
 
@@ -137,7 +146,8 @@ class Twins:
 
     def __init__(self, *, views=1, stride=4, chunk=32, window=None, separate=True, chunks=4, depth=4, seed=11,
                  fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, first_frame=False, normalizer=True,
-                 live_normalizer=None, observation=False, state=False, physical=False, live_physical=None):
+                 live_normalizer=None, observation=False, state=False, physical=False, live_physical=None,
+                 attn_res=True):
         causal, self.crwm = _live_modules()
         # the mirror's GDN readout (contract.gdn_output_normalizer) and the live one (model.memory_gdn_output_normalizer;
         # live_normalizer differs only in the negative control)
@@ -172,6 +182,10 @@ class Twins:
             options["physical_rope"] = True
         if window is not None:
             options["sliding_window_chunks"] = window
+        # model.use_attn_res false (Sana 53234167c): both block stacks a plain residual
+        self.attn_res = bool(attn_res)
+        if not self.attn_res:
+            _require_live_plain_residual()
         multiview = "sana_pixel" if views == 1 else "sana_latent"
         model_options = {} if live_normalizer else {"memory_gdn_output_normalizer": False}
         config = _Cfg(
@@ -184,7 +198,8 @@ class Twins:
             data=_Cfg(extra={"multiview": multiview}),
             vae=_Cfg(vae_stride=[8, 32, 32]),
         )
-        self.live = Live(config=config, **kwargs)
+        self.live = Live(config=config, use_attn_res=self.attn_res, **kwargs)
+        assert (self.live.attn_res is not None) is self.attn_res
         assert self.live.memory_content == memory and self.live.sliding_window_chunks == window
         assert tuple(self.live.multiview_spatial_rope_tile_shape) == (8, 16)
         assert getattr(self.live, "memory_gdn_output_normalizer", True) is live_normalizer
@@ -200,7 +215,7 @@ class Twins:
             dt_bias_init=-5.0, a_log_init=0.0, reset_legacy_beta=False,
             aligned_phase_window="first_frame" if first_frame else "padded",
             gdn_output_normalizer=normalizer, causal_observation=self.observation, causal_state=self.state,
-            physical_rope=self.physical,
+            physical_rope=self.physical, use_attn_res=self.attn_res,
         )
         policy_config = PolicyConfig.from_sana_kwargs(config=config, **kwargs)
         assert tuple(policy_config.multiview_spatial_rope_tile_shape) == (8, 16)
@@ -1298,3 +1313,104 @@ def test_the_physical_clock_places_every_token_at_its_instant():
     reference = mirror.softmax_entry_rope(frames=1, frame_offset=0.5625, robot_rows=0, step_offset=0, model_fps=FPS,
                                           view_shapes=twins.view_shapes, view_slot_ids=twins.slots, device="cpu")
     torch.testing.assert_close(tables[0], reference, rtol=0, atol=0)   # the memory chunk of every N = 1 read at 0.5625
+
+
+PLAIN_CASES = [
+    # views, stride, chunk, window, length, memory, first_frame, observation, state, physical, normalizer
+    (3, 4, 32, 1, 5, MEMORY_VIDEO_ONLY, True, False, False, True, False),     # the RoboDojo no-obs N1 recipe (020582851)
+    (1, 4, 32, 1, 5, MEMORY_VIDEO_ONLY, True, True, True, True, False),       # obs+state on the canvas, physical, numerator
+    (3, 4, 32, 2, 6, MEMORY_VIDEO_ONLY, True, True, True, True, False),
+    (3, 4, 32, 2, 6, MEMORY_VIDEO_ONLY, True, True, False, False, True),
+    (1, 4, 32, 2, 6, MEMORY_VIDEO_AND_ACTION, False, False, False, False, True),
+    (3, 4, 32, None, 4, MEMORY_VIDEO_AND_ACTION, False, False, False, True, True),
+    (1, 1, 16, 3, 6, MEMORY_VIDEO_ONLY, True, True, True, True, False),       # f_c = 2
+]
+PLAIN_IDS = ["V3-W1-noobs-phys-num", "V1-W1-obs+state-phys-num", "V3-W2-obs+state-phys-num", "V3-W2-obs-slots",
+             "V1-W2-va-pad-slots", "V3-noW-va-pad-phys", "V1-s1c16-W3-obs+state-phys-num"]
+
+
+@pytest.mark.parametrize("views,stride,chunk,window,length,memory,first_frame,observation,state,physical,normalizer",
+                         PLAIN_CASES, ids=PLAIN_IDS)
+def test_a_plain_residual_deploy_chain_equals_two_stream_training_forward(views, stride, chunk, window, length, memory,
+                                                                         first_frame, observation, state, physical,
+                                                                         normalizer):
+    """model.use_attn_res false (Sana 53234167c): the block stack is a plain residual on both sides (each layer adds its
+    attention sublayer's delta, then its MLP delta; no AttnRes module, no final aggregation), and every noisy chunk of
+    the training forward == the deploy chain's chunk, with and without observation latents and their state rows, on both
+    clocks, both memory contents and phase windows, with and without the GDN denominator."""
+
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=length, memory=memory,
+                  first_frame=first_frame, normalizer=normalizer, observation=observation, state=state, physical=physical,
+                  attn_res=False)
+    assert twins.live.attn_res is None and twins.mirror.attn_res is None
+    assert not any(key.startswith("attn_res.") for key in twins.mirror.state_dict())
+    training = twins.two_stream(length) if first_frame else twins.two_stream(length)[1:]
+    streaming = twins.streaming_first_frame(length) if first_frame else twins.streaming(length)
+    close = OBSERVED_CLOSE if observation else CLOSE
+    assert len(training) == len(streaming)
+    for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming)):
+        torch.testing.assert_close(x_ours, x_live, **close, msg=lambda m: f"chunk {k} video: {m}")
+        torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+
+
+PLAIN_SESSION_CASES = [
+    # views, memory, video_cfg, action_cfg, position mode, window, observation, state, normalizer
+    (3, MEMORY_VIDEO_ONLY, 6.0, 1.0, "rank", 1, False, False, False),
+    (1, MEMORY_VIDEO_ONLY, 6.0, 1.0, "absolute", 1, True, True, False),
+    (3, MEMORY_VIDEO_AND_ACTION, 2.5, 1.7, "rank", 2, True, False, True),
+]
+
+
+@pytest.mark.parametrize("views,memory,video_cfg,action_cfg,position_mode,window,observation,state,normalizer",
+                         PLAIN_SESSION_CASES)
+def test_a_plain_residual_session_matches_the_live_deploy_session(views, memory, video_cfg, action_cfg, position_mode,
+                                                                 window, observation, state, normalizer):
+    """A first-frame episode of a policy without AttnRes: the mirror's session == Sana's CausalPolicyChunkSession (its
+    unfused path runs the plain stack), per-stream CFG past the window boundary, with and without observation latents."""
+
+    steps, chunks = 3, 5
+    twins = Twins(views=views, window=window, chunks=chunks, memory=memory, first_frame=True, observation=observation,
+                  state=state, normalizer=normalizer, attn_res=False)
+    live = _live_session(twins, steps, video_cfg, action_cfg, position_mode)
+    ours = twins.session(steps=steps, video_cfg=video_cfg, action_cfg=action_cfg)
+    close = OBSERVED_CLOSE if observation else CLOSE
+    mask = torch.ones(1, twins.chunk, 80, dtype=torch.bool)
+    mask[..., 60:] = False
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    live.commit_sink(twins.sink)
+    ours.commit_sink(twins.ours(twins.sink))
+    g = torch.Generator().manual_seed(29)
+    for k in range(chunks):
+        video_noise = torch.randn(1, C_LAT, twins.f_chunk, 1, twins.width, generator=g, dtype=torch.float64)
+        action_noise = torch.randn(1, twins.chunk, 80, generator=g, dtype=torch.float64)
+        extra_live, extra_ours = {}, {}
+        if observation:
+            seen = twins.sink if k == 0 else twins.observations[k]   # chunk 0's observation is the sink's latent
+            extra_live, extra_ours = {"observation": seen}, {"observation": twins.ours(seen)}
+        a_live, v_live = live.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask, video_noise=video_noise,
+            action_noise=action_noise, **extra_live,
+        )
+        a_ours, v_ours = ours.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask,
+            video_noise=twins.ours(video_noise), action_noise=action_noise, **extra_ours,
+        )
+        torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+        torch.testing.assert_close(v_ours, twins.ours(v_live), **close, msg=lambda m: f"chunk {k} video: {m}")
+        live.commit_chunk(twins.clean[k], twins.a_clean[k], anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask)
+        ours.commit_chunk(twins.ours(twins.clean[k]), twins.a_clean[k], anchor_state=twins.states[k],
+                          anchor_state_mask=state_mask, action_mask=mask)
+    assert ours.chunk_idx == live.chunk_idx == chunks
+
+
+def test_a_plain_residual_mirror_is_not_the_attn_res_stack():
+    """Negative control: on a policy without AttnRes the mirror's plain stack is what the parity checks -- dropping its
+    MLP residual (one wrong sum) misses the training forward."""
+
+    twins = Twins(views=3, window=1, chunks=4, memory=MEMORY_VIDEO_ONLY, first_frame=True, physical=True, attn_res=False)
+    training = twins.two_stream(4)
+    for block in twins.mirror.blocks:
+        block.forward_mlp_sublayer = lambda hidden, modulation: torch.zeros_like(hidden)
+    streaming = twins.streaming_first_frame(4)
+    gap = max(_max_abs(streaming[k][i], training[k][i]) for k in range(4) for i in (0, 1))
+    assert gap > 1e-6, gap

@@ -221,9 +221,10 @@ class PolicyModel(nn.Module):
         nn.init.normal_(self.t_block[1].weight, std=0.02)
         nn.init.normal_(self.y_embedder.y_proj.fc1.weight, std=0.02)
         nn.init.normal_(self.y_embedder.y_proj.fc2.weight, std=0.02)
-        nn.init.zeros_(self.attn_res.attn_proj.weight)
-        nn.init.zeros_(self.attn_res.mlp_proj.weight)
-        nn.init.zeros_(self.attn_res.final_proj.weight)
+        if self.attn_res is not None:   # the causal subclass without AttnRes (SANA_WAM_CAUSAL, use_attn_res false)
+            nn.init.zeros_(self.attn_res.attn_proj.weight)
+            nn.init.zeros_(self.attn_res.mlp_proj.weight)
+            nn.init.zeros_(self.attn_res.final_proj.weight)
         state_projector = self.state_context_embed if self.state_as_cross_attention else self.state_embed
         nn.init.zeros_(state_projector.proj.weight)
         nn.init.zeros_(state_projector.proj.bias)

@@ -103,14 +103,22 @@ ALIGNED_PHASE_PADDED = "padded"
 ALIGNED_PHASE_FIRST_FRAME = "first_frame"
 ALIGNED_PHASE_WINDOWS = (ALIGNED_PHASE_PADDED, ALIGNED_PHASE_FIRST_FRAME)
 # the run record a Hub upload of the causal line writes next to config.yaml (RUN_ID.json; upload_manifest.json carries
-# the same keys): the run's protocol switches, which a config from before Sana 4bd6eca83 need not declare
-RUN_RECORD_NAMES = ("RUN_ID.json", "upload_manifest.json")
+# the same keys): the run's protocol switches, which a config from before Sana 4bd6eca83 need not declare.
+# RUN_ID.local.json is a record written next to a downloaded checkpoint whose Hub repo ships none (e.g. the training
+# tree its README names), with a ``provenance`` line saying where its keys come from.
+RUN_RECORD_NAMES = ("RUN_ID.json", "upload_manifest.json", "RUN_ID.local.json")
 # The GDN of a causal_observation chunk's observation group [o_c; s_c]: since Sana fd5261ff6 (sana-rwm's two-stream
 # obs-block) it writes a branch of the carried state that the chunk's prediction tokens read; up to its parent the whole
 # noisy segment read the state under one decay and key scale and the observation wrote nothing. No config key tells the
 # two apart, so the run record's training trees decide (``check_observation_form``). Trees known to train the branch
 # (fd5261ff6 and descendants; add a newer one after `git merge-base --is-ancestor fd5261ff6 <tree>`):
-OBSERVATION_BRANCH_TREES = ("fd5261ff6", "c6d008749", "ff004392a")
+OBSERVATION_BRANCH_TREES = (
+    "fd5261ff6", "c6d008749", "ff004392a", "53234167c", "a5ae8cf8f", "c2b32227e", "020582851", "9a1b3e33d",
+)
+# Sana 0c88c11ab retired the window-start softmax sink and the integer clock (the physical clock is the only one, the
+# sink read at chunk max(0, c - 7), physical_rope dropped from the recipes): trees from it on train a clock this adapter
+# does not serve (``check_rope_clock``); their checkpoints' configs no longer declare physical_rope.
+SINK_HORIZON_TREES = ("0c88c11ab", "e6c386907")
 # trees known to train the joint read (764ee2113 .. fd5261ff6^): served by SANA_WAM_CAUSAL up to XPolicyLab e35fcde
 OBSERVATION_JOINT_TREES = (
     "764ee2113", "afc9874b6", "6e91eaf2a", "c414e9b32", "02aebea6e", "c4d1d246d", "c601aae6e", "bf824fbf0", "35b423b3b",
@@ -140,6 +148,7 @@ class CausalContract:
     causal_observation: bool = False    # every noisy chunk opens with its own observation latent, read causally
     causal_state: bool = False          # the chunk's state row joins its observation latent (causal_observation only)
     physical_rope: bool = False         # every token at its physical instant (target latents at their frames' middle)
+    use_attn_res: bool = True           # false: the block stack is a plain residual, no AttnRes (Sana 53234167c)
 
     @property
     def first_chunk(self) -> int:
@@ -157,7 +166,7 @@ class CausalContract:
             f"multiview={self.multiview} visual_layout={self.visual_layout} "
             f"rope={self.rope} physical_rope={self.physical_rope} aligned_phase_window={self.aligned_phase_window} "
             f"first_chunk={self.first_chunk} "
-            f"gdn_output_normalizer={self.gdn_output_normalizer}"
+            f"gdn_output_normalizer={self.gdn_output_normalizer} use_attn_res={self.use_attn_res}"
         )
 
 
@@ -224,6 +233,17 @@ def resolve_gdn_output_normalizer(value: Any) -> bool:
         return True
     if not isinstance(value, bool):
         raise ValueError(f"model.memory_gdn_output_normalizer must be true or false, got {value!r}")
+    return value
+
+
+def resolve_use_attn_res(value: Any) -> bool:
+    """``model.use_attn_res`` as Sana reads it (the base model's keyword, default true; the causal policy runs without
+    AttnRes since 53234167c, its blocks then a plain residual): None -> true, a yaml boolean otherwise."""
+
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        raise ValueError(f"model.use_attn_res must be true or false, got {value!r}")
     return value
 
 
@@ -379,6 +399,21 @@ def check_observation_form(
     )
 
 
+def check_rope_clock(records: list[tuple[Path, Mapping[str, Any]]]) -> None:
+    """Refuse a checkpoint whose run records name a training tree of ``SINK_HORIZON_TREES``: from Sana 0c88c11ab on the
+    softmax sink is read at chunk max(0, c - 7) and the physical clock is the only one, while this adapter reads the
+    sink at the window's start and takes the integer clock for a config without physical_rope."""
+
+    trees = [tree for _, record in records for tree in record_trees(record)]
+    horizon = [tree for tree in trees if _known(tree, SINK_HORIZON_TREES)]
+    if horizon:
+        raise ValueError(
+            f"the run record names training trees {horizon} from Sana 0c88c11ab on: the checkpoint learned the softmax "
+            "sink at chunk max(0, c - 7) on the physical clock, which this adapter does not serve yet (it reads the sink "
+            "at the window's start, the trees up to a5ae8cf8f)"
+        )
+
+
 def describe_run_records(records: list[tuple[Path, Mapping[str, Any]]], config_path: str | Path) -> str:
     """One line for the ready report: the records read, the protocol they declare and whether the config is the one
     they recorded (``config_sha256``)."""
@@ -407,14 +442,16 @@ def is_causal_policy_config(cfg: Mapping[str, Any]) -> bool:
 def bidirectional_view(cfg: Mapping[str, Any]) -> dict[str, Any]:
     """The yaml with the parent SFT recipe's policy class and one-chunk tier put back.
 
-    Only the two keys the causal derivation changes for the policy class and the frame tier are reverted; the shared
-    resolvers of ``sana_wam_min`` then read every SFT-meaning key (multiview, rope, action modes, normalization pin,
-    schedule, text contract) exactly as for the parent SFT checkpoint.
+    Only the keys the causal derivation changes for the policy class, the frame tier and the AttnRes switch are
+    reverted; the shared resolvers of ``sana_wam_min`` then read every SFT-meaning key (multiview, rope, action modes,
+    normalization pin, schedule, text contract) exactly as for the parent SFT checkpoint. ``model.use_attn_res`` is
+    pinned true there (the bidirectional mirror has AttnRes only); the causal model reads ``CausalContract.use_attn_res``.
     """
 
     view = copy.deepcopy(dict(cfg))
     view["model"] = dict(view["model"])
     view["model"]["model"] = THREE_VIEW_POLICY_FACTORY
+    view["model"]["use_attn_res"] = True
     data = dict(view["data"])
     tier = int(sft_options_from_train_config(view).get("tier_num_frames") or 0)
     if tier <= 1:
@@ -540,6 +577,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         causal_observation=causal_observation,
         causal_state=causal_state,
         physical_rope=physical_rope,
+        use_attn_res=resolve_use_attn_res(model_cfg.get("use_attn_res")),
     )
 
 
@@ -559,6 +597,7 @@ __all__ = [
     "SERVED_VISUAL_LAYOUTS",
     "bidirectional_view",
     "check_observation_form",
+    "check_rope_clock",
     "check_run_record",
     "chunk_causal_options",
     "describe_run_records",
@@ -573,4 +612,5 @@ __all__ = [
     "resolve_gdn_output_normalizer",
     "resolve_physical_rope",
     "resolve_memory_content",
+    "resolve_use_attn_res",
 ]

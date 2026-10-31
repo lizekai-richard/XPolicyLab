@@ -160,7 +160,10 @@ class CausalPolicyModel(PolicyModel):
             for kind in self.block_attn_types
         )
         self.set_cross_attention_xformers(True)
-        self.attn_res = BlockAttnResV2(config.hidden_size, config.depth, config.attn_res_block_size)
+        self.use_attn_res = bool(contract.use_attn_res)
+        self.attn_res = (
+            BlockAttnResV2(config.hidden_size, config.depth, config.attn_res_block_size) if self.use_attn_res else None
+        )
         self.final_layer = T2IFinalLayer(config.hidden_size, config.patch_size, config.out_channels)
         self.state_embed = MaskedProjector(config.state_dim, config.hidden_size)
         self.action_embed = MaskedProjector(config.action_dim, config.hidden_size)
@@ -288,7 +291,26 @@ class CausalPolicyModel(PolicyModel):
         rope_softmax: torch.Tensor,
         caches: Optional[Sequence[LayerCache]],
     ) -> torch.Tensor:
-        """``PolicyModel._forward_trunk`` (Block AttnRes V2 over depth, per token) with each layer's cache view."""
+        """``PolicyModel._forward_trunk`` (Block AttnRes V2 over depth, per token) with each layer's cache view; without
+        AttnRes (``use_attn_res`` false) a plain residual stack, Sana's ``_plain_layer_step`` (53234167c): each layer
+        adds its attention sublayer's delta (self- plus cross-attention), then its MLP delta, and the last hidden state
+        is the output."""
+
+        if self.attn_res is None:
+            hidden = tokens
+            for layer_index, block in enumerate(self.blocks):
+                rope = rope_softmax if self.block_attn_types[layer_index] == self.softmax_attn_type else rope_linear
+                hidden = hidden + block.forward_attn_sublayer(
+                    hidden,
+                    text,
+                    modulation,
+                    text_mask=text_mask,
+                    rotary_emb=rope,
+                    prompt_group_spans=prompt_group_spans,
+                    cache=None if caches is None else caches[layer_index],
+                )
+                hidden = hidden + block.forward_mlp_sublayer(hidden, modulation)
+            return hidden
 
         block_size = self.attn_res_block_size
         num_blocks = math.ceil(len(self.blocks) / block_size)
