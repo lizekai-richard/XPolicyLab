@@ -84,9 +84,11 @@ from .robodojo_io import ROBODOJO_MODEL_FPS_HZ, ROBODOJO_VIEW_ORDER, VIEW_SLOT_I
 from .robot80 import (
     ROBOT80_DIM,
     Normalization,
+    apply_gripper_range,
     load_normalization,
     normalize_state,
     normalized_gripper_bounds,
+    resolve_gripper_range,
     select_eef_target_normalization,
     select_joint_target_normalization,
 )
@@ -307,12 +309,16 @@ class PolicyInferenceSession:
         action_flow_shift: Optional[float] = None,
         view_resize: Optional[str] = None,
         condition_prefix_cache: Optional[bool] = None,
+        gripper_range: Any = None,
     ) -> None:
         self.model = model
         self.vae = vae
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
-        self.normalization = normalization
+        # deploy gripper_range: null/auto = the artifact's own gripper map ([-1, 1] for the artifacts of 2026-09-20 up
+        # to Sana 41cf94114, [0, 1] before and from it); [-1, 1] / [0, 1] rewrite slots 16 / 45 of both blocks. The
+        # sampler's gripper clamp (normalized_gripper_bounds) follows the served map
+        self.normalization, self.gripper_range = apply_gripper_range(normalization, gripper_range)
         self.train_config = train_config
         self.device = torch.device(device)
         self.steps = int(steps)
@@ -427,6 +433,7 @@ class PolicyInferenceSession:
         action_flow_shift: Optional[float] = None,
         view_resize: Optional[str] = None,
         condition_prefix_cache: Optional[bool] = None,
+        gripper_range: Any = None,
     ) -> "PolicyInferenceSession":
         """Load every component from disk: train yaml -> normalization -> bf16 model + weights -> VAE -> Gemma.
 
@@ -459,6 +466,7 @@ class PolicyInferenceSession:
         normalization = load_checked_normalization(
             checkpoint_dir, train_cfg, normalization_path, expected_normalization_sha256
         )
+        resolve_gripper_range(gripper_range)          # refused before the weight load; the session applies it
 
         model = build_policy_model(policy_config, dtype=torch.bfloat16, device=device)
         load_report = load_policy_weights(model, str(checkpoint_dir), device=device)
@@ -485,7 +493,9 @@ class PolicyInferenceSession:
             action_flow_shift=action_flow_shift,
             view_resize=view_resize,
             condition_prefix_cache=condition_prefix_cache,
+            gripper_range=gripper_range,
         )
+        load_report["gripper_range"] = session.gripper_range
         session.load_report = load_report
         session.rope_contract = rope_label
         return session
@@ -736,6 +746,7 @@ class PolicyInferenceSession:
             "latency_ms": (time.perf_counter() - start) * 1000.0,
             "checkpoint": self.checkpoint_path,
             "normalization_sha256": self.normalization.sha256,
+            "gripper_range": self.gripper_range,
             "visual_layout": self.visual_layout,
             "text_groups": self.text_groups,
             "canvas_prompt": self.canvas_prompt,

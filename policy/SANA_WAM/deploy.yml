@@ -22,6 +22,10 @@ checkpoint_dir: null
 # policy/SANA_WAM/normalization/ (sha-pinned by default). normalization_sha256 pins whichever file is used.
 normalization_path: null
 normalization_sha256: null
+# Model-domain range of the gripper closedness: auto = the artifact's own map (the training's: [-1, 1] for the artifacts
+# of 2026-09-20 up to Sana 41cf94114, e.g. 1fe3b7e7 / 9f8b98ed; [0, 1] before that scheme and from 41cf94114 on, e.g.
+# 4078c0b2); [-1, 1] / [0, 1] force that map on the gripper slots (the ready line says when it overrides the artifact)
+gripper_range: auto
 text_encoder_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/text_encoder/gemma-2-2b-it
 vae_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/Sana/LTX-2.3-Diffusers
 sampling_steps: 50

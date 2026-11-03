@@ -855,6 +855,49 @@ def test_shipped_deploy_yml_defaults_to_video_only_cfg():
     assert deploy["action_cfg_scale"] == 1.0 and deploy["video_cfg_scale"] is None
 
 
+def test_gripper_range_is_forwarded_and_ships_auto(patched, ckpt_dir):
+    """deploy gripper_range (Sana 41cf94114 gripper identity): forwarded as given, the session resolves it; the shipped
+    default is auto (the artifact's own map, so every existing checkpoint serves unchanged)."""
+
+    import yaml as _yaml
+
+    from sana_wam_min.robot80 import GRIPPER_RANGE_AUTO, resolve_gripper_range
+
+    adapter.Model(base_cfg(ckpt_dir))
+    assert patched.from_paths_kwargs["gripper_range"] is None
+    adapter.Model(base_cfg(ckpt_dir, gripper_range="[0, 1]"))
+    assert patched.from_paths_kwargs["gripper_range"] == "[0, 1]"
+    deploy = _yaml.safe_load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "deploy.yml")))
+    assert resolve_gripper_range(deploy["gripper_range"]) == GRIPPER_RANGE_AUTO
+
+
+@pytest.mark.parametrize(
+    "stamp, value, expected",
+    [
+        (None, None, "grippers 16 / 45 identity (pre-2026-09-20 scheme)"),
+        ("identity", None, "grippers 16 / 45 identity, rot6d None (Sana 41cf94114 scheme)"),
+        (None, "[-1, 1]", "grippers 16 / 45 served [-1, 1](deploy OVERRIDES artifact [0, 1])"),
+    ],
+)
+def test_the_normalization_contract_line_names_the_served_gripper_map(capsys, stamp, value, expected):
+    """An override keeps the artifact's stamp: the contract check must not call the served map a layout mismatch."""
+
+    import dataclasses
+
+    from sana_wam_min.robot80 import apply_gripper_range, load_normalization
+    from sana_wam_min.session import PACKAGED_NORMALIZATION_PATH, TRAINING_NORMALIZATION_SHA256
+
+    norm = dataclasses.replace(
+        load_normalization(PACKAGED_NORMALIZATION_PATH, TRAINING_NORMALIZATION_SHA256), gripper_normalization=stamp
+    )
+    norm, label = apply_gripper_range(norm, value)
+    adapter.Model._log_normalization_contract(
+        types.SimpleNamespace(session=types.SimpleNamespace(normalization=norm, gripper_range=label))
+    )
+    out = capsys.readouterr().out
+    assert "WARNING" not in out and expected in out
+
+
 # -- prediction_latent_dir: the world model's predicted video, saved per chunk --------------------------------------------
 
 

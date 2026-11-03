@@ -286,6 +286,9 @@ class Model(ModelTemplate):
             # condition-causal checkpoints only (rwm/zekai-merge f6a257d4a, recognised by their GDN recurrence):
             # null/auto = on, the condition chunk once per decision and caption stream (Sana 89eaa78f6)
             condition_prefix_cache=_optional_bool(cfg.get("condition_prefix_cache")),
+            # model-domain range of the gripper closedness: null/auto = the artifact's own map ([-1, 1] for the
+            # artifacts of 2026-09-20 up to Sana 41cf94114, [0, 1] from it); [-1, 1] / [0, 1] force that map
+            gripper_range=cfg.get("gripper_range"),
             expected_normalization_sha256=cfg.get("normalization_sha256") or None,
             # per-stream guidance: null inherits cfg_scale; action_cfg_scale=1 with cfg_scale>1 guides the video only
             video_cfg_scale=_optional_float(cfg.get("video_cfg_scale")),
@@ -341,6 +344,7 @@ class Model(ModelTemplate):
                 else ""
             )
             + f" rope={getattr(self.model, 'rope_mode', None)} ({getattr(self.session, 'rope_contract', 'n/a')})"
+            + f" gripper_range={getattr(self.session, 'gripper_range', 'n/a')}"
             + f" text_groups={getattr(self.session, 'text_groups', None)}"
             + f" canvas_prompt={getattr(self.session, 'canvas_prompt', None)}"
             + (f" robot_base_eef_layout={self.robot_base_eef_layout}" if self.include_eef else "")
@@ -402,18 +406,27 @@ class Model(ModelTemplate):
         if seventh:
             problems.append(f"7th-joint slots {seventh} carry statistics (ARX-X5 arms have 6 joints; the adapter fills slots 0-5 / 29-34 only)")
         # 2026-09-20 forced scheme: grippers by statistics (center 0.5, scale 0.5), Rot6D by the fixed [-1, 1] range; the
-        # artifact stamps it, and the generic masked affine map applies it. Before: grippers identity (mask off).
+        # artifact stamps it, and the generic masked affine map applies it. Before: grippers identity (mask off). From Sana
+        # 41cf94114 the grippers are identity again (stamp identity). A deploy gripper_range override rewrites the gripper
+        # slots and keeps the stamp, so the stamp is then the artifact's, not the served map's.
         gripper_scheme = getattr(norm, "gripper_normalization", None)
+        gripper_range = str(getattr(self.session, "gripper_range", "") or "")
+        overridden = "OVERRIDES" in gripper_range
         grippers = [i for i in (16, 45) if i in active]
-        if grippers and gripper_scheme != "statistics":
-            problems.append(f"gripper slots {grippers} are normalized but the artifact does not declare gripper_normalization: statistics")
-        if not grippers and gripper_scheme == "statistics":
-            problems.append("the artifact declares gripper_normalization: statistics but slots 16 / 45 are not masked")
-        scheme = (
-            f"grippers 16 / 45 by statistics, rot6d {getattr(norm, 'rotation_normalization', None)} (2026-09-20 scheme)"
-            if gripper_scheme == "statistics"
-            else "grippers 16 / 45 identity (pre-2026-09-20 scheme)"
-        )
+        if not overridden:
+            if grippers and gripper_scheme != "statistics":
+                problems.append(f"gripper slots {grippers} are normalized but the artifact does not declare gripper_normalization: statistics")
+            if not grippers and gripper_scheme == "statistics":
+                problems.append("the artifact declares gripper_normalization: statistics but slots 16 / 45 are not masked")
+        rotation = getattr(norm, "rotation_normalization", None)
+        if overridden:
+            scheme = f"grippers 16 / 45 served {gripper_range}"
+        elif gripper_scheme == "statistics":
+            scheme = f"grippers 16 / 45 by statistics, rot6d {rotation} (2026-09-20 scheme)"
+        elif gripper_scheme == "identity":
+            scheme = f"grippers 16 / 45 identity, rot6d {rotation} (Sana 41cf94114 scheme)"
+        else:
+            scheme = "grippers 16 / 45 identity (pre-2026-09-20 scheme)"
         if problems:
             print("[SANA_WAM] WARNING normalization layout does not match the ARX-X5 contract: " + "; ".join(problems))
         else:
