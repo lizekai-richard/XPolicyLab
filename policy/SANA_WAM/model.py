@@ -139,6 +139,21 @@ def _optional_int(value: Any) -> Optional[int]:
     return None if number is None else int(number)
 
 
+def _optional_bool(value: Any) -> Optional[bool]:
+    """null / auto -> None (the session decides); true / false (bool or text) -> that value."""
+
+    if value is None or isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"", "none", "null", "auto"}:
+        return None
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"expected true, false or auto, got {value!r}")
+
+
 def derive_diffusion_seed(seed_base: int, eval_seed: int, episode_index: int, chunk_index: int) -> int:
     """Deterministic per-(eval seed, episode, chunk) seed: sha256 of the four integers, 53-bit."""
 
@@ -268,6 +283,9 @@ class Model(ModelTemplate):
             # how each view reaches its bucket: null = the yaml's robot_sft.view_resize, else stretch (the only SFT resize
             # since rwm/zekai-merge 1061b16f0); crop = the legacy resize of every checkpoint trained before it
             view_resize=cfg.get("view_resize"),
+            # condition-causal checkpoints only (rwm/zekai-merge f6a257d4a, recognised by their GDN recurrence):
+            # null/auto = on, the condition chunk once per decision and caption stream (Sana 89eaa78f6)
+            condition_prefix_cache=_optional_bool(cfg.get("condition_prefix_cache")),
             expected_normalization_sha256=cfg.get("normalization_sha256") or None,
             # per-stream guidance: null inherits cfg_scale; action_cfg_scale=1 with cfg_scale>1 guides the video only
             video_cfg_scale=_optional_float(cfg.get("video_cfg_scale")),
@@ -306,6 +324,14 @@ class Model(ModelTemplate):
             + f" visual_layout={self.visual_layout} state_as_cross_attention={self.state_as_cross_attention}"
             + f" view_resize={getattr(self.session, 'view_resize', 'stretch')} ({getattr(self.session, 'view_resize_source', 'default')})"
             + f" sana_pixel_pad={getattr(self.session, 'sana_pixel_pad', 'unmasked')}"
+            + f" attention={getattr(self.session, 'attention_form', 'bidirectional')}"
+            + (
+                f" condition_prefix_cache={self.session.condition_prefix_cache}"
+                f" state_cross_attention={getattr(self.model, 'state_cross_attention', False)}"
+                f" gdn_output_normalizer={getattr(getattr(self.model, 'policy_config', None), 'gdn_output_normalizer', True)}"
+                if getattr(self.session, "attention_form", "bidirectional") == "condition_causal"
+                else ""
+            )
             + f" video_fps={getattr(self.session, 'video_fps', None)}"
             + f" video_frame_stride={getattr(self.session, 'video_frame_stride', 1)}"
             + f" multiview={declared_multiview(self.train_config)}"

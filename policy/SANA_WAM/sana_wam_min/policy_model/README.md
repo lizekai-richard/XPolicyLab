@@ -44,6 +44,21 @@ sequence.
   (LayerNorm + per-token timestep AdaLN + Linear to 80D, masked by
   `action_mask80`).
 
+## Condition-causal form (rwm/zekai-merge f6a257d4a)
+
+`PolicyConfig.condition_causal` swaps every block's self-attention for its
+condition-causal subclass (`condition_chunks.py`, `ConditionChunkGatedDeltaNet`,
+`ConditionChunkGatedSoftmaxAttention`): the condition chunk (latent frame 0 of
+every view and the state row) never reads the prediction chunk (later frames
+and the action rows). The GDN blocks gain the recurrence tensors `gate_proj`,
+`A_log`, `dt_bias` and `recall_gate`, which is how a checkpoint names its form.
+`gdn_output_normalizer` (`model.memory_gdn_output_normalizer`) and
+`state_cross_attention` (`model.extra.state_cross_attention`: the state as one
+caption token of the last text group, no state row) exist only in this form.
+`forward(..., condition_prefix=(ConditionPrefix, PREFILL | TARGET))` runs one
+chunk alone against the other's cached reads (the prefix cache); bit parity with
+the live class: `tests/test_condition_causal_live_parity.py`.
+
 ## What is not modeled
 
 - The camera channel: `plucker_embed` and the CaPE softmax QKVO transform.

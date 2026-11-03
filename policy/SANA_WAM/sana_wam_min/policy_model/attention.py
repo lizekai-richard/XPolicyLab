@@ -20,6 +20,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .condition_chunks import (
+    A_LOG_INIT,
+    DT_BIAS_INIT,
+    TARGET,
+    ConditionPass,
+    chunk_causal_attention,
+    chunk_means,
+    gated_delta_chunk_scan,
+    gated_delta_condition_pass,
+    require_condition_layout,
+)
 from .embeddings import RMSNorm
 
 
@@ -263,6 +274,104 @@ class GatedSoftmaxAttention(_QKVAttentionBase):
         return self.proj(out)
 
 
+class ConditionChunkGatedDeltaNet(GatedDeltaNet):
+    """GatedDeltaNet of the condition-causal policy (Sana condition_chunks.py ``_ConditionChunkGDNMixin``, f6a257d4a):
+    the two-chunk gated delta-rule scan with a per-chunk decay from ``gate_proj`` / ``A_log`` / ``dt_bias`` and a
+    beta-weighted write. Projections, q/k norms, fp64 RoPE, beta, the output norm and gate are the parent's;
+    ``output_normalizer`` False (``model.memory_gdn_output_normalizer``) returns the numerator alone. ``recall_gate``
+    is a persistent buffer the forward does not read (the live class loads and saves it)."""
+
+    def __init__(self, *args, output_normalizer: bool = True, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.output_normalizer = bool(output_normalizer)
+        self.gate_proj = nn.Linear(self.in_dim, self.heads, bias=True)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.zeros_(self.gate_proj.bias)
+        self.A_log = nn.Parameter(torch.full((self.heads,), A_LOG_INIT))
+        self.dt_bias = nn.Parameter(torch.full((self.heads,), DT_BIAS_INIT))
+        self.register_buffer("recall_gate", torch.zeros(1), persistent=True)
+
+    def _chunk_decay(self, x: torch.Tensor, slices) -> torch.Tensor:
+        """Per-chunk decay ``[B, H, M]`` from the chunk mean of ``gate_proj`` over chunk-major ``x``."""
+
+        gate = chunk_means(self.gate_proj(x), slices).float()
+        decay = (-self.A_log.float().exp() * F.softplus(gate + self.dt_bias.float())).exp()
+        return decay.transpose(1, 2)
+
+    def forward(self, x: torch.Tensor, rotary_emb: torch.Tensor | None = None, chunk_layout=None) -> torch.Tensor:
+        layout = require_condition_layout(chunk_layout)
+        batch, tokens, channels = x.shape
+        if tokens != layout.num_tokens:
+            raise ValueError(f"linear attention has {tokens} tokens, the condition layout covers {layout.num_tokens}")
+        q, k, v = self.qkv(x).reshape(batch, tokens, 3, channels).unbind(2)
+        dtype = q.dtype
+
+        def head_major(tensor):
+            return tensor.transpose(-1, -2).reshape(batch, channels // self.dim, self.dim, tokens)
+
+        q = head_major(self.q_norm(q))
+        k = head_major(self.k_norm(k))
+        if rotary_emb is None:
+            q_num, k_num = q, k
+        else:
+            q_num, k_num = apply_rotary_emb_fp64(q, rotary_emb), apply_rotary_emb_fp64(k, rotary_emb)
+        v = v.transpose(-1, -2).reshape(batch, channels // self.dim, self.dim, tokens)
+        order = layout.order
+
+        def chunk_major(tensor):
+            return tensor.transpose(-1, -2).index_select(2, order)
+
+        normalizer = self.output_normalizer
+        q_den = chunk_major(self.kernel_func(q)) if normalizer else None
+        k_den = chunk_major(self.kernel_func(k)) if normalizer else None
+        beta = torch.sigmoid(self.beta_proj(x)).transpose(1, 2).index_select(2, order)
+        slices = layout.slices()
+        decay = self._chunk_decay(x.index_select(1, order), slices)
+        if isinstance(layout, ConditionPass):
+            reads = (chunk_major(q_num), chunk_major(k_num), chunk_major(v), q_den, k_den, beta, decay, self.eps)
+            if layout.phase == TARGET:
+                out = gated_delta_condition_pass(*reads, normalizer=normalizer, state=layout.cache.load(self))
+            else:
+                out, written = gated_delta_condition_pass(*reads, normalizer=normalizer)
+                layout.cache.store(self, written)
+            out = out.to(dtype)
+        else:
+            out = gated_delta_chunk_scan(
+                chunk_major(q_num), chunk_major(k_num), chunk_major(v), q_den, k_den, beta, decay, slices, self.eps,
+                normalizer=normalizer,
+            ).to(dtype)
+        out = out.index_select(2, layout.restore).transpose(-1, -2)
+        out = self.o_norm(out).reshape(batch, channels, tokens).transpose(1, 2)
+        return self.proj(out * torch.sigmoid(self.output_gate(x)))
+
+
+class ConditionChunkGatedSoftmaxAttention(GatedSoftmaxAttention):
+    """Softmax attention whose queries read only their own and earlier chunks (Sana condition_chunks.py
+    ``_ConditionChunkSoftmaxMixin``): under a prefix-cache pass the condition chunk stores its keys and values and the
+    prediction chunk reads them ahead of its own."""
+
+    _condition_layout = None
+
+    def forward(self, x: torch.Tensor, rotary_emb: torch.Tensor | None = None, chunk_layout=None) -> torch.Tensor:
+        self._condition_layout = require_condition_layout(chunk_layout)
+        try:
+            return super().forward(x, rotary_emb=rotary_emb)
+        finally:
+            self._condition_layout = None
+
+    def _run_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        layout = self._condition_layout
+        if layout is None:  # the chunk calls below run the parent's attention on their slices
+            return super()._run_attention(q, k, v)
+        if isinstance(layout, ConditionPass):
+            if layout.phase == TARGET:
+                keys, values = layout.cache.load(self)
+                return super()._run_attention(q, torch.cat((keys, k), dim=1), torch.cat((values, v), dim=1))
+            layout.cache.store(self, (k, v))
+        parent = super()._run_attention
+        return chunk_causal_attention(parent, q, k, v, layout)
+
+
 class MultiHeadCrossAttention(nn.Module):
     """Text cross-attention over one text block or per-group query spans."""
 
@@ -450,6 +559,8 @@ class MultiHeadCrossAttention(nn.Module):
 
 
 __all__ = [
+    "ConditionChunkGatedDeltaNet",
+    "ConditionChunkGatedSoftmaxAttention",
     "GatedDeltaNet",
     "GatedSoftmaxAttention",
     "MultiHeadCrossAttention",

@@ -11,6 +11,7 @@ import torch.nn as nn
 from .attnres import BlockAttnResV2
 from .block import PolicyBlock
 from .checkpoint import load_policy_state_dict
+from .condition_chunks import ConditionChunkLayout, ConditionPass, condition_chunk_layout
 from .config import PolicyConfig
 from .embeddings import (
     ActionFinalLayer,
@@ -126,6 +127,10 @@ class PolicyModel(nn.Module):
         )
         self.shared_prompt = bool(config.shared_prompt)
         self.state_as_cross_attention = bool(config.state_as_cross_attention)
+        # rwm/zekai-merge f6a257d4a / 8e0639b16 (the one policy class): condition-causal self-attention, and the anchor
+        # state as one caption token closing the last text group instead of a state row
+        self.condition_causal = bool(config.condition_causal)
+        self.state_cross_attention = bool(config.state_cross_attention)
         self.rope_mode = config.rope
         self.legacy_strided_action_origin = int(config.legacy_strided_action_origin)
         self.use_xformers_cross_attention = False
@@ -174,6 +179,8 @@ class PolicyModel(nn.Module):
                 linear_head_dim=config.linear_head_dim,
                 softmax_head_dim=config.softmax_head_dim,
                 fp32_attention=config.fp32_attention,
+                condition_causal=config.condition_causal,
+                gdn_output_normalizer=config.gdn_output_normalizer,
             )
             for kind in self.block_attn_types
         )
@@ -330,7 +337,7 @@ class PolicyModel(nn.Module):
             )
 
         action = action.to(dtype=video.dtype)
-        if self.state_as_cross_attention:
+        if self.state_as_cross_attention or self.state_cross_attention:
             return self.action_embed(action, action_mask), action_steps
         state = data_info["initial_state80"].to(video.device)
         state_mask = data_info["initial_state_condition_mask80"].to(video.device)
@@ -428,10 +435,12 @@ class PolicyModel(nn.Module):
                 (video, _independent_action_rope(rope, action_steps, batch, device)), dim=2
             )
         if mode == "independent":
+            actions = independent_action_rope(rope, action_steps, batch, device, first_position=first_action)
+            if self.state_cross_attention:  # no state row; the actions keep their positions
+                return torch.cat((video, actions), dim=2)
             state = rope.from_position_ids(
                 torch.zeros(batch, 1, 3, device=device, dtype=torch.float64)
             )
-            actions = independent_action_rope(rope, action_steps, batch, device, first_position=first_action)
             return torch.cat((video, state, actions), dim=2)
         action_ids = torch.arange(
             1, action_steps + 1, device=device, dtype=torch.float64
@@ -452,6 +461,8 @@ class PolicyModel(nn.Module):
             ),
             dim=-1,
         )
+        if self.state_cross_attention:  # sana_qwennext_pretrain.py _robot_rope: the actions on the same instants
+            condition_ids = condition_ids[:, 1:]
         return torch.cat((video, rope.from_position_ids(condition_ids)), dim=2)
 
     def _grouped_text_condition(
@@ -484,7 +495,7 @@ class PolicyModel(nn.Module):
         modes since 2026-09-22, sana_qwennext_camera_condition.py
         ``_shared_or_grouped_spans``, kernel/policy/model.py)."""
 
-        state_slots = 0 if self.state_as_cross_attention else 1
+        state_slots = 0 if (self.state_as_cross_attention or self.state_cross_attention) else 1
         total = sum(int(count) for count in view_token_counts) + state_slots + int(action_steps)
         if self.shared_prompt:
             return ((0, total),)
@@ -529,6 +540,50 @@ class PolicyModel(nn.Module):
         new_mask_column[:, -1, 0] = 1
         return text, torch.cat((base_mask, new_mask_column), dim=2)
 
+    def _append_state_text(self, text, text_mask, data_info: dict):
+        """Close the last text group with the anchor state as one caption token (``state_cross_attention``,
+        sana_qwennext_camera_condition.py ``_append_state_text``, 8e0639b16): ``state_embed`` (the state row's
+        projector) then the caption y-norm; every other group gets a masked pad slot. ``[B,G,L,C]`` -> ``[B,G,L+1,C]``
+        with a ``[B,G,L+1]`` int16 key mask."""
+
+        batch, groups, length, hidden = text.shape
+        state = data_info["initial_state80"].reshape(batch, -1).to(device=text.device, dtype=self.dtype)
+        state_mask = data_info["initial_state_condition_mask80"].reshape(batch, -1).to(device=text.device, dtype=torch.bool)
+        token = self.attention_y_norm(self.state_embed(state, state_mask))
+        slot = torch.cat((text.new_zeros(batch, groups - 1, 1, hidden), token.to(text.dtype)[:, None, None]), dim=1)
+        if text_mask is None:
+            text_mask = torch.ones(batch, groups, length, dtype=torch.int16, device=text.device)
+        state_key = torch.zeros(batch, groups, 1, dtype=text_mask.dtype, device=text.device)
+        state_key[:, -1] = 1
+        return torch.cat((text, slot), dim=2), torch.cat((text_mask, state_key), dim=2)
+
+    def _condition_layout(
+        self, view_shapes, action_steps: int, real_tokens: torch.Tensor | None, device: torch.device
+    ) -> ConditionChunkLayout | None:
+        """The condition layout of this batch (sana_qwennext_action_policy.py ``_condition_chunk_layout``), None for a
+        bidirectional model: frame-0 latents of every view (and the state row) in the condition chunk, every later
+        latent frame and the action rows in the prediction chunk. Cached per grid, rows and device."""
+
+        if not self.condition_causal:
+            return None
+        masked = real_tokens is not None
+        key = (self.f, tuple(view_shapes), masked, int(action_steps), self.state_cross_attention, str(device))
+        cache = self.__dict__.setdefault("_condition_layout_cache", {})
+        layout = cache.get(key)
+        if layout is None:
+            if masked:
+                (height, width), = view_shapes
+                frame_ids = real_tokens.cpu() // (height * width)
+            else:
+                frame_ids = torch.cat(
+                    [torch.arange(self.f).repeat_interleave(height * width) for height, width in view_shapes]
+                )
+            layout = condition_chunk_layout(
+                frame_ids, int(action_steps), state_row=not self.state_cross_attention, device=device
+            )
+            cache[key] = layout
+        return layout
+
     @torch.no_grad()
     def _forward_trunk(
         self,
@@ -539,6 +594,7 @@ class PolicyModel(nn.Module):
         prompt_group_spans,
         rope_linear,
         rope_softmax,
+        chunk_layout=None,
     ) -> torch.Tensor:
         block_size = self.attn_res_block_size
         num_blocks = math.ceil(len(self.blocks) / block_size)
@@ -577,6 +633,7 @@ class PolicyModel(nn.Module):
                     text_mask=text_mask,
                     rotary_emb=rope,
                     prompt_group_spans=prompt_group_spans,
+                    chunk_layout=chunk_layout,
                 )
                 partial = attn_delta if partial is None else partial + attn_delta
                 hidden = self.attn_res._attend_buffer(
@@ -604,6 +661,40 @@ class PolicyModel(nn.Module):
             n_active,
             None,
         )
+
+    def _forward_condition_pass(
+        self, condition_prefix, layout, tokens, text, modulation, text_mask, spans, rope_linear, rope_softmax
+    ) -> torch.Tensor:
+        """One prefix-cache pass (sana_qwennext_action_policy.py ``_condition_pass_inputs`` / ``_grouped_text_routing``
+        / ``_condition_pass_output``, Sana 89eaa78f6): ``condition_prefix = (ConditionPrefix, phase)`` runs the
+        condition chunk alone and writes its per-layer reads (``PREFILL``) or the prediction chunk alone against them
+        (``TARGET``). The trunk's per-token inputs (hidden, modulation, RoPE tables) are cut to the pass's tokens in
+        model order, every text group's span is cut to it and a group without a token in the pass is dropped with its
+        text (the robot group of a prefill under ``state_cross_attention``); the output is scattered back to the full
+        token order, zero on the skipped tokens (no prediction there)."""
+
+        if layout is None:
+            raise ValueError("the condition prefix cache serves the condition-causal policy only")
+        cache, phase = condition_prefix
+        passed = ConditionPass(layout, phase, cache)
+        keep = passed.keep
+        cut = [passed.kept(offset, length) for offset, length in spans]
+        groups = [group for group, (_offset, length) in enumerate(cut) if length]
+        if len(groups) < len(cut):
+            text = torch.cat([text[:, group : group + 1] for group in groups], dim=1)
+            if text_mask is not None:
+                text_mask = torch.cat([text_mask[:, group : group + 1] for group in groups], dim=1)
+        hidden = self._forward_trunk(
+            tokens.index_select(1, keep),
+            text,
+            modulation.index_select(2, keep),
+            text_mask,
+            tuple(cut[group] for group in groups),
+            rope_linear.index_select(2, keep),
+            rope_softmax.index_select(2, keep),
+            chunk_layout=passed,
+        )
+        return hidden.new_zeros(hidden.shape[0], passed.full_tokens, hidden.shape[-1]).index_copy(1, keep, hidden)
 
     def _sana_pixel_real_tokens(self, num_views: int, device: torch.device) -> torch.Tensor | None:
         """The real canvas cells' positions in the video token order under ``sana_pixel_pad: masked``, else None
@@ -730,7 +821,7 @@ class PolicyModel(nn.Module):
         action_timestep = self._to_model_t_domain(
             self._action_timesteps(data_info, batch, action_steps, x.device)
         )
-        if self.state_as_cross_attention:
+        if self.state_as_cross_attention or self.state_cross_attention:
             # no clean state token in the tail: the robot rows are the action rows only
             token_timestep = torch.cat((video_timestep, action_timestep), dim=1).unsqueeze(1)
         else:
@@ -770,15 +861,19 @@ class PolicyModel(nn.Module):
             )
         if self.state_as_cross_attention:
             text, text_mask = self._splice_state_context(text, text_mask, data_info)
-        tokens = self._forward_trunk(
-            tokens,
-            text,
-            modulation,
-            text_mask,
-            self._prompt_group_spans(view_token_counts, action_steps, int(text.shape[1])),
-            rope_linear,
-            rope_softmax,
-        )
+        if self.state_cross_attention:
+            text, text_mask = self._append_state_text(text, text_mask, data_info)
+        spans = self._prompt_group_spans(view_token_counts, action_steps, int(text.shape[1]))
+        layout = self._condition_layout(view_shapes, action_steps, real_tokens, x.device)
+        condition_prefix = kwargs.get("condition_prefix")
+        if condition_prefix is None:
+            tokens = self._forward_trunk(
+                tokens, text, modulation, text_mask, spans, rope_linear, rope_softmax, chunk_layout=layout
+            )
+        else:
+            tokens = self._forward_condition_pass(
+                condition_prefix, layout, tokens, text, modulation, text_mask, spans, rope_linear, rope_softmax
+            )
 
         video_tokens = self.final_layer(
             tokens[:, :n_video], time_embedding[:, :, :n_video]
@@ -789,7 +884,8 @@ class PolicyModel(nn.Module):
             ).index_copy(1, real_tokens, video_tokens)
         video_tokens = view_to_strip_tokens(video_tokens, self.f, view_shapes)
         action_mask = data_info["action_mask80"].to(tokens.device)
-        offset = 0 if self.state_as_cross_attention else 1  # the state token precedes the action rows
+        # the state token precedes the action rows (none under either state-as-text option)
+        offset = 0 if (self.state_as_cross_attention or self.state_cross_attention) else 1
         action_pred = self.action_head(
             tokens[:, n_video + offset :], time_embedding[:, :, n_video + offset :]
         ).masked_fill(~action_mask, 0)

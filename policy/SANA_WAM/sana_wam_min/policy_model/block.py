@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 
 from .attention import (
+    ConditionChunkGatedDeltaNet,
+    ConditionChunkGatedSoftmaxAttention,
     GatedDeltaNet,
     GatedSoftmaxAttention,
     MultiHeadCrossAttention,
@@ -31,6 +33,8 @@ class PolicyBlock(nn.Module):
         linear_head_dim: int,
         softmax_head_dim: int,
         fp32_attention: bool,
+        condition_causal: bool = False,
+        gdn_output_normalizer: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -38,16 +42,23 @@ class PolicyBlock(nn.Module):
         self.norm1 = nn.LayerNorm(
             hidden_size, elementwise_affine=False, eps=1e-6
         )
+        # condition-causal (rwm/zekai-merge f6a257d4a): the live policy swaps every self-attention for its
+        # ``[obs; state] | [prediction; actions]`` subclass (condition_chunks.py); the GDN layers gain the recurrence
+        self.condition_causal = bool(condition_causal)
+        linear_cls = ConditionChunkGatedDeltaNet if self.condition_causal else GatedDeltaNet
+        softmax_cls = ConditionChunkGatedSoftmaxAttention if self.condition_causal else GatedSoftmaxAttention
+        linear_kwargs = {"output_normalizer": gdn_output_normalizer} if self.condition_causal else {}
         if attention_kind == "GatedDeltaNet":
-            self.attn = GatedDeltaNet(
+            self.attn = linear_cls(
                 hidden_size,
                 hidden_size,
                 heads=hidden_size // linear_head_dim,
                 eps=1e-8,
                 fp32_attention=fp32_attention,
+                **linear_kwargs,
             )
         elif attention_kind == "GatedSoftmaxAttention":
-            self.attn = GatedSoftmaxAttention(
+            self.attn = softmax_cls(
                 hidden_size,
                 hidden_size,
                 heads=hidden_size // softmax_head_dim,
@@ -82,8 +93,11 @@ class PolicyBlock(nn.Module):
         text_mask=None,
         rotary_emb=None,
         prompt_group_spans=None,
+        chunk_layout=None,
     ) -> torch.Tensor:
         """Return self-attention plus text cross-attention delta.
+
+        ``chunk_layout`` is the condition layout (or a prefix-cache pass) of a condition-causal block, None otherwise.
 
         ``text`` is ``[B,G,L,C]`` with ``text_mask`` ``[B,G,L]`` when
         ``prompt_group_spans`` routes one text group per query span; without
@@ -107,10 +121,13 @@ class PolicyBlock(nn.Module):
         attention_input = t2i_modulate(normalized, shift, scale).reshape(
             batch, tokens, channels
         )
-        self_attention = self.attn(
-            attention_input,
-            rotary_emb=rotary_emb,
-        ).reshape(batch, token_count, -1, channels)
+        if self.condition_causal:
+            self_attention = self.attn(attention_input, rotary_emb=rotary_emb, chunk_layout=chunk_layout)
+        elif chunk_layout is not None:
+            raise ValueError("a bidirectional block takes no condition layout")
+        else:
+            self_attention = self.attn(attention_input, rotary_emb=rotary_emb)
+        self_attention = self_attention.reshape(batch, token_count, -1, channels)
         self_delta = (gate * self_attention).reshape(batch, tokens, channels)
         cross_delta = self.cross_attn(
             hidden_states + self_delta,

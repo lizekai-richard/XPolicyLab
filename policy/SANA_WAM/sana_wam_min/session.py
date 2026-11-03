@@ -28,7 +28,12 @@ import numpy as np
 import torch
 
 from .actions import model_action_to_absolute
-from .checkpoint import build_policy_model, load_policy_weights, resolve_checkpoint_file
+from .checkpoint import (
+    build_policy_model,
+    checkpoint_is_condition_causal,
+    load_policy_weights,
+    resolve_checkpoint_file,
+)
 from .config import (
     CANVAS_LAYOUTS,
     ROBOT_BASE_EEF_FULL,
@@ -43,6 +48,8 @@ from .config import (
     load_train_config,
     policy_config_from_train_config,
     sana_pixel_pad_from_train_config,
+    state_cross_attention_from_train_config,
+    gdn_output_normalizer_from_train_config,
     view_resize_from_train_config,
     resolve_canvas_text_contract,
     resolve_rope_contract,
@@ -299,6 +306,7 @@ class PolicyInferenceSession:
         robot_base_eef_layout: Optional[str] = None,
         action_flow_shift: Optional[float] = None,
         view_resize: Optional[str] = None,
+        condition_prefix_cache: Optional[bool] = None,
     ) -> None:
         self.model = model
         self.vae = vae
@@ -320,6 +328,15 @@ class PolicyInferenceSession:
         # model.extra.sana_pixel_pad (zekai-merge 319d3f666): masked drops the canvas's black quadrant from the model's
         # token sequence (PolicyModel.forward); the observation canvas itself is built exactly as for unmasked
         self.sana_pixel_pad = sana_pixel_pad_from_train_config(train_config)
+        # rwm/zekai-merge f6a257d4a: condition-causal ([obs; state] | [prediction; actions]) or bidirectional (every
+        # checkpoint trained up to 46657d0c1), from the model the checkpoint built; the condition prefix cache (Sana
+        # 89eaa78f6) runs the condition chunk once per decision and caption stream -- default on for a condition-causal
+        # model, equal to the full forward up to rounding; refused for a bidirectional one
+        condition_causal = bool(getattr(model, "condition_causal", False))
+        self.attention_form = "condition_causal" if condition_causal else "bidirectional"
+        if condition_prefix_cache and not condition_causal:
+            raise ValueError("condition_prefix_cache serves the condition-causal policy only; this checkpoint is bidirectional")
+        self.condition_prefix_cache = condition_causal if condition_prefix_cache is None else bool(condition_prefix_cache)
         self.checkpoint_path = checkpoint_path
         self.image_size = int(train_config["model"]["image_size"])
         self.multi_fps = train_config["data"].get("multi_fps") or None
@@ -409,6 +426,7 @@ class PolicyInferenceSession:
         robot_base_eef_layout: Optional[str] = None,
         action_flow_shift: Optional[float] = None,
         view_resize: Optional[str] = None,
+        condition_prefix_cache: Optional[bool] = None,
     ) -> "PolicyInferenceSession":
         """Load every component from disk: train yaml -> normalization -> bf16 model + weights -> VAE -> Gemma.
 
@@ -421,7 +439,19 @@ class PolicyInferenceSession:
         config_path = find_train_config(checkpoint_dir)
         train_cfg = load_train_config(str(config_path))
         rope, legacy_origin, rope_label = resolve_rope_contract(train_cfg, rope_mode)
-        policy_config = policy_config_from_train_config(train_cfg, rope=rope, legacy_origin=legacy_origin)
+        # rwm/zekai-merge f6a257d4a: no yaml switch -- the checkpoint's GDN recurrence tensors name the attention form
+        condition_causal = checkpoint_is_condition_causal(str(checkpoint_dir))
+        if not condition_causal and (
+            state_cross_attention_from_train_config(train_cfg) or not gdn_output_normalizer_from_train_config(train_cfg)
+        ):
+            raise ValueError(
+                "the training yaml sets model.extra.state_cross_attention / model.memory_gdn_output_normalizer false, the "
+                "condition-causal policy's options, but the checkpoint's GatedDeltaNet blocks carry no condition recurrence "
+                "(a bidirectional checkpoint): refusing the mismatch"
+            )
+        policy_config = policy_config_from_train_config(
+            train_cfg, rope=rope, legacy_origin=legacy_origin, condition_causal=condition_causal
+        )
         # the text contract is resolved (and refused) before the multi-minute weight load
         resolve_canvas_text_contract(train_cfg, text_groups, canvas_prompt)
         steps, cfg_scale, flow_shift = resolve_sampling_knobs(train_cfg, steps, cfg_scale, flow_shift)
@@ -454,6 +484,7 @@ class PolicyInferenceSession:
             robot_base_eef_layout=robot_base_eef_layout,
             action_flow_shift=action_flow_shift,
             view_resize=view_resize,
+            condition_prefix_cache=condition_prefix_cache,
         )
         session.load_report = load_report
         session.rope_contract = rope_label
@@ -655,6 +686,7 @@ class PolicyInferenceSession:
                 action_cfg_scale=self.action_cfg_scale,
                 gripper_bounds=normalized_gripper_bounds(self.normalization),
                 action_flow_shift=self.action_flow_shift,
+                prefix_cache=self.condition_prefix_cache,
             )
 
     @torch.inference_mode()
@@ -699,6 +731,7 @@ class PolicyInferenceSession:
             "flow_shift": self.flow_shift,
             "action_flow_shift": self.action_flow_shift,
             "view_resize": self.view_resize, "sana_pixel_pad": self.sana_pixel_pad,
+            "attention": self.attention_form, "condition_prefix_cache": self.condition_prefix_cache,
             "seed": None if generator is None else int(generator.initial_seed()),
             "latency_ms": (time.perf_counter() - start) * 1000.0,
             "checkpoint": self.checkpoint_path,

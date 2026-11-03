@@ -15,6 +15,7 @@ from typing import Any
 import torch
 
 from .policy_model.checkpoint import load_policy_state_dict, strip_unmodeled_state
+from .policy_model.condition_chunks import GDN_RECURRENCE_KEYS
 from .policy_model.config import PolicyConfig
 from .policy_model.model import PolicyModel, build_policy
 
@@ -27,6 +28,30 @@ def resolve_checkpoint_file(checkpoint_dir_or_file: str) -> str:
     if os.path.isdir(checkpoint_dir_or_file):
         return os.path.join(checkpoint_dir_or_file, CHECKPOINT_RELATIVE_PATH)
     return checkpoint_dir_or_file
+
+
+def checkpoint_is_condition_causal(checkpoint_dir_or_file: str) -> bool:
+    """Whether the checkpoint was trained with the condition-causal policy (rwm/zekai-merge f6a257d4a, no yaml switch):
+    its GatedDeltaNet blocks carry the chunk recurrence (``attn.gate_proj`` / ``A_log`` / ``dt_bias`` /
+    ``recall_gate``), which every bidirectional checkpoint (trained up to 46657d0c1) lacks. A checkpoint carrying the
+    recurrence on some linear blocks but not all is refused. Reads the key names only (memory-mapped)."""
+
+    path = resolve_checkpoint_file(checkpoint_dir_or_file)
+    payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    state = payload.get("state_dict", payload)
+    keys = {k.removeprefix("module.") for k in state}
+    linear = sorted({key.split(".")[1] for key in keys if key.startswith("blocks.") and key.endswith(".attn.beta_proj.weight")})
+    if not linear:
+        raise ValueError(f"{path}: no GatedDeltaNet block (attn.beta_proj) found")
+    carriers = [
+        block for block in linear
+        if all(f"blocks.{block}.attn.{name}" in keys for name in GDN_RECURRENCE_KEYS)
+    ]
+    if carriers and len(carriers) != len(linear):
+        raise ValueError(
+            f"{path}: {len(carriers)} of {len(linear)} GatedDeltaNet blocks carry the condition-causal recurrence"
+        )
+    return bool(carriers)
 
 
 def build_policy_model(
@@ -121,6 +146,7 @@ def load_policy_weights(
 __all__ = [
     "CHECKPOINT_RELATIVE_PATH",
     "build_policy_model",
+    "checkpoint_is_condition_causal",
     "load_policy_weights",
     "resolve_checkpoint_file",
 ]

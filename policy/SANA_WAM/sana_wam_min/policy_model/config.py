@@ -134,6 +134,17 @@ class PolicyConfig:
     # quadrant cells from the token sequence right after x_embedder (their timesteps and RoPE rows with them) and returns
     # velocity 0 there; only the one bidirectional policy class defines it (sana_qwennext_action_policy.py).
     sana_pixel_pad: str = "unmasked"
+    # Condition-causal self-attention (rwm/zekai-merge f6a257d4a, no yaml switch: every checkpoint trained from that
+    # commit on, recognised by its GatedDeltaNet recurrence tensors): ``[obs; state] | [prediction latents; actions]``,
+    # the condition chunk never reads the prediction (condition_chunks.py). False = the bidirectional forward of every
+    # checkpoint trained up to 46657d0c1.
+    condition_causal: bool = False
+    # ``model.memory_gdn_output_normalizer`` (condition-causal only): False reads the GDN numerator alone
+    gdn_output_normalizer: bool = True
+    # ``model.extra.state_cross_attention`` (8e0639b16, condition-causal only): the anchor state reaches the policy as
+    # one caption token closing the last text group (``state_embed`` then the caption y-norm) instead of a state row;
+    # the robot tail holds the action rows alone on their usual instants and the condition chunk the frame-0 latents
+    state_cross_attention: bool = False
 
     def validate(self) -> "PolicyConfig":
         _require("patch_size", tuple(self.patch_size), (1, 1, 1))
@@ -179,6 +190,13 @@ class PolicyConfig:
         _require_one_of("sana_pixel_pad", self.sana_pixel_pad, SANA_PIXEL_PAD_MODES)
         if self.sana_pixel_pad == "masked" and (self.shared_prompt or self.state_as_cross_attention):
             raise ValueError("sana_pixel_pad masked is implemented by the bidirectional policy only, not the canvas class")
+        if not self.condition_causal and (not self.gdn_output_normalizer or self.state_cross_attention):
+            raise ValueError(
+                "model.memory_gdn_output_normalizer false and model.extra.state_cross_attention belong to the "
+                "condition-causal policy (rwm/zekai-merge f6a257d4a / 8e0639b16); this checkpoint is bidirectional"
+            )
+        if self.condition_causal and (self.shared_prompt or self.state_as_cross_attention):
+            raise ValueError("condition-causal attention belongs to the one policy class, not the OpenWAM canvas class")
         if self.state_as_cross_attention and not self.shared_prompt:
             # the live model defines the opt-in only on the canvas policy, whose prompt is shared (G = 1)
             raise ValueError(
@@ -254,6 +272,19 @@ class PolicyConfig:
             )
         )
 
+        # the condition-causal options are read from the config only for a condition-causal model: the memory policies'
+        # adapters (SANA_WAM_CAUSAL, SANA_WAM_SM) resolve their trunk through this config with yaml keys of the same names
+        condition_causal = bool(kwargs.get("condition_causal", False))
+        state_cross_attention = kwargs.get(
+            "state_cross_attention", _value(model_extra, "state_cross_attention", None) if condition_causal else None
+        )
+        if state_cross_attention is not None and not isinstance(state_cross_attention, bool):
+            raise ValueError(f"model.extra.state_cross_attention={state_cross_attention!r}: must be true or false")
+        gdn_output_normalizer = kwargs.get(
+            "memory_gdn_output_normalizer",
+            _value(model_cfg, "memory_gdn_output_normalizer", True) if condition_causal else True,
+        )
+
         resolved = cls(
             input_size=int(kwargs.get("input_size", 32)),
             patch_size=tuple(kwargs.get("patch_size", cls.patch_size)),
@@ -315,6 +346,9 @@ class PolicyConfig:
                 _value(_value(config, "scheduler"), key) is not None
                 for key in ("action_flow_shift", "inference_action_flow_shift")
             ),
+            condition_causal=condition_causal,
+            gdn_output_normalizer=bool(gdn_output_normalizer),
+            state_cross_attention=bool(state_cross_attention),
         )
         return resolved.validate()
 

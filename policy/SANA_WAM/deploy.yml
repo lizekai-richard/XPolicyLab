@@ -45,6 +45,12 @@ action_flow_shift: null
 # trained before those commits: serve those with view_resize: crop (the RoboDojo eval worker does so for every label in
 # its pre_stretch_labels.txt). A value that contradicts a declared yaml key is refused.
 view_resize: null
+# Condition-causal checkpoints only (rwm/zekai-merge f6a257d4a, from 2026-11-01 on; recognised by the GatedDeltaNet
+# recurrence tensors, the yaml has no switch; every older checkpoint is served bidirectionally as before): the condition
+# chunk [obs; state] never reads the prediction, so null/auto runs it once per decision and caption stream and every
+# denoising step the prediction chunk alone (Sana 89eaa78f6) -- equal to the full forward up to rounding. false runs the
+# full forward every step.
+condition_prefix_cache: null
 # Targets returned per inference: null/0/all -> the whole predicted chunk (24 joint targets for the 25-frame tier);
 # a positive n returns only the first n, so the RoboDojo loop executes n control ticks, re-observes and asks for a
 # new chunk (receding-horizon replanning every n ticks; inferences per episode grow by chunk/n).

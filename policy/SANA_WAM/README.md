@@ -129,6 +129,42 @@ prints `sana_pixel_pad=`); 320x480 (a quadrant edge inside a latent cell) is ref
 live forward of the padmask checkpoints' tree (masked and unmasked, tiny and 10 x 16 grids):
 `tests/test_sana_pixel_pad_mask_parity.py` (`SANA_PADMASK_REPO`, run on its own).
 
+### Condition-causal memory-less policy (Sana rwm/zekai-merge f6a257d4a / 8e0639b16 / 89eaa78f6)
+
+From f6a257d4a (2026-11-01) the one policy class is condition-causal, with no yaml switch: self-attention runs two
+chunks, `[obs; state] | [prediction latents; actions]`. Chunk 0 holds latent frame 0 of every view and the state row,
+chunk 1 every later latent frame and the action rows; each chunk reads itself and the earlier chunk, so the condition
+never reads the noisy prediction. Softmax layers attend over the chunk key prefixes; GatedDeltaNet layers run the
+two-chunk gated delta-rule scan with a per-chunk decay (`gate_proj`, `A_log`, `dt_bias`; `recall_gate` is a loaded
+buffer the forward does not read), and `model.memory_gdn_output_normalizer: false` reads the GDN numerator alone.
+`model.extra.state_cross_attention` (8e0639b16) moves the anchor state out of the token sequence: `state_embed` then the
+caption y-norm turn it into one caption token closing the last text group (the robot group, or the one shared prompt of a
+canvas); the robot tail is the action rows alone on their usual instants and the condition chunk the frame-0 latents.
+
+- **Which form serves a checkpoint.** The checkpoint decides, not the yaml: GDN blocks carrying the recurrence tensors
+  are condition-causal (`sana_wam_min/checkpoint.py checkpoint_is_condition_causal`; a checkpoint carrying them on some
+  linear blocks only is refused). Every checkpoint trained up to 46657d0c1 lacks them and is served bidirectionally,
+  exactly as before. The two options are refused on a bidirectional model. The ready log prints `attention=`, and for a
+  condition-causal model `condition_prefix_cache=`, `state_cross_attention=` and `gdn_output_normalizer=`.
+- **Condition prefix cache** (deploy key `condition_prefix_cache`, default on for a condition-causal model). The
+  condition never reads the prediction and its timestep is 0, so a decision runs the condition chunk once per caption
+  stream before the first step and every denoising step runs the prediction chunk alone against its per-layer reads (a
+  softmax layer's keys and values, a GDN layer's state after the condition's write). This is the full forward
+  re-ordered, equal up to rounding; with frame 0 half of the f33fps8 video tokens it saves a large share of each step.
+  `false` runs the full forward every step.
+- **Grippers** (41cf94114): artifacts built from that commit on keep the grippers identity (mask off, stamp
+  `gripper_normalization: identity`), so the model sees the closedness in [0, 1]. The artifact's own masks already
+  decide this; nothing to set.
+- **Tests:**
+  - `tests/test_condition_causal_live_parity.py` (`SANA_CONDITION_REPO`, default worktree
+    `~/zekail/Sana_zekai_merge_6de2454dc`, run on its own): bit parity with the live class on the sana latent strip
+    and the sana pixel canvas (unmasked and masked), both RoPE contracts, with and without `state_cross_attention`
+    and the numerator-only readout. It also checks that the condition's velocity ignores the prediction, that the
+    cached prediction pass equals the live one bit for bit, and that the cached passes equal the full forward in fp64
+    at every noise level.
+  - `tests/test_condition_causal.py`: form detection, refusals, the layout, and the cached sampler against the plain
+    one with and without guidance.
+
 ## Evaluation
 
 ```bash
@@ -175,6 +211,7 @@ The XPolicyLab checkout must live in a parent directory that carries `env_cfg/` 
 | `n_action_steps` | null | joint targets returned per inference. `null` / `0` / `all` returns the whole predicted chunk (24 for the 25-frame tier); a positive `n` returns only its first `n`, so the RoboDojo loop executes `n` control ticks, re-observes and asks for a new chunk -- receding-horizon replanning every `n` ticks at `chunk / n` times the inferences per episode. Values above the chunk length warn once and behave like `all` |
 | `anchor_source` | measured | the joint state the model is conditioned on **and** the anchor its joint deltas are added to (one and the same row in training). `measured` = the evaluator's measured joints (historical behaviour); `last_command` = the last joint target this adapter returned for the previous chunk -- the training corpus records the previous frame's command as the state (`state[i+1] == action[i]`, verified on the public HDF5), so a measured anchor that lags the command it tracks shifts every target of a chunk by that lag; `last_command_clamped` = measured + clip(last_command - measured, +-`anchor_clamp_rad`), a guard against command wind-up under blocking contact. Grippers follow the same source; the first chunk of an episode always uses the measured state; the lag `|last_command - measured|` is printed per chunk in every mode |
 | `trajectory_dump_dir` | null | diagnostic only: directory for a per-episode trajectory dump -- every `update_obs` tick's measured Robot80 joints + grippers (`obs_state`, slots 0-5 / 29-34 / 16 / 45) and, per inference, the measured row, the anchor row and the absolute chunk returned (`chunk_measured`, `chunk_anchor`, `chunk_actions`, `chunk_step` = the tick it was predicted from) as `ep<N>.npz`, rewritten after every chunk and flushed at `reset` / trial end. Leave `null` in evaluations |
+| `condition_prefix_cache` | null (= on) | condition-causal checkpoints only (rwm/zekai-merge f6a257d4a, recognised by their GDN recurrence tensors): run the condition chunk `[obs; state]` once per decision and caption stream and every denoising step on the prediction chunk alone (Sana 89eaa78f6), equal to the full forward up to rounding; `false` runs the full forward every step; refused for a bidirectional checkpoint |
 | `prediction_latent_dir` | null | diagnostic only: directory for the world model's predicted video -- per inference the sampled video latent (fp16, still packed / normalized as in training: `video_latent` [1, C, F, h, W]), the control tick it was predicted at (`tick`), the targets executed (`executed`) and the layout (`view_latent_shapes`, `visual_layout`, `video_frame_stride`) as `ep<E>_env<V>_chunk<C>.npz`. No VAE decode in the timed inference; `tools/decode_prediction_latents.py --attempt-dir <unit>/a<N> --out <dir>` decodes them offline into side-by-side MP4s (per camera: the evaluator's real frame | the predicted frame, one frame every `video_frame_stride` ticks). The RoboDojo worker turns `@ATTEMPT_DIR@` into the unit attempt's directory. Leave `null` in evaluations |
 | `anchor_clamp_rad` | 0.05 | radians; only used by `last_command_clamped` |
 | `state_profile` | auto | `joint_only` / `robot_base_eef` / `auto` (= from the training yaml's `data.extra.action_mode_sample_ratio`). `robot_base_eef` checkpoints are conditioned on the flange (`link6`) pose per arm in the arm's `base_link` frame -- position + column rot6d after the mechanical-E axis remap -- which the adapter derives from the row's joints by URDF forward kinematics (`sana_wam_min/eef.py`, vendored `assets/robotwin2_arx_x5.urdf`), exactly as the corpus was packed (`FK(joint drive target)`) |

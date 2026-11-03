@@ -363,6 +363,26 @@ def state_as_cross_attention_from_train_config(cfg: dict[str, Any]) -> bool:
     return enabled
 
 
+def state_cross_attention_from_train_config(cfg: dict[str, Any]) -> bool:
+    """``model.extra.state_cross_attention`` of the condition-causal policy (rwm/zekai-merge 8e0639b16; default False):
+    the anchor state reaches the policy as one caption token closing the last text group instead of a state row.
+    Only true / false / absent are accepted (sana_qwennext_action_policy.py ``resolve_state_cross_attention``)."""
+
+    value = (cfg["model"].get("extra") or {}).get("state_cross_attention")
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"model.extra.state_cross_attention={value!r}: must be true or false")
+    return value
+
+
+def gdn_output_normalizer_from_train_config(cfg: dict[str, Any]) -> bool:
+    """``model.memory_gdn_output_normalizer`` (default True): False reads the condition-causal GDN numerator alone."""
+
+    value = cfg["model"].get("memory_gdn_output_normalizer")
+    return True if value is None else bool(value)
+
+
 def robot_base_eef_layout_from_train_config(cfg: dict[str, Any], normalization: Any = None) -> str:
     """``full`` (32 slots: joints + EEF + grippers) or ``eef_only`` (EEF + grippers) for a robot_base_eef checkpoint.
 
@@ -533,7 +553,10 @@ def video_frame_stride_from_train_config(cfg: dict[str, Any]) -> int:
 
 
 def policy_config_from_train_config(
-    cfg: dict[str, Any], rope: Optional[str] = "auto", legacy_origin: Optional[int] = None
+    cfg: dict[str, Any],
+    rope: Optional[str] = "auto",
+    legacy_origin: Optional[int] = None,
+    condition_causal: bool = False,
 ) -> PolicyConfig:
     """Resolve the PolicyConfig exactly as the live builder chain does.
 
@@ -610,6 +633,11 @@ def policy_config_from_train_config(
         rope=rope,
         legacy_strided_action_origin=int(legacy_origin),
         sana_pixel_pad=sana_pixel_pad_from_train_config(cfg),
+        # rwm/zekai-merge f6a257d4a / 8e0639b16: no yaml switch for the attention form (the checkpoint's GDN recurrence
+        # tensors decide, checkpoint.checkpoint_is_condition_causal); its two options are yaml keys
+        condition_causal=bool(condition_causal),
+        memory_gdn_output_normalizer=gdn_output_normalizer_from_train_config(cfg) if condition_causal else True,
+        state_cross_attention=state_cross_attention_from_train_config(cfg) if condition_causal else False,
         config=duck_config,
     )
 

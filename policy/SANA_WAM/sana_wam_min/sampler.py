@@ -21,6 +21,8 @@ import math
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 
+from .policy_model.condition_chunks import PREFILL, TARGET, ConditionPrefix
+
 # Absolute Robot80 slots of the gripper closedness channels; clamped to [0, 1] after the loop.
 LEFT_GRIPPER = 16
 RIGHT_GRIPPER = 45
@@ -115,6 +117,7 @@ def sample_policy(
     action_cfg_scale: float | None = None,
     gripper_bounds: tuple[tuple[float, float], tuple[float, float]] | None = ((0.0, 1.0), (0.0, 1.0)),
     action_flow_shift: float | None = None,
+    prefix_cache: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run joint Flow-Euler sampling of the video and action streams for the policy task.
 
@@ -150,6 +153,9 @@ def sample_policy(
         gripper_bounds: ``((lo, hi) left, (lo, hi) right)`` model-domain clamp of the gripper slots 16 / 45 after the
             loop; the default [0, 1] is Sana's (raw closedness while the grippers are identity-mapped), a
             gripper-normalized artifact needs ``robot80.normalized_gripper_bounds``; None skips the clamp.
+        prefix_cache: Condition-causal policy only (Sana 89eaa78f6): run the condition chunk ``[obs; state]`` once per
+            caption stream before the first step and every step's prediction chunk alone against its reads; equal to
+            the full forward up to rounding.
 
     Returns:
         Tuple (video, action): video in clean_video.dtype, action in clean_action.dtype with gripper
@@ -214,7 +220,15 @@ def sample_policy(
     video_scheduler = make_scheduler(steps, flow_shift, clean_video.device)
     action_scheduler = make_scheduler(steps, action_flow_shift, clean_video.device)
 
-    def _denoise_step(timestep, action_base_timestep, video, action):
+    # condition prefix cache (Sana policy_sampling.py ``prefix_cache``, 89eaa78f6): the condition-causal policy's
+    # condition chunk [obs; state] never reads the prediction and its timestep is 0, so it runs once per caption stream
+    # before the first step (PREFILL) and every step runs the prediction chunk alone against its reads (TARGET)
+    prefixes = [ConditionPrefix(), ConditionPrefix()] if prefix_cache else None
+
+    def _pass(stream: int, phase: str) -> dict:
+        return {} if prefixes is None else {"condition_prefix": (prefixes[stream], phase)}
+
+    def _model_inputs(timestep, action_base_timestep, action):
         # each stream reads its own schedule's step (equal when the shifts are); the action rows share one t
         video_timestep, _ = task_timesteps(timestep, task)
         _, action_timestep = task_timesteps(action_base_timestep, task)
@@ -231,12 +245,25 @@ def sample_policy(
                 "action_timestep": action_timesteps,
             }
         )
+        return video_timesteps, action_timesteps, model_data
+
+    def _condition(timestep, action_base_timestep, video, action):
+        video_timesteps, _, model_data = _model_inputs(timestep, action_base_timestep, action)
+        streams = [(caption_embeds, caption_mask)]
+        if use_cfg:
+            streams.append((unconditional_caption_embeds, unconditional_caption_mask))
+        for stream, (embeds, mask) in enumerate(streams):
+            model(video, video_timesteps[:, None], embeds, mask=mask, data_info=model_data, **_pass(stream, PREFILL))
+
+    def _denoise_step(timestep, action_base_timestep, video, action):
+        video_timesteps, action_timesteps, model_data = _model_inputs(timestep, action_base_timestep, action)
         conditional_output = model(
             video,
             video_timesteps[:, None],
             caption_embeds,
             mask=caption_mask,
             data_info=model_data,
+            **_pass(0, TARGET),
         )
         if not isinstance(conditional_output, dict) or conditional_output.get("x") is None:
             raise TypeError("world model must return a dict containing video velocity 'x'")
@@ -248,6 +275,7 @@ def sample_policy(
                 unconditional_caption_embeds,
                 mask=unconditional_caption_mask,
                 data_info=model_data,
+                **_pass(1, TARGET),
             )
             if not isinstance(unconditional_output, dict) or unconditional_output.get("x") is None:
                 raise TypeError("world model must return an unconditional video velocity 'x'")
@@ -284,6 +312,8 @@ def sample_policy(
         return video, action
 
     batch, _, frames, _, _ = video.shape
+    if prefixes is not None:
+        _condition(video_scheduler.timesteps[0], action_scheduler.timesteps[0], video, action)
     for step_index, timestep in enumerate(video_scheduler.timesteps):
         video, action = _denoise_step(timestep, action_scheduler.timesteps[step_index], video, action)
 
