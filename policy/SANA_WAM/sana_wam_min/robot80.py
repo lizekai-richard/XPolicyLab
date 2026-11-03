@@ -367,6 +367,107 @@ def normalize_action(values: ArrayLike, valid_mask: ArrayLike, norm: Normalizati
     )
 
 
+# Model-domain range of the gripper closedness (deploy key ``gripper_range``). The artifacts of the 2026-09-20 scheme
+# up to Sana 41cf94114 (2026-10-31) map the raw closedness [0, 1] by its paired q01/q99 (RoboDojo q01 0 / q99 1 ->
+# center 0.5, scale 0.5, mask on): the model sees [-1, 1]. Every artifact before that scheme and every one built from
+# 41cf94114 on keeps the grippers identity (mask off, endpoints 0 / 1 recorded): the model sees [0, 1]. ``auto`` serves
+# what the checkpoint's own artifact says, the training's map.
+GRIPPER_RANGE_AUTO = "auto"
+GRIPPER_RANGE_SIGNED = "[-1, 1]"
+GRIPPER_RANGE_UNIT = "[0, 1]"
+_GRIPPER_SLOTS = (LEFT_GRIPPER, RIGHT_GRIPPER)
+
+
+def resolve_gripper_range(value) -> str:
+    """The deploy key ``gripper_range``: null / ``auto`` -> auto; ``[-1, 1]`` / ``[0, 1]`` as a yaml list or a string."""
+
+    if value is None:
+        return GRIPPER_RANGE_AUTO
+    if isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        text = str(value).strip()
+        if text.lower() in ("", "auto", "null", "none"):
+            return GRIPPER_RANGE_AUTO
+        parts = text.strip("[]() ").split(",")
+    try:
+        endpoints = tuple(float(part) for part in parts)
+    except (TypeError, ValueError):
+        endpoints = None
+    if endpoints == (-1.0, 1.0):
+        return GRIPPER_RANGE_SIGNED
+    if endpoints == (0.0, 1.0):
+        return GRIPPER_RANGE_UNIT
+    raise ValueError(f"gripper_range must be auto, [-1, 1] or [0, 1], got {value!r}")
+
+
+def gripper_range_of(norm: Normalization) -> str:
+    """The model-domain range of raw closedness [0, 1] under ``norm``'s state and action gripper slots: ``[-1, 1]``,
+    ``[0, 1]`` (identity), the mapped endpoints of other statistics, or ``mixed(...)`` when the four slots disagree."""
+
+    ranges = []
+    for kind in ("state", "action"):
+        mask = np.asarray(getattr(norm, f"{kind}_normalization_mask80"))
+        center = np.asarray(getattr(norm, f"{kind}_center80"), dtype=np.float64)
+        scale = np.asarray(getattr(norm, f"{kind}_scale80"), dtype=np.float64)
+        for slot in _GRIPPER_SLOTS:
+            if not bool(mask[slot]):
+                ranges.append(GRIPPER_RANGE_UNIT)
+                continue
+            low, high = (0.0 - center[slot]) / scale[slot], (1.0 - center[slot]) / scale[slot]
+            if np.isclose(low, -1.0) and np.isclose(high, 1.0):
+                ranges.append(GRIPPER_RANGE_SIGNED)
+            else:
+                ranges.append(f"[{low:.4g}, {high:.4g}]")
+    if len(set(ranges)) == 1:
+        return ranges[0]
+    return "mixed(" + " ".join(ranges) + ")"
+
+
+def with_gripper_range(norm: Normalization, gripper_range: str) -> Normalization:
+    """Copy of ``norm`` whose gripper slots (16 / 45) of the state and action blocks map raw closedness [0, 1] to
+    ``gripper_range``: ``[-1, 1]`` = q01 0 / q99 1, center 0.5, scale 0.5, mask on (the 2026-09-20 scheme on RoboDojo);
+    ``[0, 1]`` = identity (center 0, scale 1, mask off, endpoints 0 / 1 recorded; Sana 41cf94114). ``auto`` returns
+    ``norm``. Every other slot and the artifact's sha256 / stamps are kept."""
+
+    if gripper_range == GRIPPER_RANGE_AUTO:
+        return norm
+    if gripper_range not in (GRIPPER_RANGE_SIGNED, GRIPPER_RANGE_UNIT):
+        raise ValueError(f"gripper_range must be {GRIPPER_RANGE_SIGNED} or {GRIPPER_RANGE_UNIT}, got {gripper_range!r}")
+    signed = gripper_range == GRIPPER_RANGE_SIGNED
+    values = {
+        "q01_80": 0.0,
+        "q99_80": 1.0,
+        "center80": 0.5 if signed else 0.0,
+        "scale80": 0.5 if signed else 1.0,
+        "normalization_mask80": signed,
+    }
+    updates = {}
+    for kind in ("state", "action"):
+        for suffix, value in values.items():
+            array = getattr(norm, f"{kind}_{suffix}")
+            if array is None:
+                continue
+            array = np.array(array, copy=True)
+            array[list(_GRIPPER_SLOTS)] = value
+            updates[f"{kind}_{suffix}"] = array
+    return replace(norm, **updates)
+
+
+def apply_gripper_range(norm: Normalization, value) -> tuple[Normalization, str]:
+    """(``norm`` served with the deploy key ``gripper_range``, its ready-line label): ``auto`` -> the artifact's own map
+    (``[-1, 1](artifact)``); an explicit range equal to the artifact's -> ``[-1, 1](deploy = artifact)``; one that
+    differs -> the gripper slots rewritten, ``[0, 1](deploy OVERRIDES artifact [-1, 1])``."""
+
+    requested = resolve_gripper_range(value)
+    artifact_range = gripper_range_of(norm)
+    if requested == GRIPPER_RANGE_AUTO:
+        return norm, f"{artifact_range}(artifact)"
+    if requested == artifact_range:
+        return norm, f"{requested}(deploy = artifact)"
+    return with_gripper_range(norm, requested), f"{requested}(deploy OVERRIDES artifact {artifact_range})"
+
+
 def normalized_gripper_bounds(norm: Normalization) -> tuple[tuple[float, float], tuple[float, float]]:
     """``((lo, hi) left, (lo, hi) right)``: the model-domain values of raw gripper closedness 0 and 1 (slots 16 / 45).
 

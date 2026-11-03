@@ -31,6 +31,7 @@ from sana_wam_min.config import VISUAL_LAYOUT_SANA_PIXEL_CANVAS, VISUAL_LAYOUT_T
 from sana_wam_min.multiview import pack_multiview_latents  # noqa: E402
 from sana_wam_min.pixels import frame_to_model_tensor, target_size_hw  # noqa: E402
 from sana_wam_min.robodojo_io import VIEW_SLOT_IDS  # noqa: E402
+from sana_wam_min.robot80 import apply_gripper_range  # noqa: E402
 from sana_wam_min.sana_pixel_canvas import expected_sana_pixel_latent_hw, sana_pixel_canvas_from_frames  # noqa: E402
 from sana_wam_min.session import (  # noqa: E402
     PolicyInferenceSession,
@@ -88,6 +89,7 @@ class CausalRuntime:
         action_flow_shift: Optional[float] = None,
         view_resize: Optional[str] = None,
         allow_donor_checkpoint: bool = False,
+        gripper_range: Any = None,
     ) -> "CausalRuntime":
         """Load in the validated order: yaml -> contract, completed by the run record next to the yaml (the sink rule of
         its training tree; refusals before any weight) -> normalization -> bf16 causal model + weights -> VAE -> Gemma -> the shared front-end."""
@@ -112,6 +114,8 @@ class CausalRuntime:
         normalization = load_checked_normalization(
             checkpoint_dir, view, normalization_path, expected_normalization_sha256
         )
+        # deploy gripper_range: auto = the artifact's own gripper map ([-1, 1] before Sana 41cf94114, [0, 1] from it)
+        normalization, gripper_range_label = apply_gripper_range(normalization, gripper_range)
 
         model = build_causal_policy(policy_config, contract, dtype=torch.bfloat16, device="cpu")
         load_report = load_causal_weights(
@@ -120,6 +124,7 @@ class CausalRuntime:
         load_report["run_record"] = describe_run_records(records, config_path)
         load_report["gdn_observation"] = observation_form
         load_report["rope_clock"] = rope_clock
+        load_report["gripper_range"] = gripper_range_label
         vae = load_vae(vae_path, device=device, dtype=torch.bfloat16)
         tokenizer, text_encoder = load_text_encoder(text_encoder_path, device=device)
         frontend = PolicyInferenceSession(

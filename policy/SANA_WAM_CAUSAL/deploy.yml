@@ -34,6 +34,10 @@ allow_donor_checkpoint: false
 # null -> <checkpoint_dir>/normalization/<f33 name>, else the packaged copy (refused by the yaml pin of an EEF line)
 normalization_path: null
 normalization_sha256: null
+# Model-domain range of the gripper closedness: auto = the artifact's own map (the training's: [-1, 1] for the artifacts
+# of 2026-09-20 up to Sana 41cf94114, e.g. 1fe3b7e7 / 9f8b98ed; [0, 1] for those built from 41cf94114 on, e.g. 4078c0b2);
+# [-1, 1] / [0, 1] force that map on the gripper slots (the ready line says when it overrides the artifact)
+gripper_range: auto
 text_encoder_path: null
 vae_path: null
 # Sampling: the RoboDojo defaults of every SANA evaluation (10 Euler steps, video CFG 6, action CFG 1; the flow shifts

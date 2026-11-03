@@ -291,6 +291,7 @@ class Model(ModelTemplate):
             action_flow_shift=_optional_float(cfg.get("action_flow_shift")),
             view_resize=cfg.get("view_resize"),
             allow_donor_checkpoint=self.allow_donor_checkpoint,
+            gripper_range=cfg.get("gripper_range"),
         )
         frontend = self.runtime.frontend
         if frontend.action_mode != "robot_base_eef" or frontend.robot_base_eef_layout != ROBOT_BASE_EEF_ONLY:
@@ -335,7 +336,7 @@ class Model(ModelTemplate):
             f"prediction_latent_dir={self.prediction_latent_dir} "
             f"gdn_recurrence={report.get('gdn_recurrence')} normalization_sha256={self.normalization.sha256} "
             f"run_record={report.get('run_record')} gdn_observation={report.get('gdn_observation')} "
-            f"rope_clock={report.get('rope_clock')} "
+            f"rope_clock={report.get('rope_clock')} gripper_range={report.get('gripper_range')} "
             f"device={self.device} action_type={self.action_type}",
             flush=True,
         )

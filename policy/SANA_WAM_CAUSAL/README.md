@@ -98,7 +98,7 @@ The artifact must be the one the yaml pins in `data.extra.robot_sft.normalizatio
 - rot6d: the fixed [-1, 1] range (identity);
 - gripper closedness: [0, 1] mapped to [-1, 1].
 
-The action EEF slots share the state statistics.
+The action EEF slots share the state statistics. From Sana `41cf94114` (2026-10-31) on, new artifacts (RoboDojo f33 absolute `4078c0b2...`) keep the grippers unnormalized: mask off, the model sees closedness in [0, 1]; everything else is unchanged. Runs trained before keep the [-1, 1] artifact they started on. The deploy key `gripper_range` (default `auto`) serves the artifact's own map; `[-1, 1]` / `[0, 1]` force one, and the ready line prints `gripper_range=[-1, 1](artifact)`, `(deploy = artifact)` or `(deploy OVERRIDES artifact ...)`.
 
 **Step-0 pipeline checks.** An SFT checkpoint has no recurrence parameters. With `allow_donor_checkpoint: true`, a dir whose `config.yaml` is the causal yaml and whose `model/` + `normalization/` are the donor's serves the donor as the causal policy at step 0 (on NFS: `/homes/jiamingt/checkpoints/causal_step0/pantheon33k_sana_latent_episode_{videoonly,videoonly_noobs,videoandaction}`). The recurrence parameters are initialized as the causal trainer initializes them on its first load: `gate_proj` zero, and `dt_bias` / `A_log` from the yaml's `dt_bias_init` / `a_log_init` (-5 / 0 for the episode recipes). This gives a decay of about 0.993 per chunk. The ready line then says `gdn_recurrence=initialized (SFT donor, causal step 0)`. Every chunk of such a model reads an untrained memory. Use this for wiring and latency checks only, never as an evaluation.
 
@@ -144,6 +144,7 @@ The RoboDojo client times every RPC out after 120 s whatever `request_timeout_s`
 | `checkpoint_dir` | null | explicit checkpoint dir (highest priority; `checkpoint_path` / `ckpt_dir` / `model_dir` are aliases) |
 | `allow_donor_checkpoint` | false | serve an SFT checkpoint as the causal step-0 model (see Model Assets); pipeline checks only |
 | `normalization_path` / `normalization_sha256` | null / null | explicit artifact and/or sha pin (see Model Assets) |
+| `gripper_range` | auto | model-domain range of the gripper closedness: `auto` = the artifact's map (`[-1, 1]` for artifacts of 2026-09-20 up to Sana `41cf94114`, `[0, 1]` from it); `[-1, 1]` (q01 0 / q99 1, center 0.5, scale 0.5, mask on) or `[0, 1]` (identity) force that map on the state and action gripper slots. The sampler's gripper clamp follows the served map |
 | `text_encoder_path` / `vae_path` | null | local copies of `google/gemma-2-2b-it` and `Efficient-Large-Model/LTX-2.3-Diffusers` (a repo root loads its `vae/` subfolder); null reads `SANA_WAM_TEXT_ENCODER_PATH` / `SANA_WAM_VAE_PATH`, then falls back to the Hub ids |
 | `sampling_steps` | 10 | Euler steps per chunk |
 | `cfg_scale` / `video_cfg_scale` / `action_cfg_scale` | 6.0 / null / 1.0 | per-stream text CFG as in SANA_WAM: video CFG 6, action CFG 1 (one unconditional forward per step either way). Each must be >= 1 |
