@@ -25,13 +25,18 @@ from sana_wam_causal.contract import (
     bidirectional_view,
     SINK_HORIZON_CHUNKS,
     SINK_HORIZON_TREES,
+    STATE_PROJ_TREES,
+    STATE_TOKEN_TREES,
     WINDOW_START_SINK_TREES,
     check_observation_form,
     check_run_record,
+    check_state_token_form,
     describe_run_records,
     load_run_records,
+    record_trees,
     resolve_causal_contract,
     resolve_rope_clock,
+    resolve_state_cross_attention,
 )
 from sana_wam_causal.checkpoint import load_causal_state_dict
 from sana_wam_causal.layers import LayerCache
@@ -173,7 +178,9 @@ def test_the_gdn_output_normalizer_switch_resolves(value, expected):
         cfg["model"]["memory_gdn_output_normalizer"] = value
     contract = resolve_causal_contract(cfg)
     assert contract.gdn_output_normalizer is expected
-    assert contract.describe().endswith(f"first_chunk=0 gdn_output_normalizer={expected} use_attn_res=True sink_horizon=None")
+    assert contract.describe().endswith(
+        f"first_chunk=0 gdn_output_normalizer={expected} use_attn_res=True sink_horizon=None state_cross_attention=False"
+    )
 
 
 @pytest.mark.parametrize("value", ["false", 0, 1])
@@ -199,7 +206,9 @@ def test_the_released_n1_obs_checkpoint_resolves_with_its_observation_and_state(
     assert (contract.multiview, contract.visual_layout) == ("sana_latent", "three_view_strip")
     text = contract.describe()
     assert " chunk_observation=False causal_observation=True causal_state=True multiview=sana_latent " in text
-    assert text.endswith("first_chunk=0 gdn_output_normalizer=False use_attn_res=True sink_horizon=None")
+    assert text.endswith(
+        "first_chunk=0 gdn_output_normalizer=False use_attn_res=True sink_horizon=None state_cross_attention=False"
+    )
 
 
 @pytest.mark.parametrize(
@@ -297,7 +306,8 @@ def test_the_attn_res_switch_resolves_and_the_view_keeps_the_mirror_config(value
     else:
         cfg["model"]["use_attn_res"] = value
     contract = resolve_causal_contract(cfg)
-    assert contract.use_attn_res is expected and contract.describe().endswith(f" use_attn_res={expected} sink_horizon=None")
+    assert contract.use_attn_res is expected
+    assert contract.describe().endswith(f" use_attn_res={expected} sink_horizon=None state_cross_attention=False")
     view = bidirectional_view(cfg)
     assert view["model"]["use_attn_res"] is True and cfg["model"].get("use_attn_res", None) is value
     policy_config_from_train_config(view)
@@ -378,7 +388,7 @@ def test_a_checkpoint_of_the_sink_horizon_trees_runs_the_physical_clock_with_the
     assert (contract.physical_rope, contract.sink_horizon) == (True, SINK_HORIZON_CHUNKS) == (True, 7)
     assert contract == CausalContract(**{**config.__dict__, "physical_rope": True, "sink_horizon": 7})
     assert label == f"physical+sink_horizon7(0c88c11ab; trained on {tree}0)"
-    assert contract.describe().endswith(" use_attn_res=False sink_horizon=7")
+    assert contract.describe().endswith(" use_attn_res=False sink_horizon=7 state_cross_attention=False")
     check_run_record(records[0][1], contract)
     with pytest.raises(ValueError, match="records deploy.physical_rope=True"):
         check_run_record(records[0][1], config)
@@ -386,9 +396,10 @@ def test_a_checkpoint_of_the_sink_horizon_trees_runs_the_physical_clock_with_the
     # a run resumed onto the horizon tree: the newest segment's rule, the earlier one named
     resumed = [(tmp_path / "RUN_ID.json", {"scheme_history": [{"code": "9a1b3e33d"}, {"code": tree}]})]
     assert resolve_rope_clock(resumed, config)[1].endswith(f"trained on {tree}; earlier segments on 9a1b3e33d)")
-    view = bidirectional_view(_load(RECIPE_HORIZON_NOATTNRES))
-    model = CausalPolicyModel(policy_config_from_train_config(view), contract)
-    assert (model.physical_rope, model.sink_horizon, model.target_frame_offset()) == (True, 7, 0.5625)
+    if tree == "7ed0d28bf":   # the recipe's own tree: build its (5B) model once
+        view = bidirectional_view(_load(RECIPE_HORIZON_NOATTNRES))
+        model = CausalPolicyModel(policy_config_from_train_config(view), contract)
+        assert (model.physical_rope, model.sink_horizon, model.target_frame_offset()) == (True, 7, 0.5625)
 
 
 @pytest.mark.parametrize("window,ok", [(None, False), (1, True), (7, True), (8, False)])
@@ -742,7 +753,8 @@ def test_reads_rotate_the_pre_rope_keys_at_their_slots():
 # -- the session on a tiny model -----------------------------------------------------------------------------------------
 
 
-def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION, phase=ALIGNED_PHASE_PADDED, attn_res=True):
+def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION, phase=ALIGNED_PHASE_PADDED, attn_res=True,
+                state_cross_attention=False):
     config = PolicyConfig.from_sana_kwargs(
         depth=4, hidden_size=64, patch_size=(1, 1, 1), num_heads=2, in_channels=4, caption_channels=16,
         model_max_length=7, linear_head_dim=32, softmax_head_dim=32, softmax_ratio=0.5, attn_res_block_size=2,
@@ -754,6 +766,7 @@ def _tiny_model(window=2, memory_content=MEMORY_VIDEO_AND_ACTION, phase=ALIGNED_
         memory_content=memory_content, model_fps=25.0, tier_num_frames=33,
         multiview="sana_pixel", visual_layout="sana_pixel_canvas", rope="aligned", dt_bias_init=-5.0, a_log_init=0.0,
         reset_legacy_beta=False, aligned_phase_window=phase, use_attn_res=attn_res,
+        state_cross_attention=state_cross_attention,
     )
     torch.manual_seed(0)
     model = CausalPolicyModel(config, contract)
@@ -943,3 +956,175 @@ def test_a_first_frame_session_emits_from_chunk_0():
     wrong = _session(model, caption, null)
     with pytest.raises(RuntimeError, match="commit_sink first"):
         generate(wrong, 0)
+
+
+# -- state_cross_attention (Sana e00c28c9a / 4b29e92fd, deploy 64227cb07) ------------------------------------------------
+
+
+def _state_xattn_cfg(value=True):
+    """The 7ed0d28bf no-AttnRes N1 recipe with the switch (its causal_state off: the switch removes that state row)."""
+
+    cfg = copy.deepcopy(_load(RECIPE_HORIZON_NOATTNRES))
+    _policy(cfg)["causal_state"] = False
+    _policy(cfg)["state_cross_attention"] = value
+    return cfg
+
+
+@pytest.mark.parametrize("value,expected", [(None, False), (False, False), (True, True)])
+def test_the_state_cross_attention_switch_resolves(value, expected):
+    contract = resolve_causal_contract(_state_xattn_cfg(value))
+    assert contract.state_cross_attention is expected and contract.causal_state is False
+    assert contract.describe().endswith(f" sink_horizon=None state_cross_attention={expected}")
+    assert resolve_causal_contract(_load(RECIPE_HORIZON_NOATTNRES)).state_cross_attention is False
+
+
+def test_the_state_cross_attention_switch_is_refused_outside_its_contract():
+    with pytest.raises(ValueError, match="state_cross_attention='true': must be true or false"):
+        resolve_causal_contract(_state_xattn_cfg("true"))
+    cfg = _state_xattn_cfg(True)
+    _policy(cfg)["causal_state"] = True
+    with pytest.raises(ValueError, match="removes the state row causal_state joins.*set causal_state: false"):
+        resolve_causal_contract(cfg)
+    assert resolve_state_cross_attention(None, True) is False and resolve_state_cross_attention(True, False) is True
+
+
+@pytest.mark.parametrize("tree", STATE_TOKEN_TREES)
+def test_a_state_token_checkpoint_of_the_state_embed_trees_is_served(tree, tmp_path):
+    """From Sana 4b29e92fd on the token is state_embed + the caption y-norm: such a record serves the switch on the
+    physical clock with the sink horizon and the GDN observation branch (every token tree descends from both)."""
+
+    assert set(STATE_TOKEN_TREES) <= set(SINK_HORIZON_TREES) and set(STATE_PROJ_TREES) <= set(SINK_HORIZON_TREES)
+    config = resolve_causal_contract(_state_xattn_cfg())
+    records = [(tmp_path / "RUN_ID.json", {"source_commit": tree})]
+    contract, label = resolve_rope_clock(records, config)
+    assert (contract.state_cross_attention, contract.physical_rope, contract.sink_horizon) == (True, True, 7)
+    assert check_state_token_form(records, contract) == f"state_embed(4b29e92fd; trained on {tree})"
+    assert check_observation_form(records, contract) == f"branch(fd5261ff6; trained on {tree})"
+    assert check_state_token_form(records, resolve_causal_contract(_state_xattn_cfg(False))) is None
+
+
+@pytest.mark.parametrize("tree", STATE_PROJ_TREES)
+def test_a_state_token_of_the_first_form_is_refused(tree, tmp_path):
+    """e00c28c9a .. 4b29e92fd^ projected the token with a zero-initialized state_proj (no run trained it): refused."""
+
+    contract = resolve_causal_contract(_state_xattn_cfg())
+    records = [(tmp_path / "RUN_ID.json", {"source_commit": tree})]
+    with pytest.raises(ValueError, match="zero-initialized state_proj"):
+        check_state_token_form(records, contract)
+    # the same tree without the switch serves as before (a switch-off run of those trees has no token)
+    off = resolve_causal_contract(_state_xattn_cfg(False))
+    assert check_state_token_form(records, off) is None and resolve_rope_clock(records, off)[0].sink_horizon == 7
+
+
+def test_a_state_token_checkpoint_without_a_known_tree_is_refused_unless_a_donor_directory(tmp_path):
+    contract = resolve_causal_contract(_state_xattn_cfg())
+    horizon_only = [(tmp_path / "RUN_ID.json", {"source_commit": "7ed0d28bf"})]   # predates the switch
+    for records, donor in ((horizon_only, False), (horizon_only, True), ([], False)):
+        with pytest.raises(ValueError, match="name no known training tree.*STATE_TOKEN_TREES"):
+            check_state_token_form(records, contract, allow_unrecorded=donor)
+    assert check_state_token_form([], contract, allow_unrecorded=True) == "state_embed(unrecorded: donor directory)"
+
+
+def test_a_records_top_level_code_names_its_training_tree(tmp_path):
+    """The GB300 uploads' RUN_ID.json names the tree in a top-level ``code`` (the sink-horizon no-AttnRes run): it
+    resolves like a source_commit, with no RUN_ID.local.json."""
+
+    record = {"run": "causal_..._nsc", "step": 30000, "code": "7ed0d28bf530fb6100b8fb16e63d7246828468b6",
+              "use_attn_res": False, "weights_sha256": "42024f348d0efc1a5b4f365c011e2a01c79c4f8786f8f6a85979fb918e21873e"}
+    assert record_trees(record) == ["7ed0d28bf530fb6100b8fb16e63d7246828468b6"]
+    contract, label = resolve_rope_clock([(tmp_path / "RUN_ID.json", record)], resolve_causal_contract(_load(RECIPE_HORIZON_NOATTNRES)))
+    assert label == "physical+sink_horizon7(0c88c11ab; trained on 7ed0d28bf530fb6100b8fb16e63d7246828468b6)"
+    check_run_record(record, contract)
+    with pytest.raises(ValueError, match="records use_attn_res=True but config.yaml resolves to False"):
+        check_run_record({**record, "use_attn_res": True}, contract)
+
+
+def test_a_run_record_contradicting_the_state_cross_attention_switch_is_refused():
+    contract = resolve_causal_contract(_state_xattn_cfg())
+    check_run_record({"state_cross_attention": True}, contract)
+    for record in ({"state_cross_attention": False}, {"deploy": {"state_cross_attention": False}}):
+        with pytest.raises(ValueError, match="state_cross_attention=False but config.yaml resolves to True"):
+            check_run_record(record, contract)
+
+
+def test_the_state_token_closes_the_last_text_group_and_no_state_row_is_kept():
+    """The model side of the switch: a committed video_and_action chunk keeps its C action rows alone (from step
+    slot * C + 1), the token is y_norm(state_embed(state)) behind the last group's prompt as a key no mask hides, and
+    the window forms are checked."""
+
+    model = _tiny_model(state_cross_attention=True).double()
+    assert model.chunk_robot_rows() == 32 and _tiny_model(state_cross_attention=False).chunk_robot_rows() == 33
+    assert _tiny_model(memory_content=MEMORY_VIDEO_ONLY, state_cross_attention=True).chunk_robot_rows() == 0
+    g = torch.Generator().manual_seed(4)
+    text = torch.randn(1, 4, 7, 64, generator=g, dtype=torch.float64)
+    text_mask = torch.ones(1, 4, 7, dtype=torch.int16)
+    text_mask[..., 5:] = 0
+    state = torch.randn(1, 80, generator=g, dtype=torch.float64)
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    state_mask[:, 40:] = False
+    joined, joined_mask = model._append_state_token(text, text_mask, state, state_mask)
+    assert joined.shape == (1, 4, 8, 64) and torch.equal(joined[:, :, :7], text)
+    torch.testing.assert_close(joined[0, 3, 7], model.attention_y_norm(model.state_embed(state, state_mask))[0])
+    assert torch.equal(joined[0, :3, 7], torch.zeros(3, 64, dtype=torch.float64))
+    assert joined_mask[0, :, 7].tolist() == [0, 0, 0, 1] and torch.equal(joined_mask[..., :7], text_mask)
+    # the committed chunk's action rows on their steps: the row-less table equals the state-row table minus its row 0
+    rope = dict(frames=1, frame_offset=2.0, robot_rows=32, step_offset=64, model_fps=25.0, view_shapes=((3, 4),),
+                view_slot_ids=(0,), device="cpu")
+    with_row = _tiny_model(state_cross_attention=False).double().softmax_entry_rope(**{**rope, "robot_rows": 33})
+    torch.testing.assert_close(model.softmax_entry_rope(**rope), torch.cat((with_row[:, :, :12], with_row[:, :, 13:]), dim=2))
+    latent = torch.randn(1, 4, 1, 3, 4, generator=g, dtype=torch.float64)
+    caption = torch.randn(1, 1, 1, 7, 16, generator=g, dtype=torch.float64)
+    robot = {"state80": state, "state_mask80": state_mask, "action80": torch.zeros(1, 32, 80, dtype=torch.float64),
+             "action_mask80": torch.ones(1, 32, 80, dtype=torch.bool), "action_timesteps": torch.zeros(1, 32)}
+    kwargs = dict(model_fps=25.0, frame_offset=1, step_offset=32)
+    with pytest.raises(ValueError, match="robot rows are its C action rows alone"):
+        model.forward_window(latent, torch.zeros(1, 1), caption, None, robot=robot, **kwargs)
+    with pytest.raises(ValueError, match="caption_state is the state token of a robotless"):
+        model.forward_window(latent, torch.zeros(1, 1), caption, None, robot=robot, robot_form="actions",
+                             caption_state=robot, **kwargs)
+    with pytest.raises(ValueError, match="caption_state is the state token of a robotless"):
+        _tiny_model().double().forward_window(latent, torch.zeros(1, 1), caption, None, caption_state=robot, **kwargs)
+    out = model.forward_window(latent, torch.zeros(1, 1), caption, None, robot=robot, robot_form="actions", **kwargs)
+    moved = model.forward_window(latent, torch.zeros(1, 1), caption, None, robot={**robot, "state80": state + 1},
+                                 robot_form="actions", **kwargs)
+    assert out["action_pred"].shape == (1, 32, 80) and float((moved["x"] - out["x"]).abs().max()) > 1e-6
+
+
+@pytest.mark.parametrize("memory_content", [MEMORY_VIDEO_AND_ACTION, MEMORY_VIDEO_ONLY], ids=["video_and_action", "video_only"])
+def test_a_state_cross_attention_session_runs_a_deterministic_episode_and_reads_the_state(memory_content):
+    """A padded episode with CFG on the CPU: deterministic, and the anchor state reaches every chunk through its
+    caption token (moving the generation state moves the chunk; under video_and_action the committed state moves the
+    next chunk, under video_only it is not committed and moves nothing)."""
+
+    model = _tiny_model(window=2, memory_content=memory_content, state_cross_attention=True)
+    caption, null, g = _captions(9)
+    sink, frozen = torch.randn(1, 4, 1, 3, 4, generator=g), torch.randn(1, 4, 1, 3, 4, generator=g)
+    clean = [torch.randn(1, 4, 1, 3, 4, generator=g) for _ in range(4)]
+    mask = torch.ones(1, 32, 80, dtype=torch.bool)
+    states = [torch.randn(1, 80, generator=g) for _ in range(4)]
+
+    def run(generation_shift=0.0, commit_shift=0.0):
+        session = _session(model, caption, null)
+        assert session.state_cross_attention
+        _open(session, sink, frozen, states[0], mask)
+        outs = []
+        for c in range(1, 4):
+            action, video = session.generate_chunk(
+                anchor_state=states[c] + (generation_shift if c == 2 else 0.0), anchor_state_mask=mask[0, 0],
+                action_mask=mask, generator=torch.Generator().manual_seed(70 + c),
+            )
+            outs.append((action, video))
+            session.commit_chunk(clean[c], action, anchor_state=states[c] + (commit_shift if c == 1 else 0.0),
+                                 anchor_state_mask=mask[0, 0], action_mask=mask)
+        return outs
+
+    reference = run()
+    assert all(torch.equal(a, b) and torch.equal(v, w) for (a, v), (b, w) in zip(reference, run()))
+    moved = run(generation_shift=0.5)
+    assert torch.equal(moved[0][0], reference[0][0]) and float((moved[1][0] - reference[1][0]).abs().max()) > 1e-4
+    committed = run(commit_shift=0.5)
+    assert torch.equal(committed[0][0], reference[0][0])
+    if memory_content == MEMORY_VIDEO_AND_ACTION:
+        assert float((committed[1][0] - reference[1][0]).abs().max()) > 1e-8
+    else:
+        assert all(torch.equal(a, b) for (a, _), (b, _) in zip(committed, reference))

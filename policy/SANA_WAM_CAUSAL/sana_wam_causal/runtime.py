@@ -49,6 +49,7 @@ from .contract import (  # noqa: E402
     CausalContract,
     bidirectional_view,
     check_observation_form,
+    check_state_token_form,
     check_run_record,
     describe_run_records,
     load_run_records,
@@ -106,6 +107,7 @@ class CausalRuntime:
         for source, record in records:
             check_run_record(record, contract, source=str(source))
         observation_form = check_observation_form(records, contract, allow_unrecorded=allow_donor_checkpoint)
+        state_token = check_state_token_form(records, contract, allow_unrecorded=allow_donor_checkpoint)
         view = bidirectional_view(train_cfg)
         rope, legacy_origin, rope_label = resolve_rope_contract(view, None)
         policy_config = policy_config_from_train_config(view, rope=rope, legacy_origin=legacy_origin)
@@ -124,6 +126,7 @@ class CausalRuntime:
         load_report["run_record"] = describe_run_records(records, config_path)
         load_report["gdn_observation"] = observation_form
         load_report["rope_clock"] = rope_clock
+        load_report["state_token"] = state_token
         load_report["gripper_range"] = gripper_range_label
         vae = load_vae(vae_path, device=device, dtype=torch.bfloat16)
         tokenizer, text_encoder = load_text_encoder(text_encoder_path, device=device)

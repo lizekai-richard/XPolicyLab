@@ -52,6 +52,15 @@ denoising window, its commit) reads the sink at the instant chunk max(0, c - 7) 
 farther than 7 chunks away; the GDN keeps the absolute clock, and a window above 7 chunks is refused. No config key
 tells the two sink rules apart, so the run record's training trees decide (``resolve_rope_clock``).
 
+``model.extra.chunk_causal_policy.state_cross_attention`` (Sana ``e00c28c9a`` / ``4b29e92fd``, deploy ``64227cb07``; false
+when absent, never with ``causal_state``) takes the state rows out of the token sequence: every chunk's anchor state goes
+through ``state_embed`` (the projector a state row takes) and the caption y-norm and closes, as one key no mask hides,
+the caption its chunk's robot rows read -- the robot group under the strip's token-group prompts, the one shared prompt
+of the canvas, which the chunk's targets (and its observation prefill) read too. A window's robot rows are then its C
+action rows alone, on their usual steps; a committed video_and_action chunk keeps its C action rows and its state token.
+Its first form (``e00c28c9a``: a zero-initialized ``state_proj`` into the caption channels, then the caption MLP) trained
+no run and is refused; ``4b29e92fd`` on keeps ``state_embed``, so only the config tells the two policies apart.
+
 ``model.memory_gdn_output_normalizer`` (Sana ``c414e9b32``; ``true`` when absent) decides every GDN layer's readout: true
 divides the numerator ``q (gS + K^T diag(beta) V)`` by the denominator ``ReLU(q) . (gz + K_den^T beta) + eps``, false
 returns the numerator alone (z is still carried, so a commit writes the same state either way). The per-head RMSNorm
@@ -132,7 +141,20 @@ OBSERVATION_JOINT_TREES = (
 # longer read). Trees known to train it (0c88c11ab and descendants; add a newer one after
 # `git merge-base --is-ancestor 0c88c11ab <tree>`):
 SINK_HORIZON_CHUNKS = 7
-SINK_HORIZON_TREES = ("0c88c11ab", "e6c386907", "6cf45c1ae", "7ed0d28bf")
+SINK_HORIZON_TREES = (
+    "0c88c11ab", "e6c386907", "6cf45c1ae", "7ed0d28bf", "caf601b76", "b7189fd11", "41cf94114", "ad1bb95f3", "e00c28c9a",
+    "ccddb2e7b", "64227cb07", "2578f606b", "4b29e92fd", "46657d0c1", "f6a257d4a", "8e0639b16", "cf47a0613", "89eaa78f6",
+    "8675f0ac3", "b6f5295f9", "78a48ed19", "27d767c5e", "75f663290", "6de2454dc",
+)
+# ``state_cross_attention``: from Sana 4b29e92fd on the anchor state's caption token is ``state_embed`` + the caption
+# y-norm; its first form (e00c28c9a .. 4b29e92fd^, the trees below) projected it with a zero-initialized ``state_proj``,
+# which no run trained. Trees known to train the state_embed token (4b29e92fd and descendants; add a newer one after
+# `git merge-base --is-ancestor 4b29e92fd <tree>`):
+STATE_TOKEN_TREES = (
+    "4b29e92fd", "46657d0c1", "f6a257d4a", "8e0639b16", "cf47a0613", "89eaa78f6", "8675f0ac3", "b6f5295f9", "78a48ed19",
+    "27d767c5e", "75f663290", "6de2454dc",
+)
+STATE_PROJ_TREES = ("e00c28c9a", "ccddb2e7b", "64227cb07", "2578f606b")
 # trees known to train the sink at the reader's window start on the clock physical_rope declares (not descendants of
 # 0c88c11ab): the observation trees above and the no-observation runs served so far (N2 / N4 p14k-pretrain)
 WINDOW_START_SINK_TREES = OBSERVATION_BRANCH_TREES + OBSERVATION_JOINT_TREES + (
@@ -166,6 +188,8 @@ class CausalContract:
     # H: a softmax reader in chunk c reads the sink at chunk max(0, c - H)'s start (Sana 0c88c11ab, H = 7); None: at the
     # start of its window, chunk max(0, c - W) (the trees before it). Set from the run record (``resolve_rope_clock``).
     sink_horizon: Optional[int] = None
+    # every chunk's anchor state as one caption token of its robot rows' caption, no state row (Sana 4b29e92fd)
+    state_cross_attention: bool = False
 
     @property
     def first_chunk(self) -> int:
@@ -184,7 +208,7 @@ class CausalContract:
             f"rope={self.rope} physical_rope={self.physical_rope} aligned_phase_window={self.aligned_phase_window} "
             f"first_chunk={self.first_chunk} "
             f"gdn_output_normalizer={self.gdn_output_normalizer} use_attn_res={self.use_attn_res} "
-            f"sink_horizon={self.sink_horizon}"
+            f"sink_horizon={self.sink_horizon} state_cross_attention={self.state_cross_attention}"
         )
 
 
@@ -292,6 +316,22 @@ def resolve_causal_state(value: Any, observation: bool) -> bool:
     return value
 
 
+def resolve_state_cross_attention(value: Any, state: bool) -> bool:
+    """``state_cross_attention`` as Sana reads it (``causal_rwm_train.resolve_state_cross_attention``, e00c28c9a): None
+    -> false, a yaml boolean otherwise, never with ``causal_state`` (whose state row it removes)."""
+
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"model.extra.chunk_causal_policy.state_cross_attention={value!r}: must be true or false")
+    if value and state:
+        raise ValueError(
+            "model.extra.chunk_causal_policy.state_cross_attention removes the state row causal_state joins to the "
+            "observation latent; set causal_state: false"
+        )
+    return value
+
+
 def resolve_physical_rope(value: Any) -> bool:
     """``physical_rope`` as Sana reads it (``causal_rwm_train.resolve_physical_rope``, 6e91eaf2a .. 0c88c11ab^): None ->
     false, a yaml boolean otherwise (it needs ``rope: aligned``, the only RoPE mode this adapter serves). A checkpoint
@@ -353,8 +393,9 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
     """Refuse a checkpoint whose run record contradicts the contract it resolves to (``resolve_rope_clock`` completes
     the config's): a run that trained chunk observations (``refuse_recorded_chunk_observation``) and a recorded
     ``aligned_phase_window`` / ``memory_content`` / ``memory_gdn_output_normalizer`` / ``causal_observation`` /
-    ``causal_state`` / ``physical_rope`` / ``sliding_window_chunks`` other than the contract's, at the record's top level
-    or in its ``deploy`` block (the record of the physical-RoPE line). Keys the record does not carry are not checked."""
+    ``causal_state`` / ``state_cross_attention`` / ``physical_rope`` / ``sliding_window_chunks`` / ``use_attn_res`` other
+    than the contract's, at the record's top level or in its ``deploy`` block (the record of the physical-RoPE line).
+    Keys the record does not carry are not checked."""
 
     refuse_recorded_chunk_observation(record, source)
     deploy = record.get("deploy") if isinstance(record.get("deploy"), Mapping) else {}
@@ -364,8 +405,10 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
         ("memory_gdn_output_normalizer", contract.gdn_output_normalizer),
         ("causal_observation", contract.causal_observation),
         ("causal_state", contract.causal_state),
+        ("state_cross_attention", contract.state_cross_attention),
         ("physical_rope", contract.physical_rope),
         ("sliding_window_chunks", contract.sliding_window_chunks),
+        ("use_attn_res", contract.use_attn_res),
     ):
         for where, block in (("", record), ("deploy.", deploy)):
             recorded = block.get(key)
@@ -377,10 +420,11 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
 
 
 def record_trees(record: Mapping[str, Any]) -> list[str]:
-    """The training trees a run record names, oldest first: the hex commit ids (7+ digits) of its ``source_commit`` and
-    of every ``scheme_history`` segment's ``code``."""
+    """The training trees a run record names, oldest first: the hex commit ids (7+ digits) of its ``source_commit``, of
+    its top-level ``code`` (the RUN_ID.json of the GB300 uploads, e.g. the sink-horizon no-AttnRes run) and of every
+    ``scheme_history`` segment's ``code``."""
 
-    texts = [str(record.get("source_commit") or "")]
+    texts = [str(record.get("source_commit") or ""), str(record.get("code") or "")]
     history = record.get("scheme_history")
     if isinstance(history, list):
         texts += [str(segment.get("code") or "") for segment in history if isinstance(segment, Mapping)]
@@ -421,6 +465,38 @@ def check_observation_form(
         f"known training tree ({trees or 'none'}): the GDN form of its observation group (branch since Sana fd5261ff6, "
         "joint before) cannot be told from the config. If the tree is fd5261ff6 or a descendant, add it to "
         "OBSERVATION_BRANCH_TREES; if older, serve it with SANA_WAM_CAUSAL up to XPolicyLab e35fcde"
+    )
+
+
+def check_state_token_form(
+    records: list[tuple[Path, Mapping[str, Any]]], contract: CausalContract, allow_unrecorded: bool = False
+) -> Optional[str]:
+    """The state token of a ``state_cross_attention`` checkpoint, from its run records' training trees: this adapter
+    serves Sana 4b29e92fd's (``state_embed`` + the caption y-norm, ``STATE_TOKEN_TREES``). Refuses a record naming only
+    trees of the first form (``STATE_PROJ_TREES``, a zero-initialized ``state_proj``; no run trained it) and, unless
+    ``allow_unrecorded`` (a step-0 donor directory: its state token starts from the donor's ``state_embed``, as Sana's
+    trainer starts it), a checkpoint whose records name no known tree. Returns the ready-report label (``None`` without
+    the switch)."""
+
+    if not contract.state_cross_attention:
+        return None
+    trees = [tree for _, record in records for tree in record_trees(record)]
+    token = [tree for tree in trees if _known(tree, STATE_TOKEN_TREES)]
+    if token:
+        return f"state_embed(4b29e92fd; trained on {token[-1]})"
+    proj = [tree for tree in trees if _known(tree, STATE_PROJ_TREES)]
+    if proj:
+        raise ValueError(
+            f"the run record names training trees {proj} from before Sana 4b29e92fd: their state_cross_attention token "
+            "went through a zero-initialized state_proj into the caption channels and the caption MLP, a form no run "
+            "trained and this adapter does not serve (from 4b29e92fd on the token is state_embed + the caption y-norm)"
+        )
+    if allow_unrecorded and not trees:
+        return "state_embed(unrecorded: donor directory)"
+    raise ValueError(
+        f"state_cross_attention checkpoint whose run records ({[str(path.name) for path, _ in records] or 'none'}) name "
+        f"no known training tree ({trees or 'none'}): its state token (state_embed since Sana 4b29e92fd, a state_proj "
+        "before) cannot be told from the config. If the tree is 4b29e92fd or a descendant, add it to STATE_TOKEN_TREES"
     )
 
 
@@ -581,6 +657,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
     refuse_chunk_observation(options.get("chunk_observation"))
     causal_observation = resolve_causal_observation(options.get("causal_observation"))
     causal_state = resolve_causal_state(options.get("causal_state"), causal_observation)
+    state_cross_attention = resolve_state_cross_attention(options.get("state_cross_attention"), causal_state)
     physical_rope = resolve_physical_rope(options.get("physical_rope"))
     aligned_phase_window = resolve_aligned_phase_window(_extra(cfg.get("data")).get("aligned_phase_window"))
     window = options.get("sliding_window_chunks")
@@ -628,6 +705,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         causal_state=causal_state,
         physical_rope=physical_rope,
         use_attn_res=resolve_use_attn_res(model_cfg.get("use_attn_res")),
+        state_cross_attention=state_cross_attention,
     )
 
 
@@ -648,9 +726,12 @@ __all__ = [
     "bidirectional_view",
     "SINK_HORIZON_CHUNKS",
     "SINK_HORIZON_TREES",
+    "STATE_PROJ_TREES",
+    "STATE_TOKEN_TREES",
     "WINDOW_START_SINK_TREES",
     "check_observation_form",
     "check_run_record",
+    "check_state_token_form",
     "chunk_causal_options",
     "describe_run_records",
     "is_causal_policy_config",
@@ -666,5 +747,6 @@ __all__ = [
     "resolve_physical_rope",
     "resolve_rope_clock",
     "resolve_memory_content",
+    "resolve_state_cross_attention",
     "resolve_use_attn_res",
 ]

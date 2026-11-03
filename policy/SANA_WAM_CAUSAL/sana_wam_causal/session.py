@@ -36,6 +36,13 @@ reading the sink, the window, the GDN state and itself and writing nothing to th
 it besides the window (``LayerCache.observed``), its targets one frame later (c * f_c + 2 ..) and its robot rows
 C / f_c steps later (the C action rows alone under ``causal_state``). The commit is the policy's without the option.
 
+Under ``state_cross_attention`` (Sana e00c28c9a / 4b29e92fd, deploy 64227cb07) no window and no committed chunk carries a
+state row: the denoising window is [targets_c] + [C actions] and a video_and_action commit [targets_c] + [C executed
+actions], the actions on their usual steps c * C + 1 .., and both carry the chunk's anchor state as one caption token of
+their robot rows' caption (the strip's robot group; the canvas's one prompt, which the targets read too). Under
+``causal_observation`` the canvas's observation prefill reads it as well (o_c shares its noisy segment's caption on the
+training canvas); the strip's reads its view prompts alone. The sink and a video_only commit read no state.
+
 Under ``physical_rope`` (Sana 6e91eaf2a) every token sits at its physical instant: a chunk's target latents (generated
 or committed) at the middle of the frames they cover, c * f_c + i + 0.5625, its observation latent at its start instant
 c * f_c, its rows at their own steps c * C .. without the observation shift, the sink at 0; the softmax reads, numbered
@@ -241,6 +248,7 @@ class CausalPolicySession:
         self.first_chunk = int(model.first_chunk)   # 1 after a padded window's frozen chunk 0, 0 on a first-frame window
         self.observation = bool(model.causal_observation)   # every chunk prefills its own observation latent
         self.causal_state = bool(model.causal_state)        # ... with the chunk's state row in its group
+        self.state_cross_attention = bool(model.state_cross_attention)   # the anchor state rides the caption, no row
         self.physical = bool(model.physical_rope)           # physical_rope: every token at its physical instant
         self.target_offset = float(model.target_frame_offset())   # a chunk's targets after its start instant (1 / 0.5625)
         self.steps = int(steps)
@@ -358,13 +366,13 @@ class CausalPolicySession:
         return frame_offset - origin * self.f_chunk, step_offset - origin * self.chunk_actions
 
     def _forward(self, latent, timesteps, caption: Caption, memory: CausalMemory, *, frame_offset, step_offset, robot,
-                 caches, robot_form=ROBOT_FORM_CHUNK):
+                 caches, robot_form=ROBOT_FORM_CHUNK, caption_state=None):
         soft_frame, soft_step = self._softmax_offsets(memory, frame_offset, step_offset)
         return self.model.forward_window(
             latent, timesteps, caption.y, caption.mask,
             model_fps=self.model_fps, frame_offset=frame_offset, step_offset=step_offset, view_shapes=self.view_shapes,
             view_slot_ids=self.view_slot_ids, robot=robot, caches=caches, softmax_frame_offset=soft_frame,
-            softmax_step_offset=soft_step, robot_form=robot_form,
+            softmax_step_offset=soft_step, robot_form=robot_form, caption_state=caption_state,
         )
 
     def window_offsets(self) -> tuple[float, int]:
@@ -382,8 +390,11 @@ class CausalPolicySession:
 
     def denoise_robot(self, robot: dict) -> tuple[dict, str]:
         """The robot rows of a denoising window and their form: the chunk's state and C action rows, the C action rows
-        alone under ``causal_state`` (the state row is in the observation prefill)."""
+        alone under ``causal_state`` (the state row is in the observation prefill) and under ``state_cross_attention``
+        (the state, kept in ``robot``, is the caption's token)."""
 
+        if self.state_cross_attention:
+            return robot, ROBOT_FORM_ACTIONS
         if not self.causal_state:
             return robot, ROBOT_FORM_CHUNK
         return {key: robot[key] for key in ("action80", "action_mask80", "action_timesteps")}, ROBOT_FORM_ACTIONS
@@ -402,19 +413,22 @@ class CausalPolicySession:
         latent), under ``causal_state`` with the chunk's state row at step c * C + C / f_c -- under ``physical_rope`` at
         the chunk's start instant, frame c * f_c and step c * C -- reading the sink, the softmax window, the GDN state
         and itself and writing nothing to the memory. Returns the caches of the chunk's denoise reads, which read the
-        observation besides the window (``LayerCache.observed``)."""
+        observation besides the window (``LayerCache.observed``). Under ``state_cross_attention`` the canvas's prefill
+        reads the chunk's state token (its one prompt is the noisy segment's), the strip's none."""
 
         caches = self._caches(memory, commit=False)
         for cache in caches:
             cache.observation_prefill = True
-        robot, form = None, ROBOT_FORM_CHUNK
+        robot, form, caption_state = None, ROBOT_FORM_CHUNK, None
         if self.causal_state:
             robot, form = {"state80": state, "state_mask80": state_mask}, ROBOT_FORM_STATE
+        elif self.state_cross_attention and int(caption.y.shape[1]) == 1:
+            caption_state = {"state80": state, "state_mask80": state_mask}
         frame = self.chunk_idx * self.f_chunk + (0 if self.physical else 1)
         step = self.chunk_idx * self.chunk_actions + (0 if self.physical else self.chunk_actions // self.f_chunk)
         t = torch.zeros(1, 1, device=observation.device)
         self._forward(observation, t, caption, memory, frame_offset=frame, step_offset=step, robot=robot, caches=caches,
-                      robot_form=form)
+                      robot_form=form, caption_state=caption_state)
         return [cache.observed() for cache in caches]
 
     # -- the episode opening -----------------------------------------------------------------------------------------
@@ -495,6 +509,8 @@ class CausalPolicySession:
         action_scheduler = make_scheduler(self.steps, self.action_flow_shift, device)
         state = anchor_state.reshape(1, -1).to(device)
         state_mask = anchor_state_mask.reshape(1, -1).to(device=device, dtype=torch.bool)
+        if self.probe is not None and self.state_cross_attention:
+            raise NotImplementedError("the attention probe does not model the state_cross_attention caption token")
         if self.observation:
             if self.probe is not None:
                 raise NotImplementedError("the attention probe does not model a causal_observation chunk's prefill")
@@ -584,7 +600,8 @@ class CausalPolicySession:
         """Fold chunk ``chunk_idx`` into memory (one clean forward per stream) and advance: a padded window's chunk 0 is
         the frozen first chunk (its rows hold the robot at its first state), every other chunk the EXECUTED one. Under
         ``memory_content`` video_only the memory keeps the target latents alone: the actions and the state are checked
-        but not committed (Sana's session does the same)."""
+        but not committed (Sana's session does the same). Under ``state_cross_attention`` a video_and_action commit
+        keeps the C action rows and reads the anchor state as its caption token."""
 
         if not self.has_sink:
             raise RuntimeError("commit_sink first: the episode's first frame opens the memory")
@@ -606,6 +623,7 @@ class CausalPolicySession:
                 "action_mask80": action_mask.to(device),
                 "action_timesteps": torch.zeros(1, chunk, device=device),
             }
+        form = ROBOT_FORM_ACTIONS if robot is not None and self.state_cross_attention else ROBOT_FORM_CHUNK
         video_t = torch.zeros(1, self.f_chunk, device=device)
         frame_offset = self.chunk_idx * self.f_chunk + self.target_offset   # physical_rope: its frames' middle
         step_offset = self.chunk_idx * chunk
@@ -614,7 +632,7 @@ class CausalPolicySession:
                 caches = self._caches(memory, commit=True)
                 self._forward(
                     chunk_latent, video_t, caption, memory, frame_offset=frame_offset, step_offset=step_offset,
-                    robot=robot, caches=caches,
+                    robot=robot, caches=caches, robot_form=form,
                 )
                 memory.absorb(caches)
         self.chunk_idx += 1

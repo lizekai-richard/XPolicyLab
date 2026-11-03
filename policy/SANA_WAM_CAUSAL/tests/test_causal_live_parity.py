@@ -7,6 +7,8 @@ test of the window-start sink skips, and the other way round on an older tree, s
 9a1b3e33d, then 7ed0d28bf). The numerator-only GDN readout (``model.memory_gdn_output_normalizer:
 false``) needs a tree at or after c414e9b32; those tests skip on an older one. The observation tests need a tree at or
 after fd5261ff6 (the GDN branch of the observation group, sana-rwm's two-stream obs-block) and skip on an older one.
+The state_cross_attention tests (every chunk's anchor state as a caption token, no state row) need a tree at or after
+4b29e92fd (the token through state_embed; e.g. 6de2454dc) and skip on an older one.
 
 The live class and the mirror get identical random weights (tiny dims, fp64, CPU, xformers off, ``flash_attn`` bound to
 an fp64 reference varlen as Sana's own tests do). The decisive check is the teacher-forced deploy contract: the
@@ -52,6 +54,10 @@ FP32_ATTENTION_CLOSE = {"rtol": 1e-5, "atol": 1e-8}  # fp32 attention on: CPU SD
 # prefill and the window, which moves fp64 round-off; Sana's own observation-session parity uses the same bound
 # (tests/test_causal_observation_session.py EXACT)
 OBSERVED_CLOSE = {"rtol": 1e-7, "atol": 1e-9}
+# state_cross_attention: Sana packs the robot group's valid caption keys then the state token, the mirror keeps the
+# padded caption under its mask and appends the token; the softmax sums the same keys in another order (fp64 round-off
+# of ~1e-9 relative)
+STATE_XATTN_CLOSE = OBSERVED_CLOSE
 
 
 def _reference_varlen(q, k, v, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None, dropout_p=0.0):
@@ -142,6 +148,18 @@ def _require_live_physical_rope():
         pytest.skip(f"{SANA_CAUSAL_REPO} predates physical_rope (6e91eaf2a)")
 
 
+def _require_live_state_cross_attention():
+    """Skip unless the live tree serves state_cross_attention with the state_embed token (Sana 4b29e92fd: training
+    canvas) in its cached session (64227cb07)."""
+
+    causal, crwm = _live_modules()
+    live_class = causal.SanaRWMVideoQwenNextSubAttnResV2SelfFlowWorldModelCameraConditionMultiViewCausal
+    if not hasattr(crwm, "resolve_state_cross_attention") or not hasattr(live_class, "_state_context_tokens"):
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates state_cross_attention (e00c28c9a)")
+    if "state_proj" in inspect.getsource(live_class._state_context_tokens):
+        pytest.skip(f"{SANA_CAUSAL_REPO} projects the state token with state_proj (e00c28c9a .. 4b29e92fd^)")
+
+
 def _live_sink_horizon() -> bool:
     """Whether the live tree reads the softmax sink at chunk max(0, c - 7) (Sana 0c88c11ab: ``sink_read_chunks``)."""
 
@@ -165,7 +183,7 @@ class Twins:
     def __init__(self, *, views=1, stride=4, chunk=32, window=None, separate=True, chunks=4, depth=4, seed=11,
                  fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, first_frame=False, normalizer=True,
                  live_normalizer=None, observation=False, state=False, physical=False, live_physical=None,
-                 attn_res=True, horizon=False, live_horizon=None):
+                 attn_res=True, horizon=False, live_horizon=None, state_xattn=False):
         causal, self.crwm = _live_modules()
         # the softmax sink rule (Sana 0c88c11ab: at chunk max(0, c - 7), the physical clock only) of the mirror and of
         # the live tree (live_horizon differs only in the negative control)
@@ -195,6 +213,11 @@ class Twins:
         if observation:
             _require_live_causal_observation(state)
             options.update(causal_observation=True, causal_state=bool(state))
+        # state_cross_attention (Sana 4b29e92fd): every chunk's anchor state a caption token, no state row
+        self.state_xattn = bool(state_xattn)
+        if self.state_xattn:
+            _require_live_state_cross_attention()
+            options["state_cross_attention"] = True
         # physical_rope (Sana 6e91eaf2a) on the mirror and on the live policy (live_physical differs only in the negative
         # control)
         self.physical = bool(physical) or self.horizon
@@ -227,6 +250,7 @@ class Twins:
         assert self.live.memory_content == memory and self.live.sliding_window_chunks == window
         assert tuple(self.live.multiview_spatial_rope_tile_shape) == (8, 16)
         assert getattr(self.live, "memory_gdn_output_normalizer", True) is live_normalizer
+        assert getattr(self.live, "state_cross_attention", False) is self.state_xattn
         with torch.no_grad():
             for parameter in self.live.parameters():
                 parameter.uniform_(-0.05, 0.05)
@@ -240,6 +264,7 @@ class Twins:
             aligned_phase_window="first_frame" if first_frame else "padded",
             gdn_output_normalizer=normalizer, causal_observation=self.observation, causal_state=self.state,
             physical_rope=self.physical, use_attn_res=self.attn_res, sink_horizon=7 if self.horizon else None,
+            state_cross_attention=self.state_xattn,
         )
         policy_config = PolicyConfig.from_sana_kwargs(config=config, **kwargs)
         assert tuple(policy_config.multiview_spatial_rope_tile_shape) == (8, 16)
@@ -275,6 +300,7 @@ class Twins:
         # causal_observation: every chunk's own observation latent (its start frame encoded alone), drawn after the
         # rest so the episode above is the same with and without the option
         self.observations = [randn(1, C_LAT, 1, 1, self.width) for _ in range(chunks)]
+        self.commit_state_shift = 0.0   # a negative control: the commits read another state than training's
 
     @property
     def video_and_action(self) -> bool:
@@ -365,7 +391,7 @@ class Twins:
     def commit(self, session: CausalPolicySession, k: int) -> None:
         mask = torch.ones(1, self.chunk, 80, dtype=torch.bool)
         session.commit_chunk(
-            self.ours(self.clean[k]), self.a_clean[k], anchor_state=self.states[k],
+            self.ours(self.clean[k]), self.a_clean[k], anchor_state=self.states[k] + self.commit_state_shift,
             anchor_state_mask=torch.ones(1, 80, dtype=torch.bool), action_mask=mask,
         )
 
@@ -1544,3 +1570,151 @@ def test_a_sink_horizon_session_matches_the_live_deploy_session_at_a_seven_chunk
                           anchor_state_mask=state_mask, action_mask=mask)
     assert ours.chunk_idx == live.chunk_idx == chunks
     assert origins == [max(0, k - 7) for k in range(chunks)]
+
+
+# -- state_cross_attention (Sana e00c28c9a / 4b29e92fd, deploy 64227cb07) ------------------------------------------------
+
+STATE_XATTN_CASES = [
+    # views, stride, chunk, window, length, memory, first_frame, observation, normalizer, attn_res
+    (3, 4, 32, 1, 10, MEMORY_VIDEO_ONLY, True, True, False, False),       # the no-AttnRes sana_latent N1-obs recipe
+    (1, 4, 32, 1, 10, MEMORY_VIDEO_ONLY, True, True, False, True),        # sana_pixel N1-obs: the prefill reads the token
+    (3, 4, 32, 2, 9, MEMORY_VIDEO_AND_ACTION, False, False, True, True),  # padded, the commits keep rows and token
+    (1, 4, 32, 3, 9, MEMORY_VIDEO_AND_ACTION, True, True, True, False),
+    (3, 4, 32, 7, 9, MEMORY_VIDEO_AND_ACTION, True, True, True, True),    # W = H
+    (1, 1, 16, 2, 9, MEMORY_VIDEO_ONLY, True, False, False, True),        # f_c = 2
+]
+STATE_XATTN_IDS = ["V3-W1-vo-obs-num-plain", "V1-W1-vo-obs-num", "V3-W2-va-pad", "V1-W3-va-obs-plain", "V3-W7-va-obs",
+                   "V1-s1c16-W2-vo-num"]
+
+
+@pytest.mark.parametrize("views,stride,chunk,window,length,memory,first_frame,observation,normalizer,attn_res",
+                         STATE_XATTN_CASES, ids=STATE_XATTN_IDS)
+def test_a_state_cross_attention_deploy_chain_equals_two_stream_training_forward(
+        views, stride, chunk, window, length, memory, first_frame, observation, normalizer, attn_res):
+    """Sana 4b29e92fd: the training canvas without state rows, every row chunk's anchor state a caption token of its
+    robot rows' caption (the strip's robot group, the canvas's one prompt) == the deploy chain chunk by chunk: windows
+    of the C action rows alone with the chunk's state token, commits keeping their action rows and token under
+    video_and_action, the canvas's observation prefill reading the token; past the sink horizon, both front-ends, both
+    memory contents and phase windows, with and without observation latents, AttnRes and the GDN denominator."""
+
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=length, memory=memory,
+                  first_frame=first_frame, normalizer=normalizer, observation=observation, attn_res=attn_res,
+                  horizon=True, state_xattn=True)
+    assert twins.mirror.state_cross_attention and twins.mirror.sink_horizon == 7
+    training = twins.two_stream(length) if first_frame else twins.two_stream(length)[1:]
+    streaming = twins.streaming_first_frame(length) if first_frame else twins.streaming(length)
+    close = STATE_XATTN_CLOSE
+    assert len(training) == len(streaming)
+    for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming)):
+        torch.testing.assert_close(x_ours, x_live, **close, msg=lambda m: f"chunk {k} video: {m}")
+        torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+
+
+def _state_xattn_gaps(twins, length):
+    training = twins.two_stream(length)
+    streaming = twins.streaming_first_frame(length)
+    return [max(_max_abs(streaming[k][i], training[k][i]) for i in (0, 1)) for k in range(length)]
+
+
+@pytest.mark.parametrize("views", [1, 3])
+def test_a_state_cross_attention_mirror_without_the_token_or_with_a_state_row_is_caught(views, monkeypatch):
+    """Negative controls: the parity above misses on every chunk when the mirror drops the state token, or serves the
+    switch-off policy (a state row in every window, no token) on the same weights."""
+
+    length = 4
+    twins = Twins(views=views, window=2, chunks=length, memory=MEMORY_VIDEO_AND_ACTION, first_frame=True,
+                  horizon=True, state_xattn=True)
+    assert max(_state_xattn_gaps(twins, length)) < 1e-9
+    with monkeypatch.context() as patch:
+        patch.setattr(CausalPolicyModel, "_append_state_token", lambda self, text, mask, state, state_mask: (text, mask))
+        assert min(_state_xattn_gaps(twins, length)) > 1e-6
+    twins.mirror.state_cross_attention = False
+    try:
+        assert min(_state_xattn_gaps(twins, length)) > 1e-6
+    finally:
+        twins.mirror.state_cross_attention = True
+
+
+def test_a_canvas_prefill_without_the_token_and_a_commit_of_another_state_are_caught(monkeypatch):
+    """Negative controls: the canvas's observation prefill must read its chunk's state token (on the training canvas o_c
+    shares its noisy segment's caption) -- dropping it misses every chunk -- and a video_and_action commit must read its
+    own chunk's state -- another state misses every chunk after the first commit; the strip's prefill reads no token
+    (the model refuses one)."""
+
+    length = 4
+    twins = Twins(views=1, window=2, chunks=length, memory=MEMORY_VIDEO_AND_ACTION, first_frame=True, observation=True,
+                  horizon=True, state_xattn=True)
+    original = CausalPolicyModel.forward_window
+
+    def without_caption_state(self, *args, **kwargs):
+        kwargs["caption_state"] = None
+        return original(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(CausalPolicyModel, "forward_window", without_caption_state)
+        assert min(_state_xattn_gaps(twins, length)) > 1e-6
+    twins.commit_state_shift = 0.5
+    gaps = _state_xattn_gaps(twins, length)
+    assert gaps[0] < 1e-7 and min(gaps[1:]) > 1e-6, gaps
+    strip = Twins(views=3, window=1, chunks=2, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=True,
+                  horizon=True, state_xattn=True)
+    with pytest.raises(ValueError, match="robotless window of the strip reads its view prompts alone"):
+        strip.mirror.forward_window(
+            strip.observations[0], torch.zeros(1, 1, dtype=torch.float64), strip.y, strip.mask, model_fps=FPS,
+            frame_offset=0, step_offset=0, view_shapes=strip.view_shapes, view_slot_ids=strip.slots,
+            caption_state={"state80": strip.states[0], "state_mask80": torch.ones(1, 80, dtype=torch.bool)},
+        )
+
+
+STATE_XATTN_SESSION_CASES = [
+    # views, memory, video_cfg, action_cfg, position mode, observation, normalizer, attn_res
+    (3, MEMORY_VIDEO_ONLY, 6.0, 1.0, "rank", True, False, False),
+    (1, MEMORY_VIDEO_ONLY, 6.0, 1.0, "absolute", True, False, True),
+    (1, MEMORY_VIDEO_AND_ACTION, 2.5, 1.7, "rank", False, True, True),
+    (3, MEMORY_VIDEO_AND_ACTION, 3.0, 1.0, "absolute", True, True, False),
+]
+
+
+@pytest.mark.parametrize("views,memory,video_cfg,action_cfg,position_mode,observation,normalizer,attn_res",
+                         STATE_XATTN_SESSION_CASES)
+def test_a_state_cross_attention_session_matches_the_live_deploy_session(
+        views, memory, video_cfg, action_cfg, position_mode, observation, normalizer, attn_res):
+    """A first-frame episode of a state_cross_attention policy: the mirror's session == Sana's CausalPolicyChunkSession
+    (deploy 64227cb07: no state lane in any window or entry, the caption carries the anchor state) past chunk 7 at
+    W = 7 (the one window Sana's cached forms run under the sink horizon), per-stream CFG, then the same commits."""
+
+    steps, chunks = 2, 10
+    twins = Twins(views=views, window=7, chunks=chunks, memory=memory, first_frame=True, observation=observation,
+                  normalizer=normalizer, attn_res=attn_res, horizon=True, state_xattn=True)
+    live = _live_session(twins, steps, video_cfg, action_cfg, position_mode)
+    ours = twins.session(steps=steps, video_cfg=video_cfg, action_cfg=action_cfg)
+    assert live.state_cross_attention and ours.state_cross_attention
+    close = STATE_XATTN_CLOSE
+    mask = torch.ones(1, twins.chunk, 80, dtype=torch.bool)
+    mask[..., 60:] = False
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    state_mask[:, 70:] = False
+    live.commit_sink(twins.sink)
+    ours.commit_sink(twins.ours(twins.sink))
+    g = torch.Generator().manual_seed(37)
+    for k in range(chunks):
+        video_noise = torch.randn(1, C_LAT, twins.f_chunk, 1, twins.width, generator=g, dtype=torch.float64)
+        action_noise = torch.randn(1, twins.chunk, 80, generator=g, dtype=torch.float64)
+        extra_live, extra_ours = {}, {}
+        if observation:
+            seen = twins.sink if k == 0 else twins.observations[k]   # chunk 0's observation is the sink's latent
+            extra_live, extra_ours = {"observation": seen}, {"observation": twins.ours(seen)}
+        a_live, v_live = live.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask, video_noise=video_noise,
+            action_noise=action_noise, **extra_live,
+        )
+        a_ours, v_ours = ours.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask,
+            video_noise=twins.ours(video_noise), action_noise=action_noise, **extra_ours,
+        )
+        torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+        torch.testing.assert_close(v_ours, twins.ours(v_live), **close, msg=lambda m: f"chunk {k} video: {m}")
+        live.commit_chunk(twins.clean[k], twins.a_clean[k], anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask)
+        ours.commit_chunk(twins.ours(twins.clean[k]), twins.a_clean[k], anchor_state=twins.states[k],
+                          anchor_state_mask=state_mask, action_mask=mask)
+    assert ours.chunk_idx == live.chunk_idx == chunks

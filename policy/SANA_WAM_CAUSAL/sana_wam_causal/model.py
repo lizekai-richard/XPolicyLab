@@ -20,6 +20,13 @@ streaming session needs (Sana ``CausalPolicyChunkSession`` with ``forward_sink``
   and its robot rows ``C / f_chunk`` steps later, the C action rows alone under ``causal_state`` (``robot_form``
   actions, at rows 1..C of the chunk grid).
 
+Under ``state_cross_attention`` (Sana e00c28c9a / 4b29e92fd, deploy 64227cb07) no window carries a state row: a window's
+robot rows are its C action rows alone (``robot_form`` actions, rows 1..C of the chunk grid: the denoising window and
+the commit under video_and_action), and the chunk's anchor state (``robot["state80"]``) becomes one caption token
+(``state_embed``, then the caption y-norm) closing the caption its robot rows read: the robot group of the strip, the one
+shared prompt of the canvas, whose targets read it too. A robotless window reads none, except the observation prefill on
+the canvas (``caption_state``: on the training canvas o_c shares its noisy segment's caption).
+
 Front-ends: the one-view canvas ``[B, C, F, H, W]`` (``sana_pixel``) and the three-view strip ``[B, C, F, 1,
 sum(H_v * W_v)]`` (``sana_latent``), restored to view-major tokens (every view's frames in turn) before the trunk, the
 robot rows after them (Sana ``_chunk_permutation`` of a single segment).
@@ -72,7 +79,8 @@ GDN_RECURRENCE_KEYS = ("gate_proj.weight", "gate_proj.bias", "A_log", "dt_bias",
 # the robot rows of a window (Sana ``ROBOT_ROWS_STATE`` / ``ROBOT_ROWS_ACTIONS`` of a causal_state policy)
 ROBOT_FORM_CHUNK = "chunk"        # the state row and the C action rows (every window without causal_state)
 ROBOT_FORM_STATE = "state"        # the state row alone: a causal_state observation prefill
-ROBOT_FORM_ACTIONS = "actions"    # the C action rows alone: a causal_state denoise window
+ROBOT_FORM_ACTIONS = "actions"    # the C action rows alone: a causal_state denoise window, every state_cross_attention
+                                  # window with robot rows
 ROBOT_FORMS = (ROBOT_FORM_CHUNK, ROBOT_FORM_STATE, ROBOT_FORM_ACTIONS)
 
 
@@ -133,6 +141,10 @@ class CausalPolicyModel(PolicyModel):
         self.first_chunk = int(contract.first_chunk)   # the chunk an episode emits first (0: first-frame window)
         self.causal_observation = bool(contract.causal_observation)
         self.causal_state = bool(contract.causal_state)
+        # Sana 4b29e92fd: every chunk's anchor state is a caption token of its robot rows' caption, no state row
+        self.state_cross_attention = bool(contract.state_cross_attention)
+        if self.state_cross_attention and self.causal_state:
+            raise ValueError("state_cross_attention removes the state row causal_state joins to the observation latent")
         self.physical_rope = bool(contract.physical_rope)
         # Sana 0c88c11ab: a softmax reader in chunk c reads the sink at chunk max(0, c - H)'s start (None: its window's)
         self.sink_horizon = None if contract.sink_horizon is None else int(contract.sink_horizon)
@@ -265,12 +277,13 @@ class CausalPolicyModel(PolicyModel):
     ) -> torch.Tensor:
         """Softmax rotary table of one committed entry, in its window's token order, at the read's positions: the sink
         (one frame, no rows) or a committed chunk (``f_c`` target frames from ``slot * f_c + 1``, then its state row
-        at step ``slot * C`` and its C action rows under ``memory_content`` video_and_action)."""
+        at step ``slot * C`` and its C action rows under ``memory_content`` video_and_action; the C action rows alone,
+        from step ``slot * C + 1``, under ``state_cross_attention``)."""
 
         fps = PhysicalTimeWanRotaryPosEmbed._normalize_fps(model_fps, 1, device)
         return self.window_rope(
             self.rope_softmax, fps, int(frames), view_shapes, view_slot_ids, int(robot_rows), float(frame_offset),
-            int(step_offset), device,
+            int(step_offset), device, int(self.state_cross_attention and bool(robot_rows)),
         )
 
     def target_frame_offset(self) -> float:
@@ -284,9 +297,12 @@ class CausalPolicyModel(PolicyModel):
         return (stride + 1) / (2 * stride)
 
     def chunk_robot_rows(self) -> int:
-        """Robot rows a committed chunk keeps: its state and C actions under video_and_action, none under video_only."""
+        """Robot rows a committed chunk keeps: its state and C actions under video_and_action (the C actions alone under
+        ``state_cross_attention``, its state in the commit's caption), none under video_only."""
 
-        return 1 + self.chunk_actions if self.memory_content == MEMORY_VIDEO_AND_ACTION else 0
+        if self.memory_content != MEMORY_VIDEO_AND_ACTION:
+            return 0
+        return int(not self.state_cross_attention) + self.chunk_actions
 
     # -- the trunk -----------------------------------------------------------------------------------------------------
 
@@ -382,6 +398,22 @@ class CausalPolicyModel(PolicyModel):
             raise ValueError(f"the text spans cover {offset} of {tokens} window tokens")
         return text, text_mask, tuple(spans)
 
+    def _append_state_token(self, text, text_mask, state: torch.Tensor, state_mask: torch.Tensor):
+        """``state_cross_attention``: the anchor state as one more key of the window's last text group (the robot group
+        of the strip, the canvas's one prompt), a key no mask hides; every other group gets a masked pad slot. The
+        token is ``state_embed`` then the caption y-norm (Sana ``_state_context_tokens``); ``[B,G,L,C]`` ->
+        ``[B,G,L+1,C]`` and a ``[B,G,L+1]`` mask (Sana packs the caption's valid keys then the token, the same keys)."""
+
+        batch, groups, length, hidden = text.shape
+        state = torch.as_tensor(state).to(device=text.device).reshape(batch, -1)
+        state_mask = torch.as_tensor(state_mask).to(device=text.device, dtype=torch.bool).reshape(batch, -1)
+        token = self.attention_y_norm(self.state_embed(state.to(dtype=self.dtype), state_mask)).to(text.dtype)
+        column = torch.cat((token.new_zeros(batch, groups - 1, hidden), token.unsqueeze(1)), dim=1).unsqueeze(2)
+        base_mask = text.new_ones(batch, groups, length, dtype=torch.int16) if text_mask is None else text_mask
+        mask_column = torch.zeros(batch, groups, 1, dtype=base_mask.dtype, device=base_mask.device)
+        mask_column[:, -1, 0] = 1
+        return torch.cat((text, column), dim=2), torch.cat((base_mask, mask_column), dim=2)
+
     @torch.no_grad()
     def forward_window(
         self,
@@ -400,6 +432,7 @@ class CausalPolicyModel(PolicyModel):
         softmax_frame_offset: Optional[int] = None,
         softmax_step_offset: Optional[int] = None,
         robot_form: str = ROBOT_FORM_CHUNK,
+        caption_state: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
         """Evaluate one single-segment window: a chunk's denoising window [targets] + robot rows, the commit of an
         executed chunk [targets] (+ robot rows under ``memory_content`` video_and_action), or the sink commit (one
@@ -426,7 +459,11 @@ class CausalPolicyModel(PolicyModel):
             caches: None for a window that reads and writes nothing, else one ``LayerCache`` per block.
             robot_form: which robot rows ``robot`` carries (``causal_state``, Sana ``robot_rows``): ``chunk`` the state
                 row and the C action rows; ``state`` the state row alone (the observation prefill's group, t = 0);
-                ``actions`` the C action rows alone (the denoise window, at rows 1..C of the chunk grid).
+                ``actions`` the C action rows alone (the denoise window, at rows 1..C of the chunk grid; every window
+                with robot rows under ``state_cross_attention``, whose ``robot["state80"]`` is the caption's state
+                token instead of a row).
+            caption_state: ``state80`` / ``state_mask80`` of the state token a robotless window's caption carries
+                under ``state_cross_attention``: the observation prefill on the canvas (one shared prompt) only.
 
         Returns:
             ``{}`` for a robotless window or the state row alone (nothing reads its prediction); else ``{"x": velocity
@@ -471,8 +508,14 @@ class CausalPolicyModel(PolicyModel):
         )
         if robot_form not in ROBOT_FORMS:
             raise ValueError(f"robot_form must be one of {ROBOT_FORMS}, got {robot_form!r}")
-        if robot_form != ROBOT_FORM_CHUNK and (robot is None or not self.causal_state):
+        if robot_form != ROBOT_FORM_CHUNK and (robot is None or not (self.causal_state or self.state_cross_attention)):
             raise ValueError(f"robot_form {robot_form!r} is a causal_state window with robot rows")
+        if self.state_cross_attention and robot is not None and robot_form != ROBOT_FORM_ACTIONS:
+            raise ValueError("under state_cross_attention a window's robot rows are its C action rows alone (robot_form "
+                             "actions); the anchor state is a caption token")
+        if caption_state is not None and (not self.state_cross_attention or robot is not None):
+            raise ValueError("caption_state is the state token of a robotless state_cross_attention window")
+        state_token = caption_state if robot is None else (robot if self.state_cross_attention else None)
         robot_step_start = 1 if robot_form == ROBOT_FORM_ACTIONS else 0
         action_mask = None
         if robot is None:
@@ -519,6 +562,10 @@ class CausalPolicyModel(PolicyModel):
         modulation = self.t_block(time_embedding)
         text, text_mask = self._grouped_text_condition(y, mask)
         text, text_mask, spans = self._window_text_spans(text, text_mask, view_shapes, robot_rows, int(tokens.shape[1]))
+        if state_token is not None:
+            if robot is None and text.shape[1] != 1:
+                raise ValueError("a robotless window of the strip reads its view prompts alone, no state token")
+            text, text_mask = self._append_state_token(text, text_mask, state_token["state80"], state_token["state_mask80"])
         tokens = self._causal_trunk(
             tokens,
             text,

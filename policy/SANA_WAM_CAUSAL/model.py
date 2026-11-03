@@ -336,7 +336,8 @@ class Model(ModelTemplate):
             f"prediction_latent_dir={self.prediction_latent_dir} "
             f"gdn_recurrence={report.get('gdn_recurrence')} normalization_sha256={self.normalization.sha256} "
             f"run_record={report.get('run_record')} gdn_observation={report.get('gdn_observation')} "
-            f"rope_clock={report.get('rope_clock')} gripper_range={report.get('gripper_range')} "
+            f"rope_clock={report.get('rope_clock')} state_token={report.get('state_token')} "
+            f"gripper_range={report.get('gripper_range')} "
             f"device={self.device} action_type={self.action_type}",
             flush=True,
         )
