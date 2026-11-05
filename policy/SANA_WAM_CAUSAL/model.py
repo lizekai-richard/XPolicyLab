@@ -53,7 +53,7 @@ if str(POLICY_DIR) not in sys.path:
 
 from sana_wam_causal import shared  # noqa: E402,F401  (puts policy/SANA_WAM on sys.path)
 from sana_wam_causal.attention_probe import AttentionProbe  # noqa: E402
-from sana_wam_causal.contract import MEMORY_VIDEO_AND_ACTION  # noqa: E402
+from sana_wam_causal.contract import ACTION_ROPE_1D, MEMORY_VIDEO_AND_ACTION  # noqa: E402
 from sana_wam_causal.runtime import CausalRuntime, timed  # noqa: E402
 
 from sana_wam_min.actions import model_action_to_absolute  # noqa: E402
@@ -327,8 +327,10 @@ class Model(ModelTemplate):
         self._instruction: Optional[str] = None
         self._size_warned = False
         report = self.runtime.load_report
+        # the softmax read clock: renumbered from its origin, absolute under action_rope 1D (session.py, "Positions")
+        positions = "absolute" if contract.action_rope == ACTION_ROPE_1D else "rank"
         print(
-            f"{TAG} ready: ckpt={self.ckpt_dir} {contract.describe()} softmax_positions=rank+sink "
+            f"{TAG} ready: ckpt={self.ckpt_dir} {contract.describe()} softmax_positions={positions}+sink "
             f"steps={frontend.steps} video_cfg_scale={frontend.video_cfg_scale} action_cfg_scale={frontend.action_cfg_scale} "
             f"flow_shift={frontend.flow_shift} action_flow_shift={frontend.action_flow_shift} "
             f"view_resize={frontend.view_resize} ({frontend.view_resize_source}) commit_actions={self.commit_actions} "
@@ -337,6 +339,7 @@ class Model(ModelTemplate):
             f"gdn_recurrence={report.get('gdn_recurrence')} normalization_sha256={self.normalization.sha256} "
             f"run_record={report.get('run_record')} gdn_observation={report.get('gdn_observation')} "
             f"rope_clock={report.get('rope_clock')} state_token={report.get('state_token')} "
+            f"action_rope_form={report.get('action_rope_form')} "
             f"gripper_range={report.get('gripper_range')} "
             f"device={self.device} action_type={self.action_type}",
             flush=True,

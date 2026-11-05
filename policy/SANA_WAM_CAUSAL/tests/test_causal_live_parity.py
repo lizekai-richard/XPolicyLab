@@ -8,7 +8,8 @@ test of the window-start sink skips, and the other way round on an older tree, s
 false``) needs a tree at or after c414e9b32; those tests skip on an older one. The observation tests need a tree at or
 after fd5261ff6 (the GDN branch of the observation group, sana-rwm's two-stream obs-block) and skip on an older one.
 The state_cross_attention tests (every chunk's anchor state as a caption token, no state row) need a tree at or after
-4b29e92fd (the token through state_embed; e.g. 6de2454dc) and skip on an older one.
+4b29e92fd (the token through state_embed; e.g. 6de2454dc) and skip on an older one. The action_rope 1D tests (the robot
+rows turned by one whole-head ladder at their instants) need a tree at or after b8cd4c2ee and skip on an older one.
 
 The live class and the mirror get identical random weights (tiny dims, fp64, CPU, xformers off, ``flash_attn`` bound to
 an fp64 reference varlen as Sana's own tests do). The decisive check is the teacher-forced deploy contract: the
@@ -160,6 +161,14 @@ def _require_live_state_cross_attention():
         pytest.skip(f"{SANA_CAUSAL_REPO} projects the state token with state_proj (e00c28c9a .. 4b29e92fd^)")
 
 
+def _require_live_action_rope():
+    """Skip unless the live tree reads ``model.extra.chunk_causal_policy.action_rope`` (Sana b8cd4c2ee)."""
+
+    _, crwm = _live_modules()
+    if not hasattr(crwm, "resolve_action_rope"):
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates action_rope (b8cd4c2ee)")
+
+
 def _live_sink_horizon() -> bool:
     """Whether the live tree reads the softmax sink at chunk max(0, c - 7) (Sana 0c88c11ab: ``sink_read_chunks``)."""
 
@@ -183,7 +192,8 @@ class Twins:
     def __init__(self, *, views=1, stride=4, chunk=32, window=None, separate=True, chunks=4, depth=4, seed=11,
                  fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, first_frame=False, normalizer=True,
                  live_normalizer=None, observation=False, state=False, physical=False, live_physical=None,
-                 attn_res=True, horizon=False, live_horizon=None, state_xattn=False):
+                 attn_res=True, horizon=False, live_horizon=None, state_xattn=False, action_rope="3D",
+                 live_action_rope=None):
         causal, self.crwm = _live_modules()
         # the softmax sink rule (Sana 0c88c11ab: at chunk max(0, c - 7), the physical clock only) of the mirror and of
         # the live tree (live_horizon differs only in the negative control)
@@ -218,6 +228,14 @@ class Twins:
         if self.state_xattn:
             _require_live_state_cross_attention()
             options["state_cross_attention"] = True
+        # action_rope (Sana b8cd4c2ee) of the mirror and of the live policy (live_action_rope differs only in the negative
+        # control); 3D is the live default, so its config carries no key, as every recipe before the switch
+        self.action_rope = str(action_rope)
+        live_action_rope = self.action_rope if live_action_rope is None else str(live_action_rope)
+        if "1D" in (self.action_rope, live_action_rope):
+            _require_live_action_rope()
+        if live_action_rope != "3D":
+            options["action_rope"] = live_action_rope
         # physical_rope (Sana 6e91eaf2a) on the mirror and on the live policy (live_physical differs only in the negative
         # control)
         self.physical = bool(physical) or self.horizon
@@ -251,6 +269,7 @@ class Twins:
         assert tuple(self.live.multiview_spatial_rope_tile_shape) == (8, 16)
         assert getattr(self.live, "memory_gdn_output_normalizer", True) is live_normalizer
         assert getattr(self.live, "state_cross_attention", False) is self.state_xattn
+        assert getattr(self.live, "action_rope", "3D") == live_action_rope
         with torch.no_grad():
             for parameter in self.live.parameters():
                 parameter.uniform_(-0.05, 0.05)
@@ -264,7 +283,7 @@ class Twins:
             aligned_phase_window="first_frame" if first_frame else "padded",
             gdn_output_normalizer=normalizer, causal_observation=self.observation, causal_state=self.state,
             physical_rope=self.physical, use_attn_res=self.attn_res, sink_horizon=7 if self.horizon else None,
-            state_cross_attention=self.state_xattn,
+            state_cross_attention=self.state_xattn, action_rope=self.action_rope,
         )
         policy_config = PolicyConfig.from_sana_kwargs(config=config, **kwargs)
         assert tuple(policy_config.multiview_spatial_rope_tile_shape) == (8, 16)
@@ -641,11 +660,11 @@ def test_a_pinned_sink_is_caught_on_the_evicting_chunks(views, monkeypatch):
     training = twins.two_stream(length)[1:]
     original = CausalPolicySession._sink_rope
 
-    def pinned(self):
-        rope = original(self)
+    def pinned(self, memory):
+        rope = original(self, memory)
         if rope is None:
             return None
-        origin = self.softmax_origin()
+        origin = memory.read_plan()[1]
         return self.model.softmax_entry_rope(
             frames=1, frame_offset=-origin * self.f_chunk, robot_rows=0, step_offset=0, model_fps=self.model_fps,
             view_shapes=self._views(), view_slot_ids=self.view_slot_ids, device=rope.device,
@@ -1718,3 +1737,178 @@ def test_a_state_cross_attention_session_matches_the_live_deploy_session(
         ours.commit_chunk(twins.ours(twins.clean[k]), twins.a_clean[k], anchor_state=twins.states[k],
                           anchor_state_mask=state_mask, action_mask=mask)
     assert ours.chunk_idx == live.chunk_idx == chunks
+
+
+# -- action_rope (Sana b8cd4c2ee) ----------------------------------------------------------------------------------------
+
+# the live two-stream canvas is batched and sums in another order than the deploy chain's per-chunk windows: ~1e-10 of
+# the output's max on the padded video_and_action form under 1D and 3D alike, which an elementwise rtol of 1e-9 meets
+# only by chance on near-zero elements
+ACTION_ROPE_CLOSE = OBSERVED_CLOSE
+
+ACTION_ROPE_CASES = [
+    # views, stride, chunk, window, length, memory, first_frame, observation, state, state_xattn, normalizer, attn_res
+    (3, 4, 32, 1, 10, MEMORY_VIDEO_ONLY, True, True, False, True, False, True),        # the statexattn sana latent N1
+    (3, 4, 32, 1, 10, MEMORY_VIDEO_ONLY, True, True, True, False, False, False),       # obs + state row, no AttnRes
+    (1, 4, 32, 1, 10, MEMORY_VIDEO_ONLY, True, True, False, True, False, True),        # canvas: the prefill reads the token
+    (1, 4, 32, 2, 9, MEMORY_VIDEO_AND_ACTION, False, False, False, False, True, True), # padded, commits keep state + actions
+    (3, 4, 32, 3, 9, MEMORY_VIDEO_AND_ACTION, True, True, True, False, True, True),    # committed rows + the state prefill
+    (3, 4, 32, 7, 9, MEMORY_VIDEO_AND_ACTION, True, False, False, True, True, False),  # W = H, committed action rows
+    (1, 1, 16, 2, 9, MEMORY_VIDEO_ONLY, True, False, False, False, False, True),       # f_c = 2
+]
+ACTION_ROPE_IDS = ["V3-W1-vo-obs-xattn-num", "V3-W1-vo-obs+state-num-plain", "V1-W1-vo-obs-xattn-num", "V1-W2-va-pad",
+                   "V3-W3-va-obs+state", "V3-W7-va-xattn-plain", "V1-s1c16-W2-vo-num"]
+
+
+@pytest.mark.parametrize("views,stride,chunk,window,length,memory,first_frame,observation,state,state_xattn,normalizer,"
+                         "attn_res", ACTION_ROPE_CASES, ids=ACTION_ROPE_IDS)
+def test_an_action_rope_1d_deploy_chain_equals_two_stream_training_forward(
+        views, stride, chunk, window, length, memory, first_frame, observation, state, state_xattn, normalizer,
+        attn_res):
+    """Sana b8cd4c2ee: the training canvas with every robot row (state and action rows, clean and noisy) turned by the
+    whole-head ladder at its instant == the deploy chain chunk by chunk: the denoising windows, the observation prefill's
+    state row, the committed rows of video_and_action read back from the softmax store; past the sink horizon, both
+    front-ends, memory contents and phase windows, with and without observation latents, state rows or the state
+    token, AttnRes and the GDN denominator, f_c 1 and 2."""
+
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=length, memory=memory,
+                  first_frame=first_frame, normalizer=normalizer, observation=observation, state=state,
+                  attn_res=attn_res, horizon=True, state_xattn=state_xattn, action_rope="1D")
+    assert twins.mirror.action_rope == twins.live.action_rope == "1D" and twins.mirror.sink_horizon == 7
+    training = twins.two_stream(length) if first_frame else twins.two_stream(length)[1:]
+    streaming = twins.streaming_first_frame(length) if first_frame else twins.streaming(length)
+    close = ACTION_ROPE_CLOSE
+    assert len(training) == len(streaming) and length - 1 > 7
+    for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming)):
+        torch.testing.assert_close(x_ours, x_live, **close, msg=lambda m: f"chunk {k} video: {m}")
+        torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+
+
+@pytest.mark.parametrize("mirror,live", [("3D", "1D"), ("1D", "3D")], ids=["mirror-3D-live-1D", "mirror-1D-live-3D"])
+@pytest.mark.parametrize("memory", MEMORIES)
+def test_the_other_action_rope_is_caught_on_every_chunk(mirror, live, memory):
+    """Negative control: the mirror serving the other rotation of the robot rows on the same weights misses from chunk
+    0 on (every denoising window carries action rows), under both memory contents."""
+
+    length = 4
+    twins = Twins(views=3, window=1, chunks=length, memory=memory, first_frame=True, observation=True, horizon=True,
+                  state_xattn=True, action_rope=mirror, live_action_rope=live)
+    training = twins.two_stream(length)
+    streaming = twins.streaming_first_frame(length)
+    gaps = [max(_max_abs(streaming[k][i], training[k][i]) for i in (0, 1)) for k in range(length)]
+    assert min(gaps) > 1e-6, gaps
+    twins.mirror.action_rope = live
+    training_again = twins.two_stream(length)
+    streaming_again = twins.streaming_first_frame(length)
+    assert max(max(_max_abs(streaming_again[k][i], training_again[k][i]) for i in (0, 1)) for k in range(length)) < 1e-7
+
+
+ACTION_ROPE_SESSION_CASES = [
+    # views, memory, video_cfg, action_cfg, observation, state, state_xattn, normalizer, attn_res
+    (3, MEMORY_VIDEO_ONLY, 6.0, 1.0, True, False, True, False, True),
+    (1, MEMORY_VIDEO_ONLY, 6.0, 1.0, True, True, False, False, False),
+    (3, MEMORY_VIDEO_AND_ACTION, 2.5, 1.7, False, False, False, True, True),
+    (1, MEMORY_VIDEO_AND_ACTION, 3.0, 1.0, True, False, True, True, True),
+]
+
+
+def _action_rope_session_gaps(views, memory, video_cfg, action_cfg, position_mode, observation, state, state_xattn,
+                              normalizer, attn_res, close=None):
+    """A first-frame episode of an action_rope 1D policy through the mirror's session and Sana's
+    ``CausalPolicyChunkSession`` on ``position_mode``, past chunk 7 at W = 7 with per-stream CFG and the same commits:
+    asserts every chunk within ``close`` (None: returns the per-chunk max gaps instead)."""
+
+    steps, chunks = 2, 10
+    twins = Twins(views=views, window=7, chunks=chunks, memory=memory, first_frame=True, observation=observation,
+                  state=state, normalizer=normalizer, attn_res=attn_res, horizon=True, state_xattn=state_xattn,
+                  action_rope="1D")
+    live = _live_session(twins, steps, video_cfg, action_cfg, position_mode)
+    ours = twins.session(steps=steps, video_cfg=video_cfg, action_cfg=action_cfg)
+    assert twins.live.action_rope == ours.model.action_rope == "1D"
+    gaps = []
+    mask = torch.ones(1, twins.chunk, 80, dtype=torch.bool)
+    mask[..., 60:] = False
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    state_mask[:, 70:] = False
+    live.commit_sink(twins.sink)
+    ours.commit_sink(twins.ours(twins.sink))
+    g = torch.Generator().manual_seed(41)
+    for k in range(chunks):
+        video_noise = torch.randn(1, C_LAT, twins.f_chunk, 1, twins.width, generator=g, dtype=torch.float64)
+        action_noise = torch.randn(1, twins.chunk, 80, generator=g, dtype=torch.float64)
+        extra_live, extra_ours = {}, {}
+        if observation:
+            seen = twins.sink if k == 0 else twins.observations[k]   # chunk 0's observation is the sink's latent
+            extra_live, extra_ours = {"observation": seen}, {"observation": twins.ours(seen)}
+        a_live, v_live = live.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask, video_noise=video_noise,
+            action_noise=action_noise, **extra_live,
+        )
+        a_ours, v_ours = ours.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask,
+            video_noise=twins.ours(video_noise), action_noise=action_noise, **extra_ours,
+        )
+        if close is None:
+            gaps.append(max(_max_abs(a_ours, a_live), _max_abs(v_ours, twins.ours(v_live))))
+        else:
+            torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+            torch.testing.assert_close(v_ours, twins.ours(v_live), **close, msg=lambda m: f"chunk {k} video: {m}")
+        live.commit_chunk(twins.clean[k], twins.a_clean[k], anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=mask)
+        ours.commit_chunk(twins.ours(twins.clean[k]), twins.a_clean[k], anchor_state=twins.states[k],
+                          anchor_state_mask=state_mask, action_mask=mask)
+    assert ours.chunk_idx == live.chunk_idx == chunks
+    return gaps
+
+
+@pytest.mark.parametrize("views,memory,video_cfg,action_cfg,observation,state,state_xattn,normalizer,attn_res",
+                         ACTION_ROPE_SESSION_CASES)
+def test_an_action_rope_1d_session_matches_the_live_deploy_session_on_the_absolute_clock(
+        views, memory, video_cfg, action_cfg, observation, state, state_xattn, normalizer, attn_res):
+    """A first-frame episode of an action_rope 1D policy: the mirror's session (its softmax reads on the absolute
+    clock, ``CausalMemory.slot_origin``) == Sana's CausalPolicyChunkSession on its default ``kv_position_mode``
+    absolute (the training clock; its tables take the 1D robot rows from ``_causal_rope_tables``) past chunk 7 at
+    W = 7, per-stream CFG, then the same commits."""
+
+    _action_rope_session_gaps(views, memory, video_cfg, action_cfg, "absolute", observation, state, state_xattn,
+                              normalizer, attn_res, close=ACTION_ROPE_CLOSE)
+
+
+@pytest.mark.parametrize("views,memory,video_cfg,action_cfg,observation,state,state_xattn,normalizer,attn_res",
+                         ACTION_ROPE_SESSION_CASES[:2])
+def test_the_rank_clock_misses_an_action_rope_1d_policy_past_the_sink_horizon(
+        views, memory, video_cfg, action_cfg, observation, state, state_xattn, normalizer, attn_res):
+    """Negative control, and why a 1D policy keeps the absolute clock: Sana's ``kv_position_mode`` rank renumbers a read
+    from the sink's chunk, one common shift of every lane. The 3D rotation cannot see it (every token turns on the
+    time axis' ladder); under 1D a robot row turns on the whole-head ladder against the video's time ladder, so its
+    score against a video token moves with the shift. Chunks 0..7 read from chunk 0 (no shift) and agree; every later
+    chunk misses."""
+
+    gaps = _action_rope_session_gaps(views, memory, video_cfg, action_cfg, "rank", observation, state, state_xattn,
+                                     normalizer, attn_res)
+    # tiny random weights keep the scores small, so the miss is ~4e-7 against round-off of ~1e-16 before the horizon
+    assert max(gaps[:8]) < 1e-12 and min(gaps[8:]) > 1e-8, gaps
+
+
+def test_the_1d_robot_rows_are_the_live_whole_head_ladder_at_the_3d_instants():
+    """The rows themselves against the live helper: the mirror's 1D window table == the live 3D table on the video rows
+    and ``wan_mrope.full_head_rope`` at the 3D rows' instants on the robot rows, for both rope modules."""
+
+    _require_live_action_rope()
+    import dev.rwm.diffusion.model.layers.wan_mrope as wan_mrope
+
+    one = Twins(views=3, window=1, chunks=1, memory=MEMORY_VIDEO_AND_ACTION, horizon=True, action_rope="1D").mirror
+    three = Twins(views=3, window=1, chunks=1, memory=MEMORY_VIDEO_AND_ACTION, horizon=True).mirror
+    fps = torch.tensor([FPS], dtype=torch.float64)
+    rows, video = 33, 3 * VIEW[0] * VIEW[1]
+    for name in ("rope_linear", "rope_softmax"):
+        args = (fps, 1, (VIEW,) * 3, SLOTS[3], rows, 2.5625, 64, torch.device("cpu"))
+        t1, t3 = one.window_rope(getattr(one, name), *args), three.window_rope(getattr(three, name), *args)
+        assert t1.shape == t3.shape and torch.equal(t1[:, :, :video], t3[:, :, :video])
+        rope = getattr(one, name)
+        instants = rope.base_fps * torch.arange(64, 64 + rows, dtype=torch.float64) / (8 * FPS)
+        assert torch.equal(t1[0, 0, video:], wan_mrope.full_head_rope(rope, instants))
+        # the two ladders share their first frequency pair alone; 3D keeps the y / x pairs at phase 0
+        time_pairs = rope.axis_dims[0] // 2
+        assert torch.equal(t1[..., video:, 0], t3[..., video:, 0])
+        assert not torch.allclose(t1[..., video:, 1:], t3[..., video:, 1:])
+        assert torch.equal(t3[..., video:, time_pairs:], torch.ones_like(t3[..., video:, time_pairs:]))

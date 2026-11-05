@@ -61,6 +61,13 @@ action rows alone, on their usual steps; a committed video_and_action chunk keep
 Its first form (``e00c28c9a``: a zero-initialized ``state_proj`` into the caption channels, then the caption MLP) trained
 no run and is refused; ``4b29e92fd`` on keeps ``state_embed``, so only the config tells the two policies apart.
 
+``model.extra.chunk_causal_policy.action_rope`` (Sana ``b8cd4c2ee``; ``3D`` when absent) picks how every robot row (the
+state and action rows, generated and committed) is rotated at its instant on the physical clock: ``3D`` through the
+video's three axes at ids (instant, 0, 0), the instant turning the time axis' dims and the y / x dims at phase 0 (every
+earlier tree); ``1D`` by one rotary ladder over the whole head dim at the same instant (Sana ``wan_mrope.full_head_rope``,
+no spatial axis). The video rows and the sink rotation are the same in both. A tree before ``b8cd4c2ee`` ignores the key
+and trains 3D, so a ``1D`` config is served only from a run record naming a tree that reads it (``ACTION_ROPE_TREES``).
+
 ``model.memory_gdn_output_normalizer`` (Sana ``c414e9b32``; ``true`` when absent) decides every GDN layer's readout: true
 divides the numerator ``q (gS + K^T diag(beta) V)`` by the denominator ``ReLU(q) . (gz + K_den^T beta) + eps``, false
 returns the numerator alone (z is still carried, so a commit writes the same state either way). The per-head RMSNorm
@@ -144,7 +151,7 @@ SINK_HORIZON_CHUNKS = 7
 SINK_HORIZON_TREES = (
     "0c88c11ab", "e6c386907", "6cf45c1ae", "7ed0d28bf", "caf601b76", "b7189fd11", "41cf94114", "ad1bb95f3", "e00c28c9a",
     "ccddb2e7b", "64227cb07", "2578f606b", "4b29e92fd", "46657d0c1", "f6a257d4a", "8e0639b16", "cf47a0613", "89eaa78f6",
-    "8675f0ac3", "b6f5295f9", "78a48ed19", "27d767c5e", "75f663290", "6de2454dc",
+    "8675f0ac3", "b6f5295f9", "78a48ed19", "27d767c5e", "75f663290", "6de2454dc", "b8cd4c2ee",
 )
 # ``state_cross_attention``: from Sana 4b29e92fd on the anchor state's caption token is ``state_embed`` + the caption
 # y-norm; its first form (e00c28c9a .. 4b29e92fd^, the trees below) projected it with a zero-initialized ``state_proj``,
@@ -152,9 +159,16 @@ SINK_HORIZON_TREES = (
 # `git merge-base --is-ancestor 4b29e92fd <tree>`):
 STATE_TOKEN_TREES = (
     "4b29e92fd", "46657d0c1", "f6a257d4a", "8e0639b16", "cf47a0613", "89eaa78f6", "8675f0ac3", "b6f5295f9", "78a48ed19",
-    "27d767c5e", "75f663290", "6de2454dc",
+    "27d767c5e", "75f663290", "6de2454dc", "b8cd4c2ee",
 )
 STATE_PROJ_TREES = ("e00c28c9a", "ccddb2e7b", "64227cb07", "2578f606b")
+# ``action_rope`` (Sana b8cd4c2ee): 3D, the robot rows' rotation of every tree (the value of a config without the key),
+# or 1D, the whole-head ladder at the same instants. Trees known to read the key (b8cd4c2ee and descendants; add a newer
+# one after `git merge-base --is-ancestor b8cd4c2ee <tree>`); an older tree trains 3D whatever the config says:
+ACTION_ROPE_1D = "1D"
+ACTION_ROPE_3D = "3D"
+ACTION_ROPES = (ACTION_ROPE_1D, ACTION_ROPE_3D)
+ACTION_ROPE_TREES = ("b8cd4c2ee",)
 # trees known to train the sink at the reader's window start on the clock physical_rope declares (not descendants of
 # 0c88c11ab): the observation trees above and the no-observation runs served so far (N2 / N4 p14k-pretrain)
 WINDOW_START_SINK_TREES = OBSERVATION_BRANCH_TREES + OBSERVATION_JOINT_TREES + (
@@ -190,6 +204,9 @@ class CausalContract:
     sink_horizon: Optional[int] = None
     # every chunk's anchor state as one caption token of its robot rows' caption, no state row (Sana 4b29e92fd)
     state_cross_attention: bool = False
+    # the robot rows' rotation at their instants: 3D through the video's axes at (instant, 0, 0), 1D the whole-head
+    # ladder (Sana b8cd4c2ee)
+    action_rope: str = ACTION_ROPE_3D
 
     @property
     def first_chunk(self) -> int:
@@ -208,7 +225,8 @@ class CausalContract:
             f"rope={self.rope} physical_rope={self.physical_rope} aligned_phase_window={self.aligned_phase_window} "
             f"first_chunk={self.first_chunk} "
             f"gdn_output_normalizer={self.gdn_output_normalizer} use_attn_res={self.use_attn_res} "
-            f"sink_horizon={self.sink_horizon} state_cross_attention={self.state_cross_attention}"
+            f"sink_horizon={self.sink_horizon} state_cross_attention={self.state_cross_attention} "
+            f"action_rope={self.action_rope}"
         )
 
 
@@ -332,6 +350,19 @@ def resolve_state_cross_attention(value: Any, state: bool) -> bool:
     return value
 
 
+def resolve_action_rope(value: Any) -> str:
+    """``action_rope`` as Sana reads it (``causal_rwm_train.resolve_action_rope``, b8cd4c2ee): None -> ``3D`` (configs
+    older than the key), ``1D`` or ``3D`` otherwise."""
+
+    if value is None:
+        return ACTION_ROPE_3D
+    if value not in ACTION_ROPES:
+        raise ValueError(
+            f"model.extra.chunk_causal_policy.action_rope={value!r}: allowed values are {list(ACTION_ROPES)}"
+        )
+    return value
+
+
 def resolve_physical_rope(value: Any) -> bool:
     """``physical_rope`` as Sana reads it (``causal_rwm_train.resolve_physical_rope``, 6e91eaf2a .. 0c88c11ab^): None ->
     false, a yaml boolean otherwise (it needs ``rope: aligned``, the only RoPE mode this adapter serves). A checkpoint
@@ -393,9 +424,9 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
     """Refuse a checkpoint whose run record contradicts the contract it resolves to (``resolve_rope_clock`` completes
     the config's): a run that trained chunk observations (``refuse_recorded_chunk_observation``) and a recorded
     ``aligned_phase_window`` / ``memory_content`` / ``memory_gdn_output_normalizer`` / ``causal_observation`` /
-    ``causal_state`` / ``state_cross_attention`` / ``physical_rope`` / ``sliding_window_chunks`` / ``use_attn_res`` other
-    than the contract's, at the record's top level or in its ``deploy`` block (the record of the physical-RoPE line).
-    Keys the record does not carry are not checked."""
+    ``causal_state`` / ``state_cross_attention`` / ``action_rope`` / ``physical_rope`` / ``sliding_window_chunks`` /
+    ``use_attn_res`` other than the contract's, at the record's top level or in its ``deploy`` block (the record of the
+    physical-RoPE line). Keys the record does not carry are not checked."""
 
     refuse_recorded_chunk_observation(record, source)
     deploy = record.get("deploy") if isinstance(record.get("deploy"), Mapping) else {}
@@ -406,6 +437,7 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
         ("causal_observation", contract.causal_observation),
         ("causal_state", contract.causal_state),
         ("state_cross_attention", contract.state_cross_attention),
+        ("action_rope", contract.action_rope),
         ("physical_rope", contract.physical_rope),
         ("sliding_window_chunks", contract.sliding_window_chunks),
         ("use_attn_res", contract.use_attn_res),
@@ -497,6 +529,30 @@ def check_state_token_form(
         f"state_cross_attention checkpoint whose run records ({[str(path.name) for path, _ in records] or 'none'}) name "
         f"no known training tree ({trees or 'none'}): its state token (state_embed since Sana 4b29e92fd, a state_proj "
         "before) cannot be told from the config. If the tree is 4b29e92fd or a descendant, add it to STATE_TOKEN_TREES"
+    )
+
+
+def check_action_rope_form(
+    records: list[tuple[Path, Mapping[str, Any]]], contract: CausalContract, allow_unrecorded: bool = False
+) -> str:
+    """The robot rows' rotation a checkpoint trained, from its config and run records' training trees, as the ready-report
+    label. ``3D`` is what every tree trains without the key. A ``1D`` config is served only when a record names a tree
+    that reads the key (``ACTION_ROPE_TREES``, Sana b8cd4c2ee on): an older tree ignores it and trains 3D, so a record
+    naming only such trees is refused, and so, unless ``allow_unrecorded`` (a step-0 donor directory), is one naming no
+    known tree."""
+
+    if contract.action_rope != ACTION_ROPE_1D:
+        return contract.action_rope
+    trees = [tree for _, record in records for tree in record_trees(record)]
+    reads = [tree for tree in trees if _known(tree, ACTION_ROPE_TREES)]
+    if reads:
+        return f"1D(b8cd4c2ee; trained on {reads[-1]})"
+    if allow_unrecorded and not trees:
+        return "1D(unrecorded: donor directory)"
+    raise ValueError(
+        f"action_rope 1D checkpoint whose run records ({[str(path.name) for path, _ in records] or 'none'}) name no "
+        f"training tree that reads the key ({trees or 'none'}): a tree before Sana b8cd4c2ee ignores action_rope and "
+        "trains the 3D rotation. If the tree is b8cd4c2ee or a descendant, add it to ACTION_ROPE_TREES"
     )
 
 
@@ -658,6 +714,7 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
     causal_observation = resolve_causal_observation(options.get("causal_observation"))
     causal_state = resolve_causal_state(options.get("causal_state"), causal_observation)
     state_cross_attention = resolve_state_cross_attention(options.get("state_cross_attention"), causal_state)
+    action_rope = resolve_action_rope(options.get("action_rope"))
     physical_rope = resolve_physical_rope(options.get("physical_rope"))
     aligned_phase_window = resolve_aligned_phase_window(_extra(cfg.get("data")).get("aligned_phase_window"))
     window = options.get("sliding_window_chunks")
@@ -706,10 +763,15 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         physical_rope=physical_rope,
         use_attn_res=resolve_use_attn_res(model_cfg.get("use_attn_res")),
         state_cross_attention=state_cross_attention,
+        action_rope=action_rope,
     )
 
 
 __all__ = [
+    "ACTION_ROPE_1D",
+    "ACTION_ROPE_3D",
+    "ACTION_ROPES",
+    "ACTION_ROPE_TREES",
     "ACTION_TEMPORAL_COMPRESSION",
     "ALIGNED_PHASE_FIRST_FRAME",
     "ALIGNED_PHASE_PADDED",
@@ -729,6 +791,7 @@ __all__ = [
     "STATE_PROJ_TREES",
     "STATE_TOKEN_TREES",
     "WINDOW_START_SINK_TREES",
+    "check_action_rope_form",
     "check_observation_form",
     "check_run_record",
     "check_state_token_form",
@@ -736,6 +799,7 @@ __all__ = [
     "describe_run_records",
     "is_causal_policy_config",
     "load_run_records",
+    "resolve_action_rope",
     "resolve_actions_per_chunk",
     "resolve_aligned_phase_window",
     "refuse_chunk_observation",

@@ -38,7 +38,9 @@ ids 0. The sink sits at frame 0, chunk c's targets at ``c * f_chunk + 1`` onward
 ``c * f_chunk`` is the frame of chunk c - 1's last target, or of the sink), its state row at step ``c * C`` and its actions at steps
 ``c * C + 1 .. c * C + C`` (Sana ``_causal_multiview_rope``, ``forward_sink``, ``forward_chunk``); under
 ``physical_rope`` (the only clock from Sana 0c88c11ab on) every token at its physical instant (``target_frame_offset``),
-and the softmax reads on the session's read clock (``session.py``, "Positions"). Text: one prompt row
+and the softmax reads on the session's read clock (``session.py``, "Positions"). ``action_rope`` (Sana b8cd4c2ee) picks the
+robot rows' rotation at those instants: ``3D`` at ids (instant, 0, 0) through the video's three axes (the default), ``1D``
+one rotary ladder over the whole head dim (``full_head_rope``); the video rows are the same in both. Text: one prompt row
 (G = 1) for the canvas, G = V + 1 rows for the strip (one per view, then the robot tail; a robotless window reads the V
 view rows only, Sana ``_grouped_query_sublens``).
 """
@@ -72,7 +74,13 @@ from sana_wam_min.policy_model.rope import (  # noqa: E402
     semantic_2x2_position_ids,
 )
 
-from .contract import ACTION_TEMPORAL_COMPRESSION, MEMORY_VIDEO_AND_ACTION, CausalContract  # noqa: E402
+from .contract import (  # noqa: E402
+    ACTION_ROPE_1D,
+    ACTION_ROPES,
+    ACTION_TEMPORAL_COMPRESSION,
+    MEMORY_VIDEO_AND_ACTION,
+    CausalContract,
+)
 from .layers import GDN_KIND, CausalPolicyBlock, LayerCache  # noqa: E402
 
 GDN_RECURRENCE_KEYS = ("gate_proj.weight", "gate_proj.bias", "A_log", "dt_bias", "recall_gate")
@@ -85,6 +93,18 @@ ROBOT_FORMS = (ROBOT_FORM_CHUNK, ROBOT_FORM_STATE, ROBOT_FORM_ACTIONS)
 
 
 ViewShapes = tuple[tuple[int, int], ...]
+
+
+def full_head_rope(rope: PhysicalTimeWanRotaryPosEmbed, positions: torch.Tensor) -> torch.Tensor:
+    """One 1D rotary ladder over the whole head dim at real-valued positions (Sana ``wan_mrope.full_head_rope``,
+    b8cd4c2ee): ``positions`` [..., N] -> [..., N, head_dim // 2] complex128 unit phases, pair i turning at
+    ``theta ** (-2 i / head_dim)`` per unit."""
+
+    head_dim = sum(rope.axis_dims)
+    exponent = torch.arange(0, head_dim, 2, device=positions.device, dtype=torch.float64) / head_dim
+    inverse_frequency = rope.theta ** (-exponent)
+    phase = positions.to(torch.float64)[..., None] * inverse_frequency
+    return torch.polar(torch.ones_like(phase), phase)
 
 
 def view_token_counts(frames: int, view_shapes: ViewShapes) -> list[int]:
@@ -146,6 +166,10 @@ class CausalPolicyModel(PolicyModel):
         if self.state_cross_attention and self.causal_state:
             raise ValueError("state_cross_attention removes the state row causal_state joins to the observation latent")
         self.physical_rope = bool(contract.physical_rope)
+        # Sana b8cd4c2ee: the robot rows turn through the video's three axes (3D) or one whole-head ladder (1D)
+        self.action_rope = str(contract.action_rope)
+        if self.action_rope not in ACTION_ROPES:
+            raise ValueError(f"action_rope must be one of {list(ACTION_ROPES)}, got {self.action_rope!r}")
         # Sana 0c88c11ab: a softmax reader in chunk c reads the sink at chunk max(0, c - H)'s start (None: its window's)
         self.sink_horizon = None if contract.sink_horizon is None else int(contract.sink_horizon)
         if self.sink_horizon is not None:
@@ -231,9 +255,11 @@ class CausalPolicyModel(PolicyModel):
 
         Video tokens in view-major order with the bidirectional policy's spatial ids (the plain grid for one view, the
         semantic 2x2 tiles for several) and time ``base_fps * phi / (fps / s)``, phi = ``frame_offset + j`` for the
-        window's frame j; robot row r: time ``base_fps * (step_offset + robot_step_start + r) / (8 * fps)`` and spatial
-        ids 0 (Sana ``_causal_multiview_rope`` + ``_action_rope`` for one segment: row 0 is the state at the chunk's
-        first step, row j + 1 action j; a window of the action rows alone starts at row 1, Sana ``_robot_grid``)."""
+        window's frame j; robot row r at the instant ``base_fps * (step_offset + robot_step_start + r) / (8 * fps)``,
+        rotated at ids (instant, 0, 0) under ``action_rope`` 3D, by the whole-head ladder at the instant under 1D
+        (``full_head_rope``) (Sana ``_causal_multiview_rope`` + ``_action_rope`` for one segment: row 0 is the state at
+        the chunk's first step, row j + 1 action j; a window of the action rows alone starts at row 1, Sana
+        ``_robot_grid``)."""
 
         batch = fps.numel()
         fps_video = fps.to(device=device, dtype=torch.float64) / int(self.video_frame_stride)
@@ -259,6 +285,9 @@ class CausalPolicyModel(PolicyModel):
             first = int(step_offset) + int(robot_step_start)
             steps = (first + torch.arange(robot_rows, device=device, dtype=torch.long)).to(torch.float64)
             time_ids = rope.base_fps * steps[None] / (self.action_temporal_compression * fps.to(device=device)[:, None])
+            if self.action_rope == ACTION_ROPE_1D:
+                robot = full_head_rope(rope, time_ids.expand(batch, -1)).unsqueeze(1)
+                return torch.cat((rope.from_position_ids(ids), robot), dim=2)
             robot = torch.stack((time_ids, torch.zeros_like(time_ids), torch.zeros_like(time_ids)), dim=-1)
             ids = torch.cat((ids, robot.expand(batch, -1, -1)), dim=1)
         return rope.from_position_ids(ids)
@@ -451,7 +480,8 @@ class CausalPolicyModel(PolicyModel):
                 GDN layers' clock: their state keeps keys rotated at the physical positions of the whole episode):
                 0 / 0 for the sink, ``c * f_c + 1`` / ``c * C`` for chunk c's denoising window and for its commit.
             softmax_frame_offset / softmax_step_offset: the same window on the softmax layers' clock, numbered from 0
-                at the read's origin (the session's ``read_plan``; the cached entries are rotated on that clock too);
+                at the read's origin (the session's ``read_plan``; from chunk 0 under ``action_rope`` 1D, the session's
+                ``slot_origin``; the cached entries are rotated on that clock too);
                 None = the physical offsets (nothing slid out of the window yet).
             robot: None for a robotless window (the sink, the commit under ``memory_content`` video_only), else ``state80`` /
                 ``state_mask80`` ``[B, 80]``, ``action80`` / ``action_mask80`` ``[B, C, 80]`` and ``action_timesteps``
@@ -610,5 +640,6 @@ __all__ = [
     "ROBOT_FORM_STATE",
     "ViewShapes",
     "build_causal_policy",
+    "full_head_rope",
     "view_token_counts",
 ]

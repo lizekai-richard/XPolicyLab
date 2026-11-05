@@ -71,6 +71,13 @@ whose start the training canvas rotates the sink for a reader in chunk c (``_sin
 and the reader at slot c - O <= H. The GDN layers are never windowed: their state keeps keys rotated at the physical
 positions of the whole episode (the sink at frame 0), and their windows run on that clock.
 
+That common shift is invisible only while every token turns on the same time ladder. Under ``action_rope`` 1D (Sana
+b8cd4c2ee) the robot rows turn on the whole-head ladder and the video tokens on the time axis' ladder, so a robot row's
+score against a video token moves with the shift: a 1D policy's softmax reads stay on the training canvas's absolute
+clock (Sana's deploy default, ``kv_position_mode="absolute"``) -- chunk k at slot k, the reader at slot c, the sink
+rotated to the start of chunk O (``CausalMemory.slot_origin`` 0, ``_sink_rope`` at frame O * f_c) -- and only the 3D
+policies are renumbered from O.
+
 Conditional and unconditional text streams hold separate memories (the caption reaches every layer through
 cross-attention). Latents are ``[1, C_lat, F, H, W]`` canvas grids or ``[1, C_lat, F, 1, sum(H_v * W_v)]`` view-major
 strips; actions and states are in the normalized space.
@@ -90,7 +97,7 @@ from .shared import SANA_WAM_POLICY_DIR  # noqa: F401  (sys.path bridge first)
 from sana_wam_min.sampler import _action_step, _video_step, make_scheduler  # noqa: E402
 from sana_wam_min.policy_model.attention import apply_rotary_emb_fp64_softmax  # noqa: E402
 
-from .contract import MEMORY_VIDEO_AND_ACTION  # noqa: E402
+from .contract import ACTION_ROPE_1D, MEMORY_VIDEO_AND_ACTION  # noqa: E402
 from .layers import GDN_KIND, LayerCache  # noqa: E402
 from .model import ROBOT_FORM_ACTIONS, ROBOT_FORM_CHUNK, ROBOT_FORM_STATE, CausalPolicyModel, ViewShapes  # noqa: E402
 
@@ -120,6 +127,8 @@ class CausalMemory:
         self.has_sink = False
         self.committed = 0
         self.sink_horizon = model.sink_horizon   # None: the sink at the read's window start; H: at chunk max(0, c - H)
+        # action_rope 1D: the softmax reads keep the absolute clock (module docstring, "Positions")
+        self.absolute_clock = model.action_rope == ACTION_ROPE_1D
 
     def read_chunk_ids(self) -> list[int]:
         """Committed chunks the next forward reads besides the sink and its own window, oldest first."""
@@ -138,6 +147,12 @@ class CausalMemory:
             return ids, max(0, self.committed - self.sink_horizon)
         return ids, (ids[0] if ids else self.committed)
 
+    def slot_origin(self) -> int:
+        """The chunk at slot 0 of the next read's clock: the origin O (``read_plan``), or chunk 0 on the absolute clock
+        of an ``action_rope`` 1D policy, whose sink then sits at frame O * f_c."""
+
+        return 0 if self.absolute_clock else self.read_plan()[1]
+
     def layer_caches(
         self,
         *,
@@ -147,15 +162,16 @@ class CausalMemory:
     ) -> list[LayerCache]:
         """One ``LayerCache`` per block for one forward. The softmax entries read are rotated here, once for every
         forward that shares this read (the denoising steps of a chunk reuse the caches): ``sink_rope`` is the softmax
-        rotary table of the sink at frame 0 and ``rope_of(slot)`` that of a committed chunk at chunk slot ``slot``
-        (the model's ``softmax_entry_rope``)."""
+        rotary table of the sink at its frame on the read's clock (0 at the origin, O * f_c on the absolute clock) and
+        ``rope_of(slot)`` that of a committed chunk at chunk slot ``slot`` (the model's ``softmax_entry_rope``)."""
 
-        ids, origin = self.read_plan()
+        ids, _ = self.read_plan()
+        base = self.slot_origin()
         rope = None
         if ids:
             if rope_of is None:
                 raise ValueError("a read needs rope_of: softmax entries are kept before the rotary embedding")
-            rope = torch.cat([rope_of(chunk - origin) for chunk in ids], dim=2)
+            rope = torch.cat([rope_of(chunk - base) for chunk in ids], dim=2)
         if self.has_sink and sink_rope is None:
             raise ValueError("a read needs the sink's rope: the sink is kept before the rotary embedding")
         caches = []
@@ -344,26 +360,30 @@ class CausalPolicySession:
             )
         return self._rope_tables[key]
 
-    def _sink_rope(self) -> Optional[torch.Tensor]:
-        if not self.has_sink:
+    def _sink_rope(self, memory: CausalMemory) -> Optional[torch.Tensor]:
+        """The sink's softmax table on ``memory``'s next read: at the start of the origin chunk O, frame 0 of a read
+        numbered from O, frame O * f_c of the absolute clock (an ``action_rope`` 1D policy)."""
+
+        if not memory.has_sink:
             return None
-        key = ("sink",)
+        frame = (memory.read_plan()[1] - memory.slot_origin()) * self.f_chunk
+        key = ("sink", frame)
         if key not in self._rope_tables:
             device = next(self.model.parameters()).device
             self._rope_tables[key] = self.model.softmax_entry_rope(
-                frames=1, frame_offset=0, robot_rows=0, step_offset=0, model_fps=self.model_fps,
+                frames=1, frame_offset=frame, robot_rows=0, step_offset=0, model_fps=self.model_fps,
                 view_shapes=self._views(), view_slot_ids=self.view_slot_ids, device=device,
             )
         return self._rope_tables[key]
 
     def _caches(self, memory: CausalMemory, *, commit: bool) -> list[LayerCache]:
-        return memory.layer_caches(commit=commit, rope_of=self._rope_of, sink_rope=self._sink_rope())
+        return memory.layer_caches(commit=commit, rope_of=self._rope_of, sink_rope=self._sink_rope(memory))
 
     def _softmax_offsets(self, memory: CausalMemory, frame_offset: int, step_offset: int) -> tuple[int, int]:
-        # the origin of THIS stream's read: a commit runs the streams one after the other, so another stream's memory
+        # the clock of THIS stream's read: a commit runs the streams one after the other, so another stream's memory
         # may already hold the chunk being committed
-        origin = memory.read_plan()[1]
-        return frame_offset - origin * self.f_chunk, step_offset - origin * self.chunk_actions
+        base = memory.slot_origin()
+        return frame_offset - base * self.f_chunk, step_offset - base * self.chunk_actions
 
     def _forward(self, latent, timesteps, caption: Caption, memory: CausalMemory, *, frame_offset, step_offset, robot,
                  caches, robot_form=ROBOT_FORM_CHUNK, caption_state=None):
