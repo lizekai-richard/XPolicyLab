@@ -40,9 +40,20 @@ ids 0. The sink sits at frame 0, chunk c's targets at ``c * f_chunk + 1`` onward
 ``physical_rope`` (the only clock from Sana 0c88c11ab on) every token at its physical instant (``target_frame_offset``),
 and the softmax reads on the session's read clock (``session.py``, "Positions"). ``action_rope`` (Sana b8cd4c2ee) picks the
 robot rows' rotation at those instants: ``3D`` at ids (instant, 0, 0) through the video's three axes (the default), ``1D``
-one rotary ladder over the whole head dim (``full_head_rope``); the video rows are the same in both. Text: one prompt row
+one rotary ladder over the whole head dim (``full_head_rope``); the video rows are the same in both. Under
+``decoupled_rope`` (Sana bb681f851) the video's time column is the latent-frame position itself, without the fps
+scaling (a target latent at c * f_c + i + 0.5, the observation latent at c * f_c, the sink at 0), and every robot row
+sits at its local slot on the whole-head ladder, the state row at 0 and action j at j + 1, in every chunk. Text: one
+prompt row
 (G = 1) for the canvas, G = V + 1 rows for the strip (one per view, then the robot tail; a robotless window reads the V
 view rows only, Sana ``_grouped_query_sublens``).
+
+Under ``latent_action`` (Sana 254d46478, one copy per view from cdf22c3d8) a denoising window's robot rows are its
+latent action frame, ``LATENT_ACTION_TOKENS`` tokens of the video's channels per view: ``robot["action80"]`` carries the
+cells ``[B, V * 80, C_lat]`` (``tile_latent_actions``), embedded by the video's patch embedding (its 1 x 1 x 1
+convolution on one cell, cells outside the mask at 0) and decoded by its final layer, each copy at its view's place on
+the video's three axes (``_video_position_ids`` of an 8 x 10 view: the semantic 2x2 tile of view v, the plain grid for
+one view) and at the frame slot after the chunk's last target latent, (c + 1) * f_c + 0.5625.
 """
 
 from __future__ import annotations
@@ -76,9 +87,14 @@ from sana_wam_min.policy_model.rope import (  # noqa: E402
 
 from .contract import (  # noqa: E402
     ACTION_ROPE_1D,
+    ACTION_ROPE_3D,
     ACTION_ROPES,
     ACTION_TEMPORAL_COMPRESSION,
+    DECOUPLED_TARGET_OFFSET,
+    LATENT_ACTION_GRID,
+    LATENT_ACTION_TOKENS,
     MEMORY_VIDEO_AND_ACTION,
+    MEMORY_VIDEO_ONLY,
     CausalContract,
 )
 from .layers import GDN_KIND, CausalPolicyBlock, LayerCache  # noqa: E402
@@ -105,6 +121,46 @@ def full_head_rope(rope: PhysicalTimeWanRotaryPosEmbed, positions: torch.Tensor)
     inverse_frequency = rope.theta ** (-exponent)
     phase = positions.to(torch.float64)[..., None] * inverse_frequency
     return torch.polar(torch.ones_like(phase), phase)
+
+
+def tile_latent_actions(actions: torch.Tensor, channels: int, grid: tuple = LATENT_ACTION_GRID) -> torch.Tensor:
+    """Tile action chunks over one latent frame each (Sana ``causal_rwm_train.tile_latent_actions``, Cosmos Policy's
+    ``action_to_latent_frames``): ``[..., C, D]`` -> ``[..., H * W, channels]``, the chunk flattened step-major, repeated
+    until it fills ``channels * H * W`` cells, laid out as (channels, H, W) and returned token-major: token p, channel c
+    holds the value at cell c * H * W + p (D = H * W: dim p of step c mod C)."""
+
+    *lead, steps, dims = actions.shape
+    tokens = int(grid[0]) * int(grid[1])
+    cells = int(channels) * tokens
+    values = int(steps) * int(dims)
+    if cells < values:
+        raise ValueError(
+            f"a latent frame of {channels} channels on {tuple(grid)} holds {cells} cells, fewer than the {values} "
+            f"values of a {steps} x {dims} action chunk"
+        )
+    flat = actions.reshape(*lead, values)
+    tiled = flat.repeat(*([1] * len(lead)), -(-cells // values))[..., :cells]
+    return tiled.reshape(*lead, int(channels), tokens).transpose(-1, -2)
+
+
+def untile_latent_actions(latents: torch.Tensor, steps: int, dims: int, grid: tuple = LATENT_ACTION_GRID) -> torch.Tensor:
+    """The mean of every value's copies, the inverse of ``tile_latent_actions`` and of its repeat over the views (Sana
+    ``causal_rwm_train.untile_latent_actions``): ``[..., V * H * W, channels]`` -> ``[..., steps, dims]``."""
+
+    *lead, tokens, channels = latents.shape
+    frame = int(grid[0]) * int(grid[1])
+    if int(tokens) % frame:
+        raise ValueError(f"{tokens} latent action tokens are not whole frames of {frame}")
+    copies = int(tokens) // frame
+    cells = frame * int(channels)
+    values = int(steps) * int(dims)
+    if cells < values:
+        raise ValueError(f"{cells} latent cells cannot hold the {values} values of a {steps} x {dims} action chunk")
+    flat = latents.reshape(*lead, copies, frame, channels).transpose(-1, -2).reshape(*lead, copies, cells)
+    index = torch.arange(cells, device=latents.device) % values
+    sums = flat.new_zeros(*lead, copies, values).index_add(-1, index, flat)
+    counts = torch.bincount(index, minlength=values).to(device=flat.device, dtype=flat.dtype)
+    return (sums / counts).mean(dim=-2).reshape(*lead, int(steps), int(dims))
 
 
 def view_token_counts(frames: int, view_shapes: ViewShapes) -> list[int]:
@@ -170,8 +226,21 @@ class CausalPolicyModel(PolicyModel):
         self.action_rope = str(contract.action_rope)
         if self.action_rope not in ACTION_ROPES:
             raise ValueError(f"action_rope must be one of {list(ACTION_ROPES)}, got {self.action_rope!r}")
+        # Sana bb681f851: the video on latent-frame positions, every chunk's robot rows at 0 .. C, no sink horizon
+        self.decoupled_rope = bool(contract.decoupled_rope)
+        # Sana 254d46478 / cdf22c3d8: every chunk's actions as one latent frame per view, no action rows
+        self.latent_action = bool(contract.latent_action)
+        if self.decoupled_rope and (self.action_rope != ACTION_ROPE_3D or self.latent_action or not self.physical_rope):
+            raise ValueError(
+                "decoupled_rope takes neither action_rope 1D nor latent_action and runs the physical (latent-frame) clock; "
+                f"got action_rope={self.action_rope}, latent_action={self.latent_action}, physical_rope={self.physical_rope}"
+            )
+        if self.latent_action and (not self.state_cross_attention or self.memory_content != MEMORY_VIDEO_ONLY):
+            raise ValueError("latent_action needs state_cross_attention and memory_content video_only")
         # Sana 0c88c11ab: a softmax reader in chunk c reads the sink at chunk max(0, c - H)'s start (None: its window's)
         self.sink_horizon = None if contract.sink_horizon is None else int(contract.sink_horizon)
+        if self.decoupled_rope and self.sink_horizon is not None:
+            raise ValueError("decoupled_rope has no sink horizon: its softmax readers take the sink at their window start")
         if self.sink_horizon is not None:
             window = contract.sliding_window_chunks
             if not self.physical_rope or window is None or window > self.sink_horizon:
@@ -212,6 +281,12 @@ class CausalPolicyModel(PolicyModel):
             BlockAttnResV2(config.hidden_size, config.depth, config.attn_res_block_size) if self.use_attn_res else None
         )
         self.final_layer = T2IFinalLayer(config.hidden_size, config.patch_size, config.out_channels)
+        if self.latent_action and (config.out_channels != config.in_channels or config.in_channels < self.chunk_actions):
+            raise ValueError(
+                f"latent_action tiles a {self.chunk_actions}-step chunk over the video's {config.in_channels} channels and "
+                f"decodes it through the final layer ({config.out_channels} channels): it needs out_channels == "
+                "in_channels >= actions_per_chunk"
+            )
         self.state_embed = MaskedProjector(config.state_dim, config.hidden_size)
         self.action_embed = MaskedProjector(config.action_dim, config.hidden_size)
         self.action_head = ActionFinalLayer(config.hidden_size, config.action_dim)
@@ -259,7 +334,10 @@ class CausalPolicyModel(PolicyModel):
         rotated at ids (instant, 0, 0) under ``action_rope`` 3D, by the whole-head ladder at the instant under 1D
         (``full_head_rope``) (Sana ``_causal_multiview_rope`` + ``_action_rope`` for one segment: row 0 is the state at
         the chunk's first step, row j + 1 action j; a window of the action rows alone starts at row 1, Sana
-        ``_robot_grid``)."""
+        ``_robot_grid``). Under ``decoupled_rope`` the time column is phi itself (no fps scaling) and robot row r sits at
+        the slot ``robot_step_start + r`` on the whole-head ladder, whatever ``step_offset``; under ``latent_action`` the
+        robot rows are the window's latent action frame (``latent_action_rope``) at ``frame_offset + f_c``, the frame
+        slot after the window's last target latent."""
 
         batch = fps.numel()
         fps_video = fps.to(device=device, dtype=torch.float64) / int(self.video_frame_stride)
@@ -280,7 +358,22 @@ class CausalPolicyModel(PolicyModel):
             ]
         )
         ids = ids.clone()
-        ids[..., 0] = rope.base_fps * phi[frame_of_token][None] / fps_video[:, None]
+        if self.decoupled_rope:
+            ids[..., 0] = phi[frame_of_token][None]
+        else:
+            ids[..., 0] = rope.base_fps * phi[frame_of_token][None] / fps_video[:, None]
+        if robot_rows and self.latent_action:
+            robot = self.latent_action_rope(
+                rope, fps_video, float(frame_offset) + self.latent_frames_per_chunk, len(view_shapes), view_slot_ids,
+                device,
+            )
+            if robot.shape[2] != int(robot_rows):
+                raise ValueError(f"a {len(view_shapes)}-view latent action frame is {robot.shape[2]} tokens, got {robot_rows}")
+            return torch.cat((rope.from_position_ids(ids), robot), dim=2)
+        if robot_rows and self.decoupled_rope:
+            slots = (int(robot_step_start) + torch.arange(robot_rows, device=device)).to(torch.float64)
+            robot = full_head_rope(rope, slots)[None, None].expand(batch, -1, -1, -1)
+            return torch.cat((rope.from_position_ids(ids), robot), dim=2)
         if robot_rows:
             first = int(step_offset) + int(robot_step_start)
             steps = (first + torch.arange(robot_rows, device=device, dtype=torch.long)).to(torch.float64)
@@ -291,6 +384,35 @@ class CausalPolicyModel(PolicyModel):
             robot = torch.stack((time_ids, torch.zeros_like(time_ids), torch.zeros_like(time_ids)), dim=-1)
             ids = torch.cat((ids, robot.expand(batch, -1, -1)), dim=1)
         return rope.from_position_ids(ids)
+
+    def latent_action_rope(
+        self,
+        rope: PhysicalTimeWanRotaryPosEmbed,
+        fps_video: torch.Tensor,
+        action_frame: float,
+        views: int,
+        view_slot_ids: tuple[int, ...],
+        device,
+    ) -> torch.Tensor:
+        """Rotary table ``[B, 1, views * 80, D/2]`` of a latent action frame (Sana ``_latent_action_rope``, cdf22c3d8):
+        copy v where a ``LATENT_ACTION_GRID`` view would sit in view v's place (the plain grid for one view, the
+        semantic 2x2 tile of view v otherwise), every token at time ``base_fps * action_frame / fps_video``."""
+
+        copies = (tuple(LATENT_ACTION_GRID),) * int(views)
+        if int(views) == 1:
+            ids = rope._position_ids(1, *LATENT_ACTION_GRID, fps_video, device)
+        else:
+            ids = semantic_2x2_position_ids(
+                1, copies, view_slot_ids, fps_video, rope.base_fps, self.multiview_spatial_rope_tile_shape, device,
+            )
+        ids = ids.clone()
+        ids[..., 0] = (rope.base_fps * float(action_frame) / fps_video)[:, None]
+        return rope.from_position_ids(ids)
+
+    def latent_action_rows(self, views: int) -> int:
+        """A chunk's latent action tokens: the ``LATENT_ACTION_GRID`` frame once per view (Sana ``latent_action_rows``)."""
+
+        return LATENT_ACTION_TOKENS * int(views)
 
     def softmax_entry_rope(
         self,
@@ -318,8 +440,11 @@ class CausalPolicyModel(PolicyModel):
     def target_frame_offset(self) -> float:
         """Where chunk c's target latents start on the video clock, after its start instant c * f_c: one frame later on
         the latent-slot clock (the latent's last frame), ``latent_centre_offset`` = (8 + 1) / (2 * 8) = 0.5625 later under
-        ``physical_rope`` (the middle of the frames it covers; Sana ``causal_rwm_train.latent_centre_offset``)."""
+        ``physical_rope`` (the middle of the frames it covers; Sana ``causal_rwm_train.latent_centre_offset``), half a
+        latent later under ``decoupled_rope`` (``DECOUPLED_TARGET_OFFSET``)."""
 
+        if self.decoupled_rope:
+            return DECOUPLED_TARGET_OFFSET
         if not self.physical_rope:
             return 1.0
         stride = int(self.action_temporal_compression)
@@ -427,6 +552,14 @@ class CausalPolicyModel(PolicyModel):
             raise ValueError(f"the text spans cover {offset} of {tokens} window tokens")
         return text, text_mask, tuple(spans)
 
+    def _latent_action_tokens(self, cells: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Latent action cells ``[B, N, C_lat]`` through the video's patch embedding, its 1 x 1 x 1 convolution applied
+        to one cell, cells outside ``mask`` entering as 0 (Sana ``_latent_action_tokens``)."""
+
+        proj = self.x_embedder.proj
+        weight = proj.weight.reshape(proj.out_channels, -1)
+        return torch.nn.functional.linear(cells.masked_fill(~mask, 0).to(dtype=weight.dtype), weight, proj.bias)
+
     def _append_state_token(self, text, text_mask, state: torch.Tensor, state_mask: torch.Tensor):
         """``state_cross_attention``: the anchor state as one more key of the window's last text group (the robot group
         of the strip, the canvas's one prompt), a key no mask hides; every other group gets a masked pad slot. The
@@ -485,7 +618,8 @@ class CausalPolicyModel(PolicyModel):
                 None = the physical offsets (nothing slid out of the window yet).
             robot: None for a robotless window (the sink, the commit under ``memory_content`` video_only), else ``state80`` /
                 ``state_mask80`` ``[B, 80]``, ``action80`` / ``action_mask80`` ``[B, C, 80]`` and ``action_timesteps``
-                ``[B, C]`` (raw).
+                ``[B, C]`` (raw); under ``latent_action`` ``action80`` / ``action_mask80`` are the latent action cells
+                ``[B, V * 80, C_lat]`` and ``action_timesteps`` ``[B, V * 80]``.
             caches: None for a window that reads and writes nothing, else one ``LayerCache`` per block.
             robot_form: which robot rows ``robot`` carries (``causal_state``, Sana ``robot_rows``): ``chunk`` the state
                 row and the C action rows; ``state`` the state row alone (the observation prefill's group, t = 0);
@@ -497,7 +631,8 @@ class CausalPolicyModel(PolicyModel):
 
         Returns:
             ``{}`` for a robotless window or the state row alone (nothing reads its prediction); else ``{"x": velocity
-            in ``latent``'s layout, "action_pred": [B, C, 80] velocity}``.
+            in ``latent``'s layout, "action_pred": [B, C, 80] velocity}`` (``[B, V * 80, C_lat]`` cells under
+            ``latent_action``).
         """
 
         if self.training:
@@ -563,14 +698,19 @@ class CausalPolicyModel(PolicyModel):
                 action = torch.as_tensor(robot["action80"]).to(device)
                 action_mask = torch.as_tensor(robot["action_mask80"]).to(device=device, dtype=torch.bool)
                 action_steps = action.shape[1]
-                if action_steps != self.chunk_actions:
-                    raise ValueError(f"a window carries {self.chunk_actions} action rows, got {action_steps}")
+                # latent_action: the window's latent action frame, 80 cells of the video's channels per view
+                expected = self.latent_action_rows(len(view_shapes)) if self.latent_action else self.chunk_actions
+                if action_steps != expected:
+                    raise ValueError(f"a window carries {expected} action rows, got {action_steps}")
                 action_t = torch.as_tensor(robot["action_timesteps"], device=device).reshape(batch, -1)
                 if action_t.shape[1] == 1:
                     action_t = action_t.expand(-1, action_steps)
                 if bool((action_t != action_t[:, :1]).any()):
                     raise ValueError("the action rows of one chunk share one timestep")
-                parts.append(self.action_embed(action.to(dtype=video.dtype), action_mask))
+                if self.latent_action:
+                    parts.append(self._latent_action_tokens(action, action_mask).to(dtype=video.dtype))
+                else:
+                    parts.append(self.action_embed(action.to(dtype=video.dtype), action_mask))
                 row_timesteps.append(self._to_model_t_domain(action_t))
             robot_tokens = torch.cat(parts, dim=1)
             tokens = torch.cat((video, robot_tokens), dim=1)
@@ -611,9 +751,8 @@ class CausalPolicyModel(PolicyModel):
         video_tokens = self.final_layer(tokens[:, :n_video], time_embedding[:, :, :n_video])
         video_tokens = view_to_strip_tokens(video_tokens, self.f, view_shapes)
         first_action = n_video + (0 if robot_form == ROBOT_FORM_ACTIONS else 1)
-        action_pred = self.action_head(tokens[:, first_action:], time_embedding[:, :, first_action:]).masked_fill(
-            ~action_mask, 0
-        )
+        head = self.final_layer if self.latent_action else self.action_head   # latent_action: the video's final layer
+        action_pred = head(tokens[:, first_action:], time_embedding[:, :, first_action:]).masked_fill(~action_mask, 0)
         return {"x": self.unpatchify(video_tokens), "action_pred": action_pred}
 
 
@@ -641,5 +780,7 @@ __all__ = [
     "ViewShapes",
     "build_causal_policy",
     "full_head_rope",
+    "tile_latent_actions",
+    "untile_latent_actions",
     "view_token_counts",
 ]

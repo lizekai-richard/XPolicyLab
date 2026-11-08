@@ -78,6 +78,17 @@ clock (Sana's deploy default, ``kv_position_mode="absolute"``) -- chunk k at slo
 rotated to the start of chunk O (``CausalMemory.slot_origin`` 0, ``_sink_rope`` at frame O * f_c) -- and only the 3D
 policies are renumbered from O.
 
+``decoupled_rope`` (Sana bb681f851) needs the absolute clock too, its robot rows sitting at 0 .. C in every chunk while
+the video counts latent frames along the episode (no fps scaling): a target latent at c * f_c + i + 0.5, an observation
+latent at c * f_c, the sink at 0 for the GDN and, for a softmax reader, at the start of its window, lo * f_c with lo =
+the oldest chunk read (Sana ``decoupled_sink_positions``: no sink horizon, any window). Its slots run from chunk 0 and
+the sink rotates to frame O * f_c, O = ``read_plan``'s window start.
+
+Under ``latent_action`` (Sana 254d46478 / cdf22c3d8; ``state_cross_attention``, video_only memory) a chunk's actions are
+one latent frame per view: ``generate_chunk`` tiles the action mask over the cells (``tile_latent_actions``, once per
+view), denoises every cell on the action schedule from its own noise, and decodes the chunk by averaging each value's
+copies (``untile_latent_actions``); the commit keeps the targets alone, as every video_only commit.
+
 Conditional and unconditional text streams hold separate memories (the caption reaches every layer through
 cross-attention). Latents are ``[1, C_lat, F, H, W]`` canvas grids or ``[1, C_lat, F, 1, sum(H_v * W_v)]`` view-major
 strips; actions and states are in the normalized space.
@@ -99,7 +110,15 @@ from sana_wam_min.policy_model.attention import apply_rotary_emb_fp64_softmax  #
 
 from .contract import ACTION_ROPE_1D, MEMORY_VIDEO_AND_ACTION  # noqa: E402
 from .layers import GDN_KIND, LayerCache  # noqa: E402
-from .model import ROBOT_FORM_ACTIONS, ROBOT_FORM_CHUNK, ROBOT_FORM_STATE, CausalPolicyModel, ViewShapes  # noqa: E402
+from .model import (  # noqa: E402
+    ROBOT_FORM_ACTIONS,
+    ROBOT_FORM_CHUNK,
+    ROBOT_FORM_STATE,
+    CausalPolicyModel,
+    ViewShapes,
+    tile_latent_actions,
+    untile_latent_actions,
+)
 
 LEFT_GRIPPER, RIGHT_GRIPPER = 16, 45
 
@@ -127,8 +146,8 @@ class CausalMemory:
         self.has_sink = False
         self.committed = 0
         self.sink_horizon = model.sink_horizon   # None: the sink at the read's window start; H: at chunk max(0, c - H)
-        # action_rope 1D: the softmax reads keep the absolute clock (module docstring, "Positions")
-        self.absolute_clock = model.action_rope == ACTION_ROPE_1D
+        # action_rope 1D and decoupled_rope: the softmax reads keep the absolute clock (module docstring, "Positions")
+        self.absolute_clock = model.action_rope == ACTION_ROPE_1D or bool(model.decoupled_rope)
 
     def read_chunk_ids(self) -> list[int]:
         """Committed chunks the next forward reads besides the sink and its own window, oldest first."""
@@ -266,6 +285,7 @@ class CausalPolicySession:
         self.causal_state = bool(model.causal_state)        # ... with the chunk's state row in its group
         self.state_cross_attention = bool(model.state_cross_attention)   # the anchor state rides the caption, no row
         self.physical = bool(model.physical_rope)           # physical_rope: every token at its physical instant
+        self.latent_action = bool(model.latent_action)      # every chunk's actions as one latent frame per view
         self.target_offset = float(model.target_frame_offset())   # a chunk's targets after its start instant (1 / 0.5625)
         self.steps = int(steps)
         if self.steps <= 0:
@@ -492,7 +512,9 @@ class CausalPolicySession:
         observation; returns (normalized actions [1, C, 80], target latents [1, C_lat, f_c, H, W]). Nothing is
         written. A ``causal_observation`` policy takes the chunk's own observation latent ``[1, C_lat, 1, H, W]`` (its
         start frame encoded alone, chunk 0's the sink's latent), required by such a policy and refused by any other:
-        it is prefilled once per stream (``prefill_observation``) and every denoising step reads it."""
+        it is prefilled once per stream (``prefill_observation``) and every denoising step reads it. Under
+        ``latent_action`` the denoised rows are the latent action cells ``[1, V * 80, C_lat]`` (``action_noise`` takes
+        that shape), the slot mask tiled over them, decoded to ``[1, C, 80]`` by averaging every value's copies."""
 
         if (observation is not None) != self.observation:
             raise ValueError(
@@ -517,19 +539,27 @@ class CausalPolicySession:
             video_noise = torch.randn(
                 (1, channels, self.f_chunk, *self._grid), generator=generator, device=device, dtype=latent_dtype
             )
+        action_mask = action_mask.to(device)
+        if self.latent_action:
+            # the action frame once per view, its input mask the slot layout tiled over the cells (Sana
+            # prepare_latent_action_flow); every cell takes its own noise
+            cells = tile_latent_actions(action_mask.to(torch.float32), int(self.model.in_channels))
+            row_mask = cells.repeat(1, len(self._views()), 1) > 0.5
+        else:
+            row_mask = action_mask
+        rows = int(row_mask.shape[1])
         if action_noise is None:
-            action_noise = torch.randn(
-                (1, chunk, action_mask.shape[2]), generator=generator, device=device, dtype=latent_dtype
-            )
+            action_noise = torch.randn(tuple(row_mask.shape), generator=generator, device=device, dtype=latent_dtype)
+        if tuple(action_noise.shape) != tuple(row_mask.shape):
+            raise ValueError(f"action_noise must be {tuple(row_mask.shape)}, got {tuple(action_noise.shape)}")
         video = video_noise.to(device=device, dtype=latent_dtype)
         self._check_latent(video, self.f_chunk, "video_noise")
-        action = action_noise.to(device=device, dtype=latent_dtype).masked_fill(~action_mask.to(device), 0)
-        action_mask = action_mask.to(device)
+        action = action_noise.to(device=device, dtype=latent_dtype).masked_fill(~row_mask, 0)
         video_scheduler = make_scheduler(self.steps, self.flow_shift, device)
         action_scheduler = make_scheduler(self.steps, self.action_flow_shift, device)
         state = anchor_state.reshape(1, -1).to(device)
         state_mask = anchor_state_mask.reshape(1, -1).to(device=device, dtype=torch.bool)
-        if self.probe is not None and self.state_cross_attention:
+        if self.probe is not None and (self.state_cross_attention or self.latent_action):
             raise NotImplementedError("the attention probe does not model the state_cross_attention caption token")
         if self.observation:
             if self.probe is not None:
@@ -561,14 +591,14 @@ class CausalPolicySession:
                 for step_index, timestep in enumerate(video_scheduler.timesteps):
                     action_timestep = action_scheduler.timesteps[step_index]
                     video_t = timestep.reshape(1, 1).expand(1, self.f_chunk).to(torch.float32)
-                    action_t = action_timestep.reshape(1, 1).expand(1, chunk).to(torch.float32)
+                    action_t = action_timestep.reshape(1, 1).expand(1, rows).to(torch.float32)
                     latent = video
                     window_t = video_t
                     robot, robot_form = self.denoise_robot({
                         "state80": state,
                         "state_mask80": state_mask,
                         "action80": action,
-                        "action_mask80": action_mask,
+                        "action_mask80": row_mask,
                         "action_timesteps": action_t,
                     })
                     outputs = []
@@ -596,10 +626,14 @@ class CausalPolicySession:
                     video = _video_step(video_scheduler, video_prediction.to(video.dtype), timestep, video, video_t)
                     action = _action_step(
                         action_scheduler, action_prediction.to(action.dtype), action_timestep, action, action_t
-                    ).masked_fill(~action_mask, 0)
+                    ).masked_fill(~row_mask, 0)
         finally:
             if probe is not None:
                 probe.pause()
+        if self.latent_action:
+            work = action.to(torch.promote_types(action.dtype, torch.float32))   # the copies' mean, at least in fp32
+            action = untile_latent_actions(work, chunk, int(action_mask.shape[2])).to(action.dtype)
+            action = action.masked_fill(~action_mask, 0)
         if gripper_bounds is not None:
             for slot, (low, high) in zip((LEFT_GRIPPER, RIGHT_GRIPPER), gripper_bounds):
                 action[..., slot] = action[..., slot].clamp(float(low), float(high))

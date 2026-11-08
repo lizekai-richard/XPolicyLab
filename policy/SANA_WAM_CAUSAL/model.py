@@ -327,8 +327,9 @@ class Model(ModelTemplate):
         self._instruction: Optional[str] = None
         self._size_warned = False
         report = self.runtime.load_report
-        # the softmax read clock: renumbered from its origin, absolute under action_rope 1D (session.py, "Positions")
-        positions = "absolute" if contract.action_rope == ACTION_ROPE_1D else "rank"
+        # the softmax read clock: renumbered from its origin, absolute under action_rope 1D and decoupled_rope (session.py,
+        # "Positions")
+        positions = "absolute" if contract.action_rope == ACTION_ROPE_1D or contract.decoupled_rope else "rank"
         print(
             f"{TAG} ready: ckpt={self.ckpt_dir} {contract.describe()} softmax_positions={positions}+sink "
             f"steps={frontend.steps} video_cfg_scale={frontend.video_cfg_scale} action_cfg_scale={frontend.action_cfg_scale} "
@@ -339,7 +340,7 @@ class Model(ModelTemplate):
             f"gdn_recurrence={report.get('gdn_recurrence')} normalization_sha256={self.normalization.sha256} "
             f"run_record={report.get('run_record')} gdn_observation={report.get('gdn_observation')} "
             f"rope_clock={report.get('rope_clock')} state_token={report.get('state_token')} "
-            f"action_rope_form={report.get('action_rope_form')} "
+            f"action_rope_form={report.get('action_rope_form')} latent_action_form={report.get('latent_action_form')} "
             f"gripper_range={report.get('gripper_range')} "
             f"device={self.device} action_type={self.action_type}",
             flush=True,

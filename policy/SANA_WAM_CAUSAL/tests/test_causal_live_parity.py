@@ -9,7 +9,9 @@ false``) needs a tree at or after c414e9b32; those tests skip on an older one. T
 after fd5261ff6 (the GDN branch of the observation group, sana-rwm's two-stream obs-block) and skip on an older one.
 The state_cross_attention tests (every chunk's anchor state as a caption token, no state row) need a tree at or after
 4b29e92fd (the token through state_embed; e.g. 6de2454dc) and skip on an older one. The action_rope 1D tests (the robot
-rows turned by one whole-head ladder at their instants) need a tree at or after b8cd4c2ee and skip on an older one.
+rows turned by one whole-head ladder at their instants) need a tree at or after b8cd4c2ee and skip on an older one. The
+decoupled_rope tests (the video on latent-frame positions, every chunk's robot rows at 0 .. C) need a tree at or after
+bb681f851, the latent_action tests (one latent action frame per view) one at or after cdf22c3d8.
 
 The live class and the mirror get identical random weights (tiny dims, fp64, CPU, xformers off, ``flash_attn`` bound to
 an fp64 reference varlen as Sana's own tests do). The decisive check is the teacher-forced deploy contract: the
@@ -169,6 +171,22 @@ def _require_live_action_rope():
         pytest.skip(f"{SANA_CAUSAL_REPO} predates action_rope (b8cd4c2ee)")
 
 
+def _require_live_decoupled_rope():
+    """Skip unless the live tree reads ``model.extra.chunk_causal_policy.decoupled_rope`` (Sana bb681f851)."""
+
+    _, crwm = _live_modules()
+    if not hasattr(crwm, "resolve_decoupled_rope"):
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates decoupled_rope (bb681f851)")
+
+
+def _require_live_latent_action():
+    """Skip unless the live tree reads ``latent_action`` with one action frame per view (Sana cdf22c3d8)."""
+
+    _, crwm = _live_modules()
+    if not hasattr(crwm, "latent_action_rows"):
+        pytest.skip(f"{SANA_CAUSAL_REPO} predates latent_action with a frame per view (cdf22c3d8)")
+
+
 def _live_sink_horizon() -> bool:
     """Whether the live tree reads the softmax sink at chunk max(0, c - 7) (Sana 0c88c11ab: ``sink_read_chunks``)."""
 
@@ -193,13 +211,25 @@ class Twins:
                  fp32_attention=False, memory=MEMORY_VIDEO_AND_ACTION, first_frame=False, normalizer=True,
                  live_normalizer=None, observation=False, state=False, physical=False, live_physical=None,
                  attn_res=True, horizon=False, live_horizon=None, state_xattn=False, action_rope="3D",
-                 live_action_rope=None):
+                 live_action_rope=None, decoupled=False, live_decoupled=None, latent_action=False, channels=C_LAT):
         causal, self.crwm = _live_modules()
+        # decoupled_rope (Sana bb681f851) of the mirror and of the live policy (live_decoupled differs only in the
+        # negative control): latent-frame video positions, robot rows at 0 .. C, the sink at the window start
+        self.decoupled = bool(decoupled)
+        live_decoupled = self.decoupled if live_decoupled is None else bool(live_decoupled)
+        if self.decoupled or live_decoupled:
+            _require_live_decoupled_rope()
+        # latent_action (Sana cdf22c3d8): one latent action frame per view, C_lat >= C channels
+        self.latent_action = bool(latent_action)
+        if self.latent_action:
+            _require_live_latent_action()
+        self.channels = int(channels)
         # the softmax sink rule (Sana 0c88c11ab: at chunk max(0, c - 7), the physical clock only) of the mirror and of
-        # the live tree (live_horizon differs only in the negative control)
+        # the live tree (live_horizon differs only in the negative control); a decoupled policy has none
         self.horizon = bool(horizon)
         live_horizon = self.horizon if live_horizon is None else bool(live_horizon)
-        _require_live_sink_rule(live_horizon)
+        if not (self.decoupled or live_decoupled):
+            _require_live_sink_rule(live_horizon)
         # the mirror's GDN readout (contract.gdn_output_normalizer) and the live one (model.memory_gdn_output_normalizer;
         # live_normalizer differs only in the negative control)
         live_normalizer = normalizer if live_normalizer is None else live_normalizer
@@ -214,7 +244,7 @@ class Twins:
         self.groups = 1 if views == 1 else views + 1
         torch.manual_seed(7)
         kwargs = dict(
-            depth=depth, hidden_size=64, patch_size=(1, 1, 1), num_heads=2, in_channels=C_LAT, pred_sigma=False,
+            depth=depth, hidden_size=64, patch_size=(1, 1, 1), num_heads=2, in_channels=self.channels, pred_sigma=False,
             caption_channels=TEXT_CH, model_max_length=TEXT_LEN, linear_head_dim=32, softmax_head_dim=32,
             softmax_ratio=0.5, attn_res_block_size=2, use_time_conditioning=False, y_norm=True, cross_norm=True,
         )
@@ -236,11 +266,15 @@ class Twins:
             _require_live_action_rope()
         if live_action_rope != "3D":
             options["action_rope"] = live_action_rope
+        if live_decoupled:
+            options["decoupled_rope"] = True
+        if self.latent_action:
+            options["latent_action"] = True
         # physical_rope (Sana 6e91eaf2a) on the mirror and on the live policy (live_physical differs only in the negative
         # control)
-        self.physical = bool(physical) or self.horizon
+        self.physical = bool(physical) or self.horizon or self.decoupled
         live_physical = self.physical if live_physical is None else bool(live_physical)
-        if not live_horizon:   # a horizon tree runs the physical clock without the key
+        if not (live_horizon or live_decoupled):   # a horizon tree runs the physical clock without the key
             if self.physical or live_physical:
                 _require_live_physical_rope()
             if live_physical:
@@ -270,6 +304,8 @@ class Twins:
         assert getattr(self.live, "memory_gdn_output_normalizer", True) is live_normalizer
         assert getattr(self.live, "state_cross_attention", False) is self.state_xattn
         assert getattr(self.live, "action_rope", "3D") == live_action_rope
+        assert getattr(self.live, "decoupled_rope", False) is live_decoupled
+        assert getattr(self.live, "latent_action", False) is self.latent_action
         with torch.no_grad():
             for parameter in self.live.parameters():
                 parameter.uniform_(-0.05, 0.05)
@@ -283,7 +319,8 @@ class Twins:
             aligned_phase_window="first_frame" if first_frame else "padded",
             gdn_output_normalizer=normalizer, causal_observation=self.observation, causal_state=self.state,
             physical_rope=self.physical, use_attn_res=self.attn_res, sink_horizon=7 if self.horizon else None,
-            state_cross_attention=self.state_xattn, action_rope=self.action_rope,
+            state_cross_attention=self.state_xattn, action_rope=self.action_rope, decoupled_rope=self.decoupled,
+            latent_action=self.latent_action,
         )
         policy_config = PolicyConfig.from_sana_kwargs(config=config, **kwargs)
         assert tuple(policy_config.multiview_spatial_rope_tile_shape) == (8, 16)
@@ -304,9 +341,9 @@ class Twins:
             return torch.randn(*shape, generator=g, dtype=torch.float64)
 
         self.chunks = chunks
-        self.sink = randn(1, C_LAT, 1, 1, self.width)
-        self.clean = [randn(1, C_LAT, self.f_chunk, 1, self.width) for _ in range(chunks)]
-        self.noisy = [randn(1, C_LAT, self.f_chunk, 1, self.width) for _ in range(chunks)]
+        self.sink = randn(1, self.channels, 1, 1, self.width)
+        self.clean = [randn(1, self.channels, self.f_chunk, 1, self.width) for _ in range(chunks)]
+        self.noisy = [randn(1, self.channels, self.f_chunk, 1, self.width) for _ in range(chunks)]
         self.a_clean = [randn(1, chunk, 80) for _ in range(chunks)]
         self.a_noisy = [randn(1, chunk, 80) for _ in range(chunks)]
         self.states = [randn(1, 80) for _ in range(chunks)]
@@ -318,8 +355,17 @@ class Twins:
         self.mask[..., 5:] = 0
         # causal_observation: every chunk's own observation latent (its start frame encoded alone), drawn after the
         # rest so the episode above is the same with and without the option
-        self.observations = [randn(1, C_LAT, 1, 1, self.width) for _ in range(chunks)]
+        self.observations = [randn(1, self.channels, 1, 1, self.width) for _ in range(chunks)]
         self.commit_state_shift = 0.0   # a negative control: the commits read another state than training's
+        # latent_action: a chunk's rows are its latent action cells [1, V * 80, C_lat], drawn after the rest; the slot
+        # layout keeps slots 0..19 (RoboDojo keeps 20 of 80), tiled over the cells as the deploy tiles it
+        self.rows = 80 * views if self.latent_action else chunk
+        self.slot_mask = torch.ones(1, chunk, 80, dtype=torch.bool)
+        self.row_mask = torch.ones(1, chunk, 80, dtype=torch.bool)
+        if self.latent_action:
+            self.slot_mask[..., 20:] = False
+            self.row_mask = self.crwm.tile_latent_actions(self.slot_mask.double(), self.channels).repeat(1, views, 1) > 0.5
+            self.a_noisy = [randn(1, self.rows, self.channels) for _ in range(chunks)]
 
     @property
     def video_and_action(self) -> bool:
@@ -358,6 +404,7 @@ class Twins:
             lo = noisy_start + c * (lead + f_c) + lead
             t_video[:, lo : lo + f_c] = self.t_video[c]
         memory = crwm.memory_row_chunks(length, self.memory)
+        chunk = self.rows   # a chunk's robot rows: C actions, or its latent action cells under latent_action
         rows = torch.cat(self.a_clean[:memory] + self.a_noisy[:length], dim=1)
         row_t = torch.cat(
             [torch.zeros(1, memory * chunk, dtype=torch.float64)]
@@ -370,7 +417,7 @@ class Twins:
         info.update(
             rwm_task="policy",
             action80=crwm.insert_state_slots(rows, grid, chunk),
-            action_mask80=crwm.insert_state_slots(torch.ones(1, grid * chunk, 80, dtype=torch.bool), grid, chunk),
+            action_mask80=crwm.insert_state_slots(self.row_mask.repeat(1, grid, 1), grid, chunk),
             action_timestep=crwm.insert_state_slots(row_t, grid, chunk),
             initial_state80=anchors[0],
             initial_state_condition_mask80=torch.ones(1, 80, dtype=torch.bool),
@@ -394,8 +441,9 @@ class Twins:
             "state80": self.states[k],
             "state_mask80": torch.ones(1, 80, dtype=torch.bool),
             "action80": self.a_noisy[k] if noisy else self.a_clean[k],
-            "action_mask80": torch.ones(1, self.chunk, 80, dtype=torch.bool),
-            "action_timesteps": torch.full((1, self.chunk), self.t_action[k] if noisy else 0.0, dtype=torch.float64),
+            "action_mask80": self.row_mask if noisy else torch.ones(1, self.chunk, 80, dtype=torch.bool),
+            "action_timesteps": torch.full((1, self.rows if noisy else self.chunk), self.t_action[k] if noisy else 0.0,
+                                           dtype=torch.float64),
         }
 
     def session(self, window="model", steps=1, video_cfg=1.0, action_cfg=1.0) -> CausalPolicySession:
@@ -1912,3 +1960,435 @@ def test_the_1d_robot_rows_are_the_live_whole_head_ladder_at_the_3d_instants():
         assert torch.equal(t1[..., video:, 0], t3[..., video:, 0])
         assert not torch.allclose(t1[..., video:, 1:], t3[..., video:, 1:])
         assert torch.equal(t3[..., video:, time_pairs:], torch.ones_like(t3[..., video:, time_pairs:]))
+
+
+# -- decoupled_rope (Sana bb681f851) -------------------------------------------------------------------------------------
+
+DECOUPLED_CASES = [
+    # views, stride, chunk, window, length, memory, first_frame, observation, state, state_xattn, normalizer, attn_res
+    (3, 4, 32, 1, 10, MEMORY_VIDEO_ONLY, True, True, False, True, False, True),        # statexattn sana latent N1-like
+    (1, 4, 32, 1, 10, MEMORY_VIDEO_ONLY, True, True, True, False, False, False),       # obs + state row, no AttnRes
+    (3, 4, 32, None, 10, MEMORY_VIDEO_AND_ACTION, False, False, False, False, True, True),  # padded, no window, L > 8
+    (1, 4, 32, 9, 11, MEMORY_VIDEO_AND_ACTION, True, True, False, True, True, True),   # W > 7: no sink horizon
+    (3, 4, 32, 2, 9, MEMORY_VIDEO_AND_ACTION, True, True, True, False, True, False),   # committed rows + the state prefill
+    (1, 1, 16, 2, 9, MEMORY_VIDEO_ONLY, True, False, False, False, False, True),       # f_c = 2
+]
+DECOUPLED_IDS = ["V3-W1-vo-obs-xattn-num", "V1-W1-vo-obs+state-num-plain", "V3-noW-va-pad-L10", "V1-W9-va-obs-xattn",
+                 "V3-W2-va-obs+state-plain", "V1-s1c16-W2-vo-num"]
+
+
+@pytest.mark.parametrize("views,stride,chunk,window,length,memory,first_frame,observation,state,state_xattn,normalizer,"
+                         "attn_res", DECOUPLED_CASES, ids=DECOUPLED_IDS)
+def test_a_decoupled_rope_deploy_chain_equals_two_stream_training_forward(
+        views, stride, chunk, window, length, memory, first_frame, observation, state, state_xattn, normalizer,
+        attn_res):
+    """Sana bb681f851: the training canvas with the video on latent-frame positions (no fps scaling), every chunk's
+    robot rows at 0 .. C on the whole-head ladder and the softmax sink at the reader's window start == the deploy chain
+    chunk by chunk, its reads on the absolute clock: windows 1 / 2 / 9 and none (no sink horizon, L - 1 > 7), both
+    front-ends, memory contents and phase windows, with and without observation latents, state rows or the state token,
+    AttnRes and the GDN denominator, f_c 1 and 2."""
+
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=length, memory=memory,
+                  first_frame=first_frame, normalizer=normalizer, observation=observation, state=state,
+                  attn_res=attn_res, state_xattn=state_xattn, decoupled=True)
+    assert twins.mirror.decoupled_rope and twins.live.decoupled_rope and twins.mirror.sink_horizon is None
+    training = twins.two_stream(length) if first_frame else twins.two_stream(length)[1:]
+    streaming = twins.streaming_first_frame(length) if first_frame else twins.streaming(length)
+    close = ACTION_ROPE_CLOSE
+    assert len(training) == len(streaming) and length - 1 > 7
+    for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming)):
+        torch.testing.assert_close(x_ours, x_live, **close, msg=lambda m: f"chunk {k} video: {m}")
+        torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+
+
+def _first_frame_gaps(twins, length):
+    training = twins.two_stream(length)
+    streaming = twins.streaming_first_frame(length)
+    return [max(_max_abs(streaming[k][i], training[k][i]) for i in (0, 1)) for k in range(length)]
+
+
+@pytest.mark.parametrize("memory", MEMORIES)
+def test_the_shared_clock_is_caught_on_a_decoupled_policy(memory):
+    """Negative control: the mirror serving the shared physical clock (fps-scaled video, robot rows at their instants,
+    the sink horizon) on the weights of a decoupled policy misses from chunk 0 on, and agrees once switched back."""
+
+    length = 4
+    twins = Twins(views=3, window=1, chunks=length, memory=memory, first_frame=True, observation=True, state_xattn=True,
+                  horizon=True, live_decoupled=True)
+    assert not twins.mirror.decoupled_rope and twins.live.decoupled_rope
+    assert min(_first_frame_gaps(twins, length)) > 1e-6
+    twins.mirror.decoupled_rope, twins.mirror.sink_horizon = True, None
+    assert max(_first_frame_gaps(twins, length)) < 1e-7
+
+
+@pytest.mark.parametrize("window", [1, 2])
+def test_the_rank_clock_and_a_pinned_sink_are_caught_on_a_decoupled_policy(window, monkeypatch):
+    """Negative controls, and why a decoupled policy keeps the absolute clock: renumbering a read from its window start
+    (the 3D policies' rank clock) moves the video against the robot rows, which stay at 0 .. C, and misses every chunk
+    whose window has slid (c > W); the sink read at 0 instead of the window's start (``decoupled_sink_positions``)
+    misses those same chunks. Chunks 0..W read from chunk 0 and agree."""
+
+    length = 6
+    twins = Twins(views=3, window=window, chunks=length, memory=MEMORY_VIDEO_AND_ACTION, first_frame=True,
+                  observation=True, state_xattn=True, decoupled=True)
+    assert max(_first_frame_gaps(twins, length)) < 1e-7
+    with monkeypatch.context() as patch:
+        patch.setattr(CausalMemory, "slot_origin", lambda self: self.read_plan()[1])
+        gaps = _first_frame_gaps(twins, length)
+        assert max(gaps[: window + 1]) < 1e-12 and min(gaps[window + 1 :]) > 1e-8, gaps
+    with monkeypatch.context() as patch:
+        patch.setattr(CausalPolicySession, "_sink_rope",
+                      lambda self, memory: self.model.softmax_entry_rope(
+                          frames=1, frame_offset=0, robot_rows=0, step_offset=0, model_fps=self.model_fps,
+                          view_shapes=self._views(), view_slot_ids=self.view_slot_ids, device=torch.device("cpu")))
+        gaps = _first_frame_gaps(twins, length)
+        assert max(gaps[: window + 1]) < 1e-12 and min(gaps[window + 1 :]) > 1e-8, gaps
+
+
+def test_the_decoupled_rows_are_the_live_ladder_at_their_slots():
+    """The rows themselves: under decoupled_rope the mirror's window table holds the robot rows at ``wan_mrope.
+    full_head_rope`` of slots 0 .. C (the live helper) whatever the step offset, and the video rows equal the shared
+    clock's at an fps whose time column is the frame index itself (fps / s = base_fps), for both rope modules."""
+
+    _require_live_decoupled_rope()
+    import dev.rwm.diffusion.model.layers.wan_mrope as wan_mrope
+
+    mirror = Twins(views=3, window=1, chunks=1, memory=MEMORY_VIDEO_AND_ACTION, decoupled=True).mirror
+    shared = Twins(views=3, window=1, chunks=1, memory=MEMORY_VIDEO_AND_ACTION, horizon=True).mirror
+    fps = torch.tensor([FPS], dtype=torch.float64)
+    video = 3 * VIEW[0] * VIEW[1]
+    for name in ("rope_linear", "rope_softmax"):
+        rope = getattr(mirror, name)
+        plain = shared.window_rope(getattr(shared, name), torch.tensor([rope.base_fps * 4], dtype=torch.float64), 1,
+                                   (VIEW,) * 3, SLOTS[3], 0, 2.5, 0, torch.device("cpu"))
+        for step_offset in (0, 64, 4096):
+            table = mirror.window_rope(rope, fps, 1, (VIEW,) * 3, SLOTS[3], 33, 2.5, step_offset, torch.device("cpu"))
+            assert torch.equal(table[0, 0, video:], wan_mrope.full_head_rope(rope, torch.arange(33, dtype=torch.float64)))
+            assert torch.allclose(table[:, :, :video], plain, rtol=0, atol=1e-12)
+
+
+# -- latent_action (Sana 254d46478, one copy per view from cdf22c3d8) ---------------------------------------------------
+
+LATENT_CASES = [
+    # views, stride, chunk, channels, window, length, first_frame, observation, normalizer, attn_res
+    (3, 1, 8, 8, 1, 10, True, True, False, True),      # the strip, N1 with observation latents
+    (1, 1, 8, 8, 1, 10, True, True, False, False),     # the canvas: the prefill reads the state token, no AttnRes
+    (3, 1, 16, 16, 2, 9, False, False, True, True),    # padded, f_c = 2
+    (1, 2, 16, 16, 7, 9, True, False, True, True),     # W = H
+    (3, 1, 8, 12, 3, 6, True, True, True, False),      # 12 channels: a chunk's values fill 1.5 copies of the frame
+]
+LATENT_IDS = ["V3-c8-W1-obs-num", "V1-c8-W1-obs-num-plain", "V3-c16-W2-pad", "V1-s2c16-W7", "V3-c8-ch12-W3-obs-plain"]
+
+
+@pytest.mark.parametrize("views,stride,chunk,channels,window,length,first_frame,observation,normalizer,attn_res",
+                         LATENT_CASES, ids=LATENT_IDS)
+def test_a_latent_action_deploy_chain_equals_two_stream_training_forward(
+        views, stride, chunk, channels, window, length, first_frame, observation, normalizer, attn_res):
+    """Sana cdf22c3d8: the training canvas whose noisy chunks carry one latent action frame per view (cells through the
+    video's patch embedding, out through its final layer, each copy at its view's place on the video's three axes at
+    the frame slot after the chunk's last target), the state on the caption, video_only memory == the deploy chain chunk
+    by chunk; past the sink horizon, both front-ends and phase windows, with and without observation latents, AttnRes
+    and the GDN denominator, f_c 1 and 2, a frame the chunk's values do not fill a whole number of times."""
+
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=length, memory=MEMORY_VIDEO_ONLY,
+                  first_frame=first_frame, normalizer=normalizer, observation=observation, attn_res=attn_res,
+                  horizon=True, state_xattn=True, latent_action=True, channels=channels)
+    assert twins.mirror.latent_action and twins.live.latent_action and twins.rows == 80 * views
+    training = twins.two_stream(length) if first_frame else twins.two_stream(length)[1:]
+    streaming = twins.streaming_first_frame(length) if first_frame else twins.streaming(length)
+    close = ACTION_ROPE_CLOSE
+    assert len(training) == len(streaming)
+    for k, ((x_live, a_live), (x_ours, a_ours)) in enumerate(zip(training, streaming)):
+        assert a_ours.shape == (1, 80 * views, channels)
+        torch.testing.assert_close(x_ours, x_live, **close, msg=lambda m: f"chunk {k} video: {m}")
+        torch.testing.assert_close(a_ours, a_live, **close, msg=lambda m: f"chunk {k} action: {m}")
+
+
+@pytest.mark.parametrize("views", [1, 3])
+def test_a_latent_action_frame_elsewhere_is_caught(views, monkeypatch):
+    """Negative controls: the action frame at its chunk's first target instant instead of the slot after its last (one
+    f_c early), and on the strip every copy on one plain grid (Sana 254d46478's one copy, repeated), miss every chunk."""
+
+    length = 4
+    twins = Twins(views=views, window=1, chunks=length, memory=MEMORY_VIDEO_ONLY, first_frame=True, observation=True,
+                  horizon=True, state_xattn=True, latent_action=True, channels=8, chunk=8, stride=1)
+    assert max(_first_frame_gaps(twins, length)) < 1e-7
+    original = CausalPolicyModel.latent_action_rope
+    with monkeypatch.context() as patch:
+        patch.setattr(CausalPolicyModel, "latent_action_rope",
+                      lambda self, rope, fps_video, frame, *rest: original(self, rope, fps_video,
+                                                                           frame - self.latent_frames_per_chunk, *rest))
+        assert min(_first_frame_gaps(twins, length)) > 1e-6
+    if views == 3:
+        def one_grid(self, rope, fps_video, frame, count, slots, device):
+            single = original(self, rope, fps_video, frame, 1, (0,), device)
+            return single.repeat(1, 1, count, 1)
+        with monkeypatch.context() as patch:
+            patch.setattr(CausalPolicyModel, "latent_action_rope", one_grid)
+            assert min(_first_frame_gaps(twins, length)) > 1e-6
+
+
+@pytest.mark.parametrize("steps,dims,channels,lead", [(8, 80, 8, ()), (32, 80, 128, (2,)), (8, 80, 12, (1, 3)),
+                                                       (5, 7, 6, ())])
+def test_the_tiling_is_the_live_tiling(steps, dims, channels, lead):
+    """``tile_latent_actions`` / ``untile_latent_actions`` == Sana's, bitwise; the untiling inverts the tiling and its
+    repeat over the views (every copy equal), and averages copies that differ."""
+
+    _require_live_latent_action()
+    from sana_wam_causal.model import tile_latent_actions, untile_latent_actions
+
+    _, crwm = _live_modules()
+    grid = (8, 10) if dims == 80 else (1, dims)
+    g = torch.Generator().manual_seed(steps * 100 + channels)
+    actions = torch.randn(*lead, steps, dims, generator=g, dtype=torch.float64)
+    ours = tile_latent_actions(actions, channels, grid)
+    assert torch.equal(ours, crwm.tile_latent_actions(actions, channels, grid))
+    copies = ours.repeat(*([1] * len(lead)), 3, 1)
+    torch.testing.assert_close(untile_latent_actions(copies, steps, dims, grid), actions, rtol=1e-14, atol=1e-15)
+    noisy = copies + torch.randn(copies.shape, generator=g, dtype=torch.float64)
+    assert torch.equal(untile_latent_actions(noisy, steps, dims, grid), crwm.untile_latent_actions(noisy, steps, dims, grid))
+
+
+def _live_canvas(twins, length, *, video, t_video, rows, t_rows, y, observations, row_mask):
+    """The live two-stream canvas over ``length`` chunks with noisy chunk ``length - 1`` at (``video``, ``t_video``) and
+    its robot rows at (``rows``, ``t_rows``) (the earlier noisy chunks at their Twins draws, which chunk ``length - 1``
+    never reads) under prompt ``y``: (its targets in the mirror's layout, its rows' output)."""
+
+    crwm, f_c = twins.crwm, twins.f_chunk
+    k = length - 1
+    lead = int(twins.observation)
+    noisy_video = twins.noisy[:k] + [video]
+    noisy = [torch.cat([observations[c], noisy_video[c]], dim=2) if lead else noisy_video[c] for c in range(length)]
+    x = torch.cat([twins.sink] + twins.clean[:k] + noisy, dim=2)
+    t = torch.zeros(1, x.shape[2], dtype=torch.float64)
+    noisy_start = 1 + k * f_c
+    for c in range(length):
+        lo = noisy_start + c * (lead + f_c) + lead
+        t[:, lo : lo + f_c] = twins.t_video[c] if c < k else t_video
+    memory = crwm.memory_row_chunks(length, twins.memory)
+    per = twins.rows
+    noisy_rows = twins.a_noisy[:k] + [rows]
+    action = torch.cat(twins.a_clean[:memory] + noisy_rows, dim=1)
+    row_t = torch.cat(
+        [torch.zeros(1, memory * per, dtype=torch.float64)]
+        + [torch.full((1, per), twins.t_action[c] if c < k else t_rows, dtype=torch.float64) for c in range(length)],
+        dim=1,
+    )
+    anchors = twins.states[:memory] + twins.states[:length]
+    grid = len(anchors)
+    masks = [torch.ones(1, twins.chunk, 80, dtype=torch.bool)] * memory + [twins.row_mask] * (length - 1) + [row_mask]
+    info = twins.info()
+    info.update(
+        rwm_task="policy",
+        action80=crwm.insert_state_slots(action, grid, per),
+        action_mask80=crwm.insert_state_slots(torch.cat(masks, dim=1), grid, per),
+        action_timestep=crwm.insert_state_slots(row_t, grid, per),
+        initial_state80=anchors[0],
+        initial_state_condition_mask80=torch.ones(1, 80, dtype=torch.bool),
+        two_stream_num_chunks=length,
+    )
+    if grid > 1:
+        info["chunk_states80"] = torch.stack(anchors[1:], dim=1)
+        info["chunk_states_mask80"] = torch.ones(1, grid - 1, 80, dtype=torch.bool)
+    with torch.no_grad():
+        out = twins.live(x, t, y, mask=twins.mask, data_info=info)
+    lo = noisy_start + k * (lead + f_c) + lead
+    positions = crwm.action_row_positions(grid, per)
+    rows_k = positions[(memory + k) * per : (memory + k + 1) * per]
+    return twins.ours(out["x"][:, :, lo : lo + f_c]), out["action_pred"].index_select(1, rows_k)
+
+
+def _reference_generate(twins, k, *, steps, video_cfg, action_cfg, video_noise, action_noise, observations):
+    """``generate_chunk`` of chunk k rebuilt on the live training canvas: every solver step one canvas per text stream
+    (chunk k its last noisy chunk, so it reads the sink, the clean chunks 0..k-1 and itself), per-stream CFG, the
+    sampler's Euler steps on both schedules, and under latent_action the slot mask tiled over the cells and the chunk
+    decoded by averaging every value's copies (Sana ``untile_latent_actions``)."""
+
+    from sana_wam_min.sampler import _action_step, _video_step, make_scheduler
+
+    crwm = twins.crwm
+    video_scheduler = make_scheduler(steps, 5.0, torch.device("cpu"))
+    action_scheduler = make_scheduler(steps, 1.0, torch.device("cpu"))
+    row_mask = twins.row_mask
+    video, action = video_noise, action_noise.masked_fill(~row_mask, 0)
+    guided = video_cfg > 1 or action_cfg > 1
+    for index, timestep in enumerate(video_scheduler.timesteps):
+        action_timestep = action_scheduler.timesteps[index]
+        t_v = float(timestep.to(torch.float32))
+        t_a = float(action_timestep.to(torch.float32))
+        outs = [
+            _live_canvas(twins, k + 1, video=video if twins.views > 1 else video.reshape(*video.shape[:3], 1, -1),
+                         t_video=t_v, rows=action, t_rows=t_a, y=y, observations=observations, row_mask=row_mask)
+            for y in ([twins.y, twins.y_null] if guided else [twins.y])
+        ]
+        video_prediction, action_prediction = outs[0]
+        if guided and video_cfg > 1:
+            video_prediction = outs[1][0] + video_cfg * (video_prediction - outs[1][0])
+        if guided and action_cfg > 1:
+            action_prediction = outs[1][1] + action_cfg * (action_prediction - outs[1][1])
+        video_t = torch.full((1, twins.f_chunk), t_v, dtype=torch.float32)
+        action_t = torch.full((1, action.shape[1]), t_a, dtype=torch.float32)
+        video = _video_step(video_scheduler, video_prediction, timestep, video, video_t)
+        action = _action_step(action_scheduler, action_prediction, action_timestep, action, action_t).masked_fill(~row_mask, 0)
+    if twins.latent_action:
+        action = crwm.untile_latent_actions(action, twins.chunk, 80).masked_fill(~twins.slot_mask, 0)
+    return action, video
+
+
+GENERATE_CASES = [
+    # views, latent_action, decoupled, observation, memory, window, video_cfg, action_cfg
+    (3, True, False, True, MEMORY_VIDEO_ONLY, 1, 6.0, 1.0),
+    (1, True, False, False, MEMORY_VIDEO_ONLY, 2, 2.5, 1.7),
+    (3, False, True, True, MEMORY_VIDEO_ONLY, 1, 6.0, 1.0),
+    (1, False, True, False, MEMORY_VIDEO_AND_ACTION, None, 2.5, 1.7),
+]
+GENERATE_IDS = ["V3-latent-obs-W1-cfg6", "V1-latent-W2-cfg2.5/1.7", "V3-decoupled-obs-W1-cfg6", "V1-decoupled-va-noW"]
+
+
+@pytest.mark.parametrize("views,latent_action,decoupled,observation,memory,window,video_cfg,action_cfg",
+                         GENERATE_CASES, ids=GENERATE_IDS)
+def test_generate_chunk_equals_the_live_canvas_solver(views, latent_action, decoupled, observation, memory, window,
+                                                      video_cfg, action_cfg):
+    """A first-frame episode through the mirror's session (two solver steps, per-stream CFG, the commits between) ==
+    the same solver run on the live training canvas, chunk by chunk: for latent_action the cells, their tiled mask,
+    every cell's own noise and the decoding by the copies' mean; for decoupled_rope the absolute clock with the sink
+    at the window start. Sana's own cached session refuses both switches, so the canvas is the reference."""
+
+    steps, chunks = 2, 4
+    chunk, stride, channels = (8, 1, 8) if latent_action else (32, 4, C_LAT)
+    twins = Twins(views=views, stride=stride, chunk=chunk, window=window, chunks=chunks, memory=memory,
+                  first_frame=True, observation=observation, state_xattn=True, horizon=not decoupled,
+                  decoupled=decoupled, latent_action=latent_action, channels=channels)
+    ours = twins.session(steps=steps, video_cfg=video_cfg, action_cfg=action_cfg)
+    observations = [twins.sink] + twins.observations[1:]   # chunk 0's observation is the sink's latent
+    state_mask = torch.ones(1, 80, dtype=torch.bool)
+    ours.commit_sink(twins.ours(twins.sink))
+    g = torch.Generator().manual_seed(43)
+    for k in range(chunks):
+        video_noise = torch.randn(1, channels, twins.f_chunk, 1, twins.width, generator=g, dtype=torch.float64)
+        action_noise = torch.randn(tuple(twins.row_mask.shape), generator=g, dtype=torch.float64)
+        extra = {"observation": twins.ours(observations[k])} if observation else {}
+        a_ours, v_ours = ours.generate_chunk(
+            anchor_state=twins.states[k], anchor_state_mask=state_mask, action_mask=twins.slot_mask,
+            video_noise=twins.ours(video_noise), action_noise=action_noise, **extra,
+        )
+        a_ref, v_ref = _reference_generate(
+            twins, k, steps=steps, video_cfg=video_cfg, action_cfg=action_cfg, video_noise=twins.ours(video_noise),
+            action_noise=action_noise, observations=observations,
+        )
+        assert a_ours.shape == (1, chunk, 80)
+        torch.testing.assert_close(a_ours, a_ref, **ACTION_ROPE_CLOSE, msg=lambda m: f"chunk {k} action: {m}")
+        torch.testing.assert_close(v_ours, v_ref, **ACTION_ROPE_CLOSE, msg=lambda m: f"chunk {k} video: {m}")
+        twins.commit(ours, k)
+    assert ours.chunk_idx == chunks
+
+
+class _FlowAtSigma:
+    """The flow scheduler's ``q_sample`` at given sigmas, all ``prepare_latent_action_flow`` reads of it here."""
+
+    timestep_map = None
+
+    def q_sample(self, x, t, noise=None, sigmas=None):
+        sigmas = sigmas.to(x.dtype)[..., None]
+        return (1.0 - sigmas) * x + sigmas * noise
+
+
+@pytest.mark.parametrize("views,channels", [(3, 128), (1, 128), (3, 40)], ids=["strip-V3-C128", "canvas-V1-C128", "strip-V3-C40"])
+def test_a_latent_action_chunk_decodes_to_the_actions_the_trainer_tiled(views, channels, monkeypatch):
+    """Oracle decode at the recipe's sizes (C = 32 over 128 channels: 4 copies a frame, x3 views on the strip; 40
+    channels: steps 0..7 twice a frame, the rest once). Sana's trainer tiles known chunks into their clean cells
+    (``prepare_latent_action_flow``: the frame once per view, its input mask), a model that predicts the exact flow
+    velocity toward those cells runs through ``generate_chunk`` -- the session's own noise draw, tiled mask, two-stream
+    CFG, Euler steps and decoding -- and the decoded chunk is the known one on the live slots, 0 elsewhere, the gripper
+    bounds applied after the decoding. With the copies of every value offset by zero-mean amounts the decoding still
+    returns it (it averages exactly the trainer's copies of a value), and a decoding that reads one copy misses it."""
+
+    _require_live_latent_action()
+    from dev.rwm.train_utils.action import prepare_latent_action_flow
+    from sana_wam_causal import session as session_module
+    from sana_wam_causal.model import tile_latent_actions
+    from sana_wam_causal.session import LEFT_GRIPPER, RIGHT_GRIPPER
+
+    chunk, chunks, steps = 32, 3, 4
+    twins = Twins(views=views, stride=4, chunk=chunk, window=1, chunks=chunks, memory=MEMORY_VIDEO_ONLY,
+                  first_frame=True, observation=True, state_xattn=True, horizon=True, latent_action=True,
+                  channels=channels)
+    crwm, rows = twins.crwm, 80 * views
+    slot_mask = torch.zeros(1, chunk, 80, dtype=torch.bool)
+    slot_mask[..., 7:17] = True   # RoboDojo's two EEF arms, each gripper the arm's last slot
+    slot_mask[..., 36:46] = True
+    row_mask = tile_latent_actions(slot_mask.double(), channels).repeat(1, views, 1) > 0.5
+    bounds = ((0.0, 1.0), (-0.25, 0.75))
+    g = torch.Generator().manual_seed(5)
+    known = [torch.randn(1, chunk, 80, generator=g, dtype=torch.float64).masked_fill(~slot_mask, 0) for _ in range(chunks)]
+    expected = []
+    for values in known:
+        values = values.clone()
+        for slot, (low, high) in zip((LEFT_GRIPPER, RIGHT_GRIPPER), bounds):
+            values[..., slot] = values[..., slot].clamp(low, high)
+        expected.append(values)
+    zeros = torch.zeros(1, rows, dtype=torch.float64)
+    cells = []
+    for values in known:
+        # sigma 0: the trainer's noisy cells are its clean cells, on the per-step mask
+        clean, input_mask, target, _ = prepare_latent_action_flow(
+            _FlowAtSigma(), {"action80": values, "action_mask80": slot_mask}, zeros, zeros, zeros,
+            chunk_actions=chunk, channels=channels, views=views,
+        )
+        assert clean.shape == (1, rows, channels) and torch.equal(input_mask, row_mask)
+        cells.append(clean)
+
+    def offsets(seed):
+        # zero mean over every value's copies: P minus the copies' mean of P, retiled over the frame and the views
+        p = torch.randn(1, rows, channels, generator=torch.Generator().manual_seed(seed), dtype=torch.float64)
+        mean = crwm.untile_latent_actions(p, chunk, 80)
+        return (p - crwm.tile_latent_actions(mean, channels).repeat(1, views, 1)).masked_fill(~row_mask, 0)
+
+    def episode(targets):
+        ours = twins.session(steps=steps, video_cfg=6.0, action_cfg=1.0)
+        target = {}
+        original = ours._forward
+
+        def oracle(latent, timesteps, caption, memory, *, robot=None, **kwargs):
+            out = original(latent, timesteps, caption, memory, robot=robot, **kwargs)
+            if robot is None or "x0" not in target:
+                return out
+            x = robot["action80"]
+            assert x.shape == (1, rows, channels) and torch.equal(robot["action_mask80"], row_mask)
+            # the scheduler's per-token sigma (fp32 timesteps / 1000 in fp32), so its last step lands on the target
+            sigma = (robot["action_timesteps"] / 1000.0).to(x.dtype)[..., None]
+            velocity = ((x - target["x0"]) / sigma).masked_fill(~row_mask, 0)
+            return {**out, "action_pred": velocity.to(out["action_pred"].dtype)}
+
+        ours._forward = oracle
+        observations = [twins.sink] + twins.observations[1:]
+        ours.commit_sink(twins.ours(twins.sink))
+        decoded = []
+        for k in range(chunks):
+            target["x0"] = targets[k]
+            action, _ = ours.generate_chunk(
+                anchor_state=twins.states[k], anchor_state_mask=torch.ones(1, 80, dtype=torch.bool),
+                action_mask=slot_mask, generator=torch.Generator().manual_seed(70 + k), gripper_bounds=bounds,
+                observation=twins.ours(observations[k]),
+            )
+            target.clear()
+            decoded.append(action)
+            twins.commit(ours, k)
+        return decoded
+
+    # diffusers' Euler step upcasts the sample to fp32, so the solver lands on the cells to fp32 rounding (~1e-7)
+    for k, action in enumerate(episode(cells)):
+        assert action.shape == (1, chunk, 80) and bool((action[~slot_mask] == 0).all())
+        torch.testing.assert_close(action, expected[k], rtol=0, atol=1e-6, msg=lambda m: f"chunk {k}: {m}")
+    disagreeing = [clean + offsets(100 + k) for k, clean in enumerate(cells)]
+    assert min(float(d.sub(c).abs().max()) for d, c in zip(disagreeing, cells)) > 0.5
+    for k, action in enumerate(episode(disagreeing)):
+        torch.testing.assert_close(action, expected[k], rtol=0, atol=1e-6, msg=lambda m: f"disagreeing chunk {k}: {m}")
+
+    def one_copy(latents, steps_, dims, grid=(8, 10)):
+        frame = grid[0] * grid[1]
+        return crwm.untile_latent_actions(latents[:, :frame, : steps_ * dims // frame], steps_, dims)
+
+    monkeypatch.setattr(session_module, "untile_latent_actions", one_copy)
+    misses = [float((a - e).abs().max()) for a, e in zip(episode(disagreeing), expected)]
+    assert min(misses) > 0.1, misses

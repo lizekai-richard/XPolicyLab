@@ -4,7 +4,10 @@ episode canvas in its single form (no chunk observations; the live tree must be 
 chunk's own observation latent -- its start frame encoded alone -- on both sides: [o_c | targets] on the canvas, the
 session's observation prefill before the chunk's window on the chain. A checkpoint whose run record names a tree from
 Sana 0c88c11ab on (the softmax sink at chunk max(0, c - 7), the physical clock only) needs a live tree at or after it;
-``--chunks`` above 8 takes the chain past the horizon, which the summary reports apart.
+``--chunks`` above 8 takes the chain past the horizon, which the summary reports apart. A ``decoupled_rope`` checkpoint
+(Sana bb681f851) needs a live tree at or after it and runs any window; a ``latent_action`` checkpoint (cdf22c3d8 on) runs
+its chunks' actions as latent action cells on both sides: the clean rows tiled over the latent channels once per view,
+each cell mixed with its own noise, compared on the cells of the live slots.
 
 The same checkpoint and the same inputs go through two implementations of one prediction:
 
@@ -58,7 +61,7 @@ sys.path.insert(0, str(POLICY_DIR))
 from sana_wam_causal import shared  # noqa: E402,F401
 from sana_wam_causal.checkpoint import load_causal_weights  # noqa: E402
 from sana_wam_causal.contract import bidirectional_view  # noqa: E402
-from sana_wam_causal.model import build_causal_policy  # noqa: E402
+from sana_wam_causal.model import build_causal_policy, tile_latent_actions  # noqa: E402
 from sana_wam_causal.runtime import CausalRuntime  # noqa: E402
 from sana_wam_causal.session import Caption, CausalPolicySession  # noqa: E402
 from sana_wam_min.config import load_train_config, policy_config_from_train_config  # noqa: E402
@@ -245,11 +248,12 @@ def two_stream(live, crwm, inp, L, f_c, chunk, memory_content, first, autocast_d
         lo = noisy_start + c * (lead + f_c) + lead
         t_video[:, lo : lo + f_c] = inp["t_video"][c]
     memory = crwm.memory_row_chunks(L, memory_content)
+    chunk = int(inp["row_mask"].shape[1])   # a chunk's robot rows: C actions, or V * 80 latent action cells
     rows = torch.cat(inp["a_clean"][:memory] + inp["a_noisy"][:L], dim=1)
     row_t = torch.cat([torch.zeros(1, memory * chunk)] + [torch.full((1, chunk), inp["t_action"][c]) for c in range(L)], dim=1)
     anchors = inp["states"][:memory] + inp["states"][:L]
     grid = len(anchors)
-    mask_rows = inp["action_mask"][:, :1].expand(1, grid * chunk, 80)
+    mask_rows = inp["row_mask"].repeat(1, grid, 1)
     info = {
         "model_fps": 25.0,
         "view_count": torch.tensor([len(views)]),
@@ -311,10 +315,11 @@ def kv_chain(mirror, inp, L, window, first, autocast_dtype):
     preds, reads = [], []
     for k in range(first, L):
         video_t = torch.full((1, f_c), float(inp["t_video"][k]), device=dev)
-        action_t = torch.full((1, chunk), float(inp["t_action"][k]), device=dev)
+        action_t = torch.full((1, int(inp["row_mask"].shape[1])), float(inp["t_action"][k]), device=dev)
         robot = {
             "state80": inp["states"][k].to(dev, dtype), "state_mask80": smask[None],
-            "action80": inp["a_noisy"][k].to(dev, dtype), "action_mask80": amask, "action_timesteps": action_t,
+            "action80": inp["a_noisy"][k].to(dev, dtype), "action_mask80": inp["row_mask"].to(dev),
+            "action_timesteps": action_t,
         }
         reads.append((session.read_chunk_ids(), session.softmax_origin()))
         with torch.no_grad(), session._autocast(dev):
@@ -339,14 +344,14 @@ def kv_chain(mirror, inp, L, window, first, autocast_dtype):
 
 # ---- comparison ---------------------------------------------------------------------------------------------------------------
 
-def compare(a_preds, b_preds, action_mask):
+def compare(a_preds, b_preds, row_mask):
     rows = []
-    mask = action_mask[0, 0].cpu()
+    mask = row_mask.cpu()   # [1, rows, D]: the EEF slots of every action row, or the live latent action cells
     for (va, aa), (vb, ab) in zip(a_preds, b_preds):
-        dv, da = vb - va, (ab - aa)[..., mask]
+        dv, da = vb - va, (ab - aa)[mask]
         rows.append({
             "video_rel": float(dv.norm() / va.norm().clamp_min(1e-12)), "video_max": float(dv.abs().max()),
-            "action_rel": float(da.norm() / aa[..., mask].norm().clamp_min(1e-12)), "action_max": float(da.abs().max()),
+            "action_rel": float(da.norm() / aa[mask].norm().clamp_min(1e-12)), "action_max": float(da.abs().max()),
         })
     return rows
 
@@ -443,8 +448,16 @@ def main() -> int:
     if observations is not None:
         inp["observations"] = observations
     inp["noisy"] = [(1 - s) * x0 + s * torch.randn(x0.shape, generator=g) for s, x0 in zip(sig_v, clean)]
-    inp["a_noisy"] = [((1 - s) * a0 + s * torch.randn(a0.shape, generator=g)).masked_fill(~action_mask, 0)
-                      for s, a0 in zip(sig_a, inp["a_clean"])]
+    inp["row_mask"] = action_mask
+    clean_rows = inp["a_clean"]
+    if contract.latent_action:
+        # every chunk's clean rows tiled over the latent channels once per view, every cell its own noise (Sana
+        # prepare_latent_action_flow); the cells of the live slots compared
+        views_n, channels = len(view_shapes), int(sink.shape[1])
+        inp["row_mask"] = tile_latent_actions(action_mask.float(), channels).repeat(1, views_n, 1) > 0.5
+        clean_rows = [tile_latent_actions(a0, channels).repeat(1, views_n, 1) for a0 in inp["a_clean"]]
+    inp["a_noisy"] = [((1 - s) * a0 + s * torch.randn(a0.shape, generator=g)).masked_fill(~inp["row_mask"], 0)
+                      for s, a0 in zip(sig_a, clean_rows)]
     print(f"[tf-parity] inputs ready ({time.perf_counter() - t0:.0f}s): latents {tuple(sink.shape)} per frame, {L} chunks "
           f"({'chunk 0 the frozen opening' if first else 'chunk 0 at the first frame'}), views {view_shapes}", flush=True)
 
@@ -481,12 +494,13 @@ def main() -> int:
     # 3. report
     report = {}
     for prec, r in results.items():
-        report[f"B_vs_A_{prec}"] = compare(r["A"], r["B"], action_mask)
+        report[f"B_vs_A_{prec}"] = compare(r["A"], r["B"], inp["row_mask"])
     if "float32" in results and "bfloat16" in results:
-        report["A_bf16_vs_A_fp32"] = compare(results["float32"]["A"], results["bfloat16"]["A"], action_mask)
-        report["B_bf16_vs_A_fp32"] = compare(results["float32"]["A"], results["bfloat16"]["B"], action_mask)
+        report["A_bf16_vs_A_fp32"] = compare(results["float32"]["A"], results["bfloat16"]["A"], inp["row_mask"])
+        report["B_bf16_vs_A_fp32"] = compare(results["float32"]["A"], results["bfloat16"]["B"], inp["row_mask"])
     reads = next(iter(results.values()))["reads"]
-    print("\n[tf-parity] per noisy chunk (relative L2 error = ||X - A|| / ||A||; video velocity | action velocity on the 20 EEF slots)")
+    print("\n[tf-parity] per noisy chunk (relative L2 error = ||X - A|| / ||A||; video velocity | action velocity on the 20 EEF slots"
+          + (", tiled over the latent action cells)" if contract.latent_action else ")"))
     keys = list(report)
     print("chunk  read(origin)      " + "  ".join(f"{k:>26s}" for k in keys))
     for c in range(first, L):

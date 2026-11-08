@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,9 @@ from sana_wam_causal.contract import (
     ALIGNED_PHASE_FIRST_FRAME,
     ALIGNED_PHASE_PADDED,
     ACTION_ROPE_TREES,
+    DECOUPLED_ROPE_TREES,
+    LATENT_ACTION_ONE_COPY_TREES,
+    LATENT_ACTION_TREES,
     MEMORY_VIDEO_AND_ACTION,
     MEMORY_VIDEO_ONLY,
     CausalContract,
@@ -30,6 +34,7 @@ from sana_wam_causal.contract import (
     STATE_TOKEN_TREES,
     WINDOW_START_SINK_TREES,
     check_action_rope_form,
+    check_latent_action_form,
     check_observation_form,
     check_run_record,
     check_state_token_form,
@@ -38,6 +43,8 @@ from sana_wam_causal.contract import (
     record_trees,
     resolve_action_rope,
     resolve_causal_contract,
+    resolve_decoupled_rope,
+    resolve_latent_action,
     resolve_rope_clock,
     resolve_state_cross_attention,
 )
@@ -183,7 +190,7 @@ def test_the_gdn_output_normalizer_switch_resolves(value, expected):
     assert contract.gdn_output_normalizer is expected
     assert contract.describe().endswith(
         f"first_chunk=0 gdn_output_normalizer={expected} use_attn_res=True sink_horizon=None state_cross_attention=False "
-        "action_rope=3D"
+        "action_rope=3D decoupled_rope=False latent_action=False"
     )
 
 
@@ -212,7 +219,7 @@ def test_the_released_n1_obs_checkpoint_resolves_with_its_observation_and_state(
     assert " chunk_observation=False causal_observation=True causal_state=True multiview=sana_latent " in text
     assert text.endswith(
         "first_chunk=0 gdn_output_normalizer=False use_attn_res=True sink_horizon=None state_cross_attention=False "
-        "action_rope=3D"
+        "action_rope=3D decoupled_rope=False latent_action=False"
     )
 
 
@@ -314,6 +321,7 @@ def test_the_attn_res_switch_resolves_and_the_view_keeps_the_mirror_config(value
     assert contract.use_attn_res is expected
     assert contract.describe().endswith(
         f" use_attn_res={expected} sink_horizon=None state_cross_attention=False action_rope=3D"
+        " decoupled_rope=False latent_action=False"
     )
     view = bidirectional_view(cfg)
     assert view["model"]["use_attn_res"] is True and cfg["model"].get("use_attn_res", None) is value
@@ -395,7 +403,8 @@ def test_a_checkpoint_of_the_sink_horizon_trees_runs_the_physical_clock_with_the
     assert (contract.physical_rope, contract.sink_horizon) == (True, SINK_HORIZON_CHUNKS) == (True, 7)
     assert contract == CausalContract(**{**config.__dict__, "physical_rope": True, "sink_horizon": 7})
     assert label == f"physical+sink_horizon7(0c88c11ab; trained on {tree}0)"
-    assert contract.describe().endswith(" use_attn_res=False sink_horizon=7 state_cross_attention=False action_rope=3D")
+    assert contract.describe().endswith(" use_attn_res=False sink_horizon=7 state_cross_attention=False action_rope=3D"
+                                       " decoupled_rope=False latent_action=False")
     check_run_record(records[0][1], contract)
     with pytest.raises(ValueError, match="records deploy.physical_rope=True"):
         check_run_record(records[0][1], config)
@@ -600,10 +609,11 @@ class _Cfg(SimpleNamespace):
 
 
 class _Model:
-    def __init__(self, kinds, sink_horizon=None, action_rope="3D"):
+    def __init__(self, kinds, sink_horizon=None, action_rope="3D", decoupled_rope=False):
         self.blocks = [type("B", (), {"attn_type": kind})() for kind in kinds]
         self.sink_horizon = sink_horizon
         self.action_rope = action_rope
+        self.decoupled_rope = decoupled_rope
 
 
 def _entry_caches(memory: CausalMemory, value: float) -> list[LayerCache]:
@@ -982,7 +992,8 @@ def _state_xattn_cfg(value=True):
 def test_the_state_cross_attention_switch_resolves(value, expected):
     contract = resolve_causal_contract(_state_xattn_cfg(value))
     assert contract.state_cross_attention is expected and contract.causal_state is False
-    assert contract.describe().endswith(f" sink_horizon=None state_cross_attention={expected} action_rope=3D")
+    assert contract.describe().endswith(f" sink_horizon=None state_cross_attention={expected} action_rope=3D"
+                                       " decoupled_rope=False latent_action=False")
     assert resolve_causal_contract(_load(RECIPE_HORIZON_NOATTNRES)).state_cross_attention is False
 
 
@@ -1154,7 +1165,8 @@ def _action_rope_cfg(value="1D"):
 def test_the_action_rope_switch_resolves(value, expected):
     contract = resolve_causal_contract(_action_rope_cfg(value))
     assert contract.action_rope == expected and contract.state_cross_attention
-    assert contract.describe().endswith(f" state_cross_attention=True action_rope={expected}")
+    assert contract.describe().endswith(f" state_cross_attention=True action_rope={expected}"
+                                       " decoupled_rope=False latent_action=False")
     for recipe in (RECIPE_HORIZON_NOATTNRES, RECIPE_N1, RECIPE_PIXEL_N2):
         assert resolve_causal_contract(_load(recipe)).action_rope == "3D"
 
@@ -1278,3 +1290,262 @@ def test_a_1d_memory_reads_on_the_absolute_clock():
         assert three.read_plan() == one.read_plan() == (list(range(max(0, committed - 7), committed)), origin)
         assert (three.slot_origin(), one.slot_origin()) == (origin, 0)
     assert not three.absolute_clock and one.absolute_clock
+
+
+# -- decoupled_rope (Sana bb681f851) -------------------------------------------------------------------------------------
+
+
+def _decoupled_cfg(value=True, window=1):
+    """The state_cross_attention N1 recipe above with ``decoupled_rope`` and the softmax window ``window``."""
+
+    cfg = _state_xattn_cfg(True)
+    if value is not None:
+        _policy(cfg)["decoupled_rope"] = value
+    _policy(cfg)["sliding_window_chunks"] = window
+    return cfg
+
+
+@pytest.mark.parametrize("value,expected", [(None, False), (False, False), (True, True)])
+def test_the_decoupled_rope_switch_resolves(value, expected):
+    contract = resolve_causal_contract(_decoupled_cfg(value))
+    assert contract.decoupled_rope is expected and contract.action_rope == "3D" and not contract.latent_action
+    assert contract.describe().endswith(f" action_rope=3D decoupled_rope={expected} latent_action=False")
+
+
+def test_the_decoupled_rope_switch_is_refused_outside_its_contract():
+    with pytest.raises(ValueError, match="decoupled_rope='true': must be true or false"):
+        resolve_causal_contract(_decoupled_cfg("true"))
+    for rope in ("1D", "3D"):
+        cfg = _decoupled_cfg(True)
+        _policy(cfg)["action_rope"] = rope
+        with pytest.raises(ValueError, match=f"drop action_rope='{rope}'"):
+            resolve_causal_contract(cfg)
+    assert resolve_decoupled_rope(None, "1D") is False and resolve_decoupled_rope(False, "1D") is False
+
+
+@pytest.mark.parametrize("window", [1, 9, None])
+@pytest.mark.parametrize("tree", DECOUPLED_ROPE_TREES)
+def test_a_decoupled_checkpoint_serves_the_window_start_sink_without_a_horizon(tree, window, tmp_path):
+    """From Sana bb681f851 on the key is read: such a record serves the decoupled clock (physical offsets, the sink at
+    the reader's window start, no horizon) at any window, above 7 chunks or none, where a shared-clock record of the
+    same tree refuses a window above the horizon."""
+
+    assert set(DECOUPLED_ROPE_TREES) <= set(SINK_HORIZON_TREES) and set(DECOUPLED_ROPE_TREES) <= set(STATE_TOKEN_TREES)
+    records = [(tmp_path / "RUN_ID.json", {"source_commit": tree})]
+    contract, label = resolve_rope_clock(records, resolve_causal_contract(_decoupled_cfg(True, window)))
+    assert (contract.decoupled_rope, contract.physical_rope, contract.sink_horizon) == (True, True, None)
+    assert label == f"decoupled+sink_window_start(bb681f851; trained on {tree})"
+    assert check_action_rope_form(records, contract).startswith("none(decoupled_rope")
+    assert check_state_token_form(records, contract) == f"state_embed(4b29e92fd; trained on {tree})"
+    assert check_latent_action_form(records, contract) is None
+    check_run_record({"source_commit": tree, "decoupled_rope": True, "sliding_window_chunks": window}, contract)
+    if window != 1:
+        with pytest.raises(ValueError, match="refuses a window above the sink horizon"):
+            resolve_rope_clock(records, resolve_causal_contract(_decoupled_cfg(False, window)))
+
+
+@pytest.mark.parametrize("tree", ["b8cd4c2ee", "6de2454dc", "7ed0d28bf"])
+def test_a_decoupled_config_of_a_tree_before_the_key_is_refused(tree, tmp_path):
+    """A tree before bb681f851 ignores the key and trains the shared clock; without a record only a donor directory is
+    served."""
+
+    contract = resolve_causal_contract(_decoupled_cfg(True))
+    with pytest.raises(ValueError, match="a tree before Sana bb681f851 ignores decoupled_rope.*DECOUPLED_ROPE_TREES"):
+        resolve_rope_clock([(tmp_path / "RUN_ID.json", {"source_commit": tree})], contract)
+    with pytest.raises(ValueError, match="name no training tree that reads the key"):
+        resolve_rope_clock([], contract)
+    served, label = resolve_rope_clock([], contract, allow_unrecorded=True)
+    assert served.sink_horizon is None and label == "decoupled+sink_window_start(unrecorded: donor directory)"
+
+
+def test_a_run_record_contradicting_decoupled_rope_or_latent_action_is_refused():
+    decoupled = resolve_causal_contract(_decoupled_cfg(True))
+    check_run_record({"decoupled_rope": True, "latent_action": False}, decoupled)
+    with pytest.raises(ValueError, match="decoupled_rope=False but config.yaml resolves to True"):
+        check_run_record({"decoupled_rope": False}, decoupled)
+    with pytest.raises(ValueError, match="deploy.latent_action=True but config.yaml resolves to False"):
+        check_run_record({"deploy": {"latent_action": True}}, decoupled)
+
+
+def test_a_decoupled_memory_reads_on_the_absolute_clock_from_its_window_start():
+    """No sink horizon: the read's origin is its window start (the oldest chunk read), the sink rotated there; the
+    slots run from chunk 0 (``slot_origin`` 0), as under action_rope 1D."""
+
+    kinds = ["GatedDeltaNet", "GatedSoftmaxAttention"]
+    memory = CausalMemory(_Model(kinds, decoupled_rope=True), 2)
+    assert memory.absolute_clock and memory.sink_horizon is None
+    for committed, origin in ((0, 0), (1, 0), (2, 0), (3, 1), (12, 10)):
+        memory.committed = committed
+        assert memory.read_plan() == (list(range(max(0, committed - 2), committed)), origin)
+        assert memory.slot_origin() == 0
+
+
+def _tiny_contract(**overrides):
+    base = CausalContract(
+        actions_per_chunk=32, video_frame_stride=4, latent_frames_per_chunk=1, sliding_window_chunks=2,
+        memory_content=MEMORY_VIDEO_ONLY, model_fps=25.0, tier_num_frames=33, multiview="sana_pixel",
+        visual_layout="sana_pixel_canvas", rope="aligned", dt_bias_init=-5.0, a_log_init=0.0, reset_legacy_beta=False,
+        physical_rope=True,
+    )
+    return replace(base, **overrides)
+
+
+def _tiny_config(in_channels=4):
+    return PolicyConfig.from_sana_kwargs(
+        depth=4, hidden_size=64, patch_size=(1, 1, 1), num_heads=2, in_channels=in_channels, caption_channels=16,
+        model_max_length=7, linear_head_dim=32, softmax_head_dim=32, softmax_ratio=0.5, attn_res_block_size=2,
+        use_time_conditioning=False, pred_sigma=False, y_norm=True, cross_norm=True,
+        config=_Cfg(model=_Cfg(extra={"rope": "aligned"}), scheduler=_Cfg(action_flow_shift=1.0), vae=_Cfg(vae_stride=[8, 32, 32])),
+    )
+
+
+def test_the_model_refuses_a_decoupled_policy_off_its_clock():
+    CausalPolicyModel(_tiny_config(), _tiny_contract(decoupled_rope=True))
+    for overrides, message in (
+        ({"sink_horizon": 7}, "decoupled_rope has no sink horizon"),
+        ({"physical_rope": False}, "runs the physical"),
+        ({"action_rope": "1D"}, "takes neither action_rope 1D nor latent_action"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            CausalPolicyModel(_tiny_config(), _tiny_contract(decoupled_rope=True, **overrides))
+
+
+# -- latent_action (Sana 254d46478, one copy per view from cdf22c3d8) ---------------------------------------------------
+
+
+def _latent_cfg(value=True, recipe=None):
+    """The state_cross_attention N1 strip recipe above (video_only), or ``recipe`` with the state token, and
+    ``latent_action``."""
+
+    if recipe is None:
+        cfg = _state_xattn_cfg(True)
+    else:
+        cfg = copy.deepcopy(_load(recipe))
+        _policy(cfg)["state_cross_attention"] = True
+    if value is not None:
+        _policy(cfg)["latent_action"] = value
+    return cfg
+
+
+@pytest.mark.parametrize("value,expected", [(None, False), (False, False), (True, True)])
+def test_the_latent_action_switch_resolves(value, expected):
+    contract = resolve_causal_contract(_latent_cfg(value))
+    assert contract.latent_action is expected and contract.memory_content == MEMORY_VIDEO_ONLY
+    assert contract.view_count == 3 and resolve_causal_contract(_latent_cfg(value, RECIPE_PIXEL_N2)).view_count == 1
+    assert contract.describe().endswith(f" action_rope=3D decoupled_rope=False latent_action={expected}")
+
+
+def test_the_latent_action_switch_is_refused_outside_its_contract():
+    with pytest.raises(ValueError, match="latent_action='true': must be true or false"):
+        resolve_causal_contract(_latent_cfg("true"))
+    cfg = _latent_cfg(True)
+    _policy(cfg)["state_cross_attention"] = False
+    with pytest.raises(ValueError, match="set state_cross_attention: true"):
+        resolve_causal_contract(cfg)
+    cfg = _latent_cfg(True)
+    _policy(cfg)["memory_content"] = MEMORY_VIDEO_AND_ACTION
+    with pytest.raises(ValueError, match="wired for memory_content: video_only"):
+        resolve_causal_contract(cfg)
+    cfg = _latent_cfg(True)
+    _policy(cfg)["action_rope"] = "3D"
+    with pytest.raises(ValueError, match="leaving no robot row for action_rope to turn"):
+        resolve_causal_contract(cfg)
+    cfg = _latent_cfg(True)
+    _policy(cfg)["decoupled_rope"] = True
+    with pytest.raises(ValueError, match="drop decoupled_rope"):
+        resolve_causal_contract(cfg)
+    kwargs = dict(state_cross_attention=False, memory_content=MEMORY_VIDEO_AND_ACTION, action_rope="1D",
+                  decoupled_rope=True)
+    assert resolve_latent_action(None, **kwargs) is False and resolve_latent_action(False, **kwargs) is False
+
+
+@pytest.mark.parametrize("tree", LATENT_ACTION_TREES + LATENT_ACTION_ONE_COPY_TREES)
+def test_the_latent_action_form_follows_the_training_tree(tree, tmp_path):
+    """cdf22c3d8 on trains one copy of the action frame per view: served on both front-ends (240 tokens on the strip,
+    80 on the canvas) with the sink horizon; 254d46478's one copy is the same on the canvas and refused on the strip."""
+
+    assert set(LATENT_ACTION_TREES + LATENT_ACTION_ONE_COPY_TREES) <= set(SINK_HORIZON_TREES)
+    records = [(tmp_path / "RUN_ID.json", {"source_commit": tree, "latent_action": True})]
+    strip, _ = resolve_rope_clock(records, resolve_causal_contract(_latent_cfg(True)))
+    canvas, _ = resolve_rope_clock(records, resolve_causal_contract(_latent_cfg(True, RECIPE_PIXEL_N2)))
+    assert strip.sink_horizon == canvas.sink_horizon == 7 and strip.latent_action and canvas.latent_action
+    check_run_record(records[0][1], strip)
+    assert check_action_rope_form(records, strip).startswith("none(latent_action")
+    if tree in LATENT_ACTION_TREES:
+        assert check_latent_action_form(records, strip) == f"per_view(cdf22c3d8; trained on {tree}; 3 x 80 = 240 tokens)"
+        assert check_latent_action_form(records, canvas) == f"per_view(cdf22c3d8; trained on {tree}; 1 x 80 = 80 tokens)"
+    else:
+        with pytest.raises(ValueError, match="one copy on the plain 8 x 10 grid whatever the view count"):
+            check_latent_action_form(records, strip)
+        assert check_latent_action_form(records, canvas).startswith(f"one_copy(254d46478; trained on {tree}")
+
+
+@pytest.mark.parametrize("tree", ["bb681f851", "b8cd4c2ee", "6de2454dc"])
+def test_a_latent_action_config_of_a_tree_before_the_key_is_refused(tree, tmp_path):
+    contract = resolve_causal_contract(_latent_cfg(True))
+    with pytest.raises(ValueError, match="a tree before Sana 254d46478 ignores latent_action.*LATENT_ACTION_TREES"):
+        check_latent_action_form([(tmp_path / "RUN_ID.json", {"source_commit": tree})], contract)
+    with pytest.raises(ValueError, match="name no training tree that reads the key"):
+        check_latent_action_form([], contract)
+    assert check_latent_action_form([], contract, allow_unrecorded=True) == (
+        "per_view(unrecorded: donor directory; 240 tokens)"
+    )
+    assert check_latent_action_form([], resolve_causal_contract(_latent_cfg(False))) is None
+
+
+def test_the_model_refuses_a_latent_action_policy_outside_its_contract():
+    with pytest.raises(ValueError, match="needs out_channels == in_channels >= actions_per_chunk"):
+        CausalPolicyModel(_tiny_config(4), _tiny_contract(latent_action=True, state_cross_attention=True, sink_horizon=7))
+    with pytest.raises(ValueError, match="latent_action needs state_cross_attention and memory_content video_only"):
+        CausalPolicyModel(_tiny_config(32), _tiny_contract(latent_action=True, sink_horizon=7))
+    CausalPolicyModel(_tiny_config(32), _tiny_contract(latent_action=True, state_cross_attention=True, sink_horizon=7))
+
+
+def test_a_latent_action_session_decodes_a_masked_chunk_deterministically():
+    """A first-frame canvas episode of a latent_action policy (C = 8 over 8 channels) with CFG on the CPU: generation
+    returns [1, C, 80] normalized actions, zero on the masked slots, the same on a rerun with the same seeds; the
+    action noise is the cells' ([1, 80, 8]) and another shape is refused."""
+
+    config = _tiny_config(8)
+    contract = _tiny_contract(actions_per_chunk=8, video_frame_stride=1, tier_num_frames=9, latent_action=True,
+                              state_cross_attention=True, sink_horizon=7, aligned_phase_window=ALIGNED_PHASE_FIRST_FRAME,
+                              sliding_window_chunks=1)
+    torch.manual_seed(0)
+    model = CausalPolicyModel(config, contract)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.uniform_(-0.05, 0.05)
+    model.eval()
+    g = torch.Generator().manual_seed(3)
+    caption = Caption(torch.randn(1, 1, 1, 7, 16, generator=g), torch.ones(1, 1, 7, dtype=torch.int16))
+    null = Caption(torch.randn(1, 1, 1, 7, 16, generator=g), torch.ones(1, 1, 7, dtype=torch.int16))
+    sink = torch.randn(1, 8, 1, 3, 4, generator=g)
+    clean = [torch.randn(1, 8, 1, 3, 4, generator=g) for _ in range(3)]
+    states = [torch.randn(1, 80, generator=g) for _ in range(3)]
+    mask = torch.zeros(1, 8, 80, dtype=torch.bool)
+    mask[..., 7:27] = True
+
+    def run():
+        session = _session(model, caption, null, window=1, steps=2)
+        session.commit_sink(sink)
+        outs = []
+        for c in range(3):
+            action, video = session.generate_chunk(
+                anchor_state=states[c], anchor_state_mask=mask[0, 0], action_mask=mask,
+                generator=torch.Generator().manual_seed(90 + c),
+            )
+            outs.append((action, video))
+            session.commit_chunk(clean[c], action, anchor_state=states[c], anchor_state_mask=mask[0, 0], action_mask=mask)
+        return session, outs
+
+    session, first = run()
+    _, second = run()
+    for action, video in first:
+        assert action.shape == (1, 8, 80) and video.shape == (1, 8, 1, 3, 4)
+        assert bool((action[~mask] == 0).all()) and float(action[mask].abs().max()) > 0
+    assert all(torch.equal(a, b) and torch.equal(v, w) for (a, v), (b, w) in zip(first, second))
+    fresh = _session(model, caption, null, window=1, steps=2)
+    fresh.commit_sink(sink)
+    with pytest.raises(ValueError, match=r"action_noise must be \(1, 80, 8\)"):
+        fresh.generate_chunk(anchor_state=states[0], anchor_state_mask=mask[0, 0], action_mask=mask,
+                             action_noise=torch.zeros(1, 8, 80))

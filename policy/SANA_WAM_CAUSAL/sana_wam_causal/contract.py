@@ -68,6 +68,25 @@ earlier tree); ``1D`` by one rotary ladder over the whole head dim at the same i
 no spatial axis). The video rows and the sink rotation are the same in both. A tree before ``b8cd4c2ee`` ignores the key
 and trains 3D, so a ``1D`` config is served only from a run record naming a tree that reads it (``ACTION_ROPE_TREES``).
 
+``model.extra.chunk_causal_policy.decoupled_rope`` (Sana ``bb681f851``; false when absent, never with an explicit
+``action_rope``) gives the video and the robot rows positions of their own, for runs from Sana Video: the video counts
+latent frames along the episode with no fps scaling (the sink at 0, chunk c's observation latent at c * f_c, its target
+latents, generated or committed, at c * f_c + i + 0.5), a softmax reader whose window starts at chunk lo reads the sink
+at lo * f_c, half a latent before the window's first memory latent (the GDN reads it at 0), and every chunk's robot rows
+sit at 0 .. C on the whole-head ladder (the state row at 0, the actions at 1 .. C), in every chunk. There is no sink
+horizon: the softmax window may exceed 7 chunks or be unbounded. A tree before ``bb681f851`` ignores the key, so a
+decoupled config is served only from a run record naming a tree that reads it (``DECOUPLED_ROPE_TREES``).
+
+``model.extra.chunk_causal_policy.latent_action`` (Sana ``254d46478``, one copy per view from ``cdf22c3d8``; false when
+absent; needs ``state_cross_attention`` and ``memory_content: video_only``, never with an explicit ``action_rope`` or with
+``decoupled_rope``) brings every chunk's actions in as one latent frame of the video's channels on an 8 x 10 grid (Cosmos
+Policy's latent frame injection), repeated once per view: the chunk's C x 80 actions tiled over (channels, 8, 10) (token
+p carries robot80 slot p over the chunk's steps, channel ch step ch mod C), every copy noised and denoised on its own,
+embedded by the video's patch embedding and decoded by its final layer, each copy at its view's place on the video's
+three RoPE axes at the frame slot after the chunk's last target latent, (c + 1) * f_c + 0.5625. The prediction decodes
+by averaging every value's copies. ``254d46478`` trained one copy whatever the view count, the same as one copy per view
+on the one-view canvas only.
+
 ``model.memory_gdn_output_normalizer`` (Sana ``c414e9b32``; ``true`` when absent) decides every GDN layer's readout: true
 divides the numerator ``q (gS + K^T diag(beta) V)`` by the denominator ``ReLU(q) . (gz + K_den^T beta) + eps``, false
 returns the numerator alone (z is still carried, so a commit writes the same state either way). The per-head RMSNorm
@@ -151,7 +170,8 @@ SINK_HORIZON_CHUNKS = 7
 SINK_HORIZON_TREES = (
     "0c88c11ab", "e6c386907", "6cf45c1ae", "7ed0d28bf", "caf601b76", "b7189fd11", "41cf94114", "ad1bb95f3", "e00c28c9a",
     "ccddb2e7b", "64227cb07", "2578f606b", "4b29e92fd", "46657d0c1", "f6a257d4a", "8e0639b16", "cf47a0613", "89eaa78f6",
-    "8675f0ac3", "b6f5295f9", "78a48ed19", "27d767c5e", "75f663290", "6de2454dc", "b8cd4c2ee",
+    "8675f0ac3", "b6f5295f9", "78a48ed19", "27d767c5e", "75f663290", "6de2454dc", "b8cd4c2ee", "bb681f851", "254d46478",
+    "cdf22c3d8",
 )
 # ``state_cross_attention``: from Sana 4b29e92fd on the anchor state's caption token is ``state_embed`` + the caption
 # y-norm; its first form (e00c28c9a .. 4b29e92fd^, the trees below) projected it with a zero-initialized ``state_proj``,
@@ -159,7 +179,7 @@ SINK_HORIZON_TREES = (
 # `git merge-base --is-ancestor 4b29e92fd <tree>`):
 STATE_TOKEN_TREES = (
     "4b29e92fd", "46657d0c1", "f6a257d4a", "8e0639b16", "cf47a0613", "89eaa78f6", "8675f0ac3", "b6f5295f9", "78a48ed19",
-    "27d767c5e", "75f663290", "6de2454dc", "b8cd4c2ee",
+    "27d767c5e", "75f663290", "6de2454dc", "b8cd4c2ee", "bb681f851", "254d46478", "cdf22c3d8",
 )
 STATE_PROJ_TREES = ("e00c28c9a", "ccddb2e7b", "64227cb07", "2578f606b")
 # ``action_rope`` (Sana b8cd4c2ee): 3D, the robot rows' rotation of every tree (the value of a config without the key),
@@ -168,7 +188,19 @@ STATE_PROJ_TREES = ("e00c28c9a", "ccddb2e7b", "64227cb07", "2578f606b")
 ACTION_ROPE_1D = "1D"
 ACTION_ROPE_3D = "3D"
 ACTION_ROPES = (ACTION_ROPE_1D, ACTION_ROPE_3D)
-ACTION_ROPE_TREES = ("b8cd4c2ee",)
+ACTION_ROPE_TREES = ("b8cd4c2ee", "bb681f851", "254d46478", "cdf22c3d8")
+# ``decoupled_rope`` (Sana bb681f851): trees known to read the key (bb681f851 and descendants; add a newer one after
+# `git merge-base --is-ancestor bb681f851 <tree>`); an older tree trains the shared clock whatever the config says
+DECOUPLED_ROPE_TREES = ("bb681f851", "254d46478", "cdf22c3d8")
+# a decoupled target latent's position after its frame index (Sana ``causal_rwm_train.DECOUPLED_TARGET_OFFSET``)
+DECOUPLED_TARGET_OFFSET = 0.5
+# ``latent_action``: trees known to train one copy of the action frame per view (cdf22c3d8 and descendants; add a newer
+# one after `git merge-base --is-ancestor cdf22c3d8 <tree>`), and the tree that trained one copy whatever the view count
+LATENT_ACTION_TREES = ("cdf22c3d8",)
+LATENT_ACTION_ONE_COPY_TREES = ("254d46478",)
+# the action frame's latent grid (Sana ``causal_rwm_train.LATENT_ACTION_GRID``): 80 tokens, one per robot80 slot
+LATENT_ACTION_GRID = (8, 10)
+LATENT_ACTION_TOKENS = LATENT_ACTION_GRID[0] * LATENT_ACTION_GRID[1]
 # trees known to train the sink at the reader's window start on the clock physical_rope declares (not descendants of
 # 0c88c11ab): the observation trees above and the no-observation runs served so far (N2 / N4 p14k-pretrain)
 WINDOW_START_SINK_TREES = OBSERVATION_BRANCH_TREES + OBSERVATION_JOINT_TREES + (
@@ -207,6 +239,17 @@ class CausalContract:
     # the robot rows' rotation at their instants: 3D through the video's axes at (instant, 0, 0), 1D the whole-head
     # ladder (Sana b8cd4c2ee)
     action_rope: str = ACTION_ROPE_3D
+    # the video on latent-frame positions and every chunk's robot rows at 0 .. C, no sink horizon (Sana bb681f851)
+    decoupled_rope: bool = False
+    # every chunk's actions as one latent frame per view through the video's patch embedding and final layer (Sana
+    # 254d46478 / cdf22c3d8)
+    latent_action: bool = False
+
+    @property
+    def view_count(self) -> int:
+        """The views the policy reads: three on the strip, one on the canvas."""
+
+        return 3 if self.visual_layout == VISUAL_LAYOUT_THREE_VIEW_STRIP else 1
 
     @property
     def first_chunk(self) -> int:
@@ -226,7 +269,7 @@ class CausalContract:
             f"first_chunk={self.first_chunk} "
             f"gdn_output_normalizer={self.gdn_output_normalizer} use_attn_res={self.use_attn_res} "
             f"sink_horizon={self.sink_horizon} state_cross_attention={self.state_cross_attention} "
-            f"action_rope={self.action_rope}"
+            f"action_rope={self.action_rope} decoupled_rope={self.decoupled_rope} latent_action={self.latent_action}"
         )
 
 
@@ -363,6 +406,59 @@ def resolve_action_rope(value: Any) -> str:
     return value
 
 
+def resolve_decoupled_rope(value: Any, action_rope: Any) -> bool:
+    """``decoupled_rope`` as Sana reads it (``causal_rwm_train.resolve_decoupled_rope``, bb681f851): None -> false, a
+    yaml boolean otherwise, never with an explicit ``action_rope`` (the raw key: its robot rows sit on the video's
+    clock)."""
+
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"model.extra.chunk_causal_policy.decoupled_rope={value!r}: must be true or false")
+    if value and action_rope is not None:
+        raise ValueError(
+            "model.extra.chunk_causal_policy.decoupled_rope places the robot rows at local positions of their own; "
+            f"drop action_rope={action_rope!r}, which places them on the video's clock"
+        )
+    return value
+
+
+def resolve_latent_action(
+    value: Any, *, state_cross_attention: bool, memory_content: str, action_rope: Any, decoupled_rope: bool
+) -> bool:
+    """``latent_action`` as Sana reads it (``causal_rwm_train.resolve_latent_action``, 254d46478 / cdf22c3d8): None ->
+    false, a yaml boolean otherwise; true needs ``state_cross_attention`` and ``memory_content: video_only`` and takes
+    neither an explicit ``action_rope`` (the raw key) nor ``decoupled_rope``."""
+
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"model.extra.chunk_causal_policy.latent_action={value!r}: must be true or false")
+    if not value:
+        return False
+    if not state_cross_attention:
+        raise ValueError(
+            "model.extra.chunk_causal_policy.latent_action takes every chunk's state through the caption; set "
+            "state_cross_attention: true"
+        )
+    if memory_content != MEMORY_VIDEO_ONLY:
+        raise ValueError(
+            "model.extra.chunk_causal_policy.latent_action is wired for memory_content: video_only, whose clean chunks "
+            "carry no robot rows"
+        )
+    if action_rope is not None:
+        raise ValueError(
+            "model.extra.chunk_causal_policy.latent_action places its tokens on the video's three axes, leaving no robot "
+            "row for action_rope to turn; drop action_rope"
+        )
+    if decoupled_rope:
+        raise ValueError(
+            "model.extra.chunk_causal_policy.latent_action places the action frame at the next frame's instant on the "
+            "video's clock; drop decoupled_rope"
+        )
+    return True
+
+
 def resolve_physical_rope(value: Any) -> bool:
     """``physical_rope`` as Sana reads it (``causal_rwm_train.resolve_physical_rope``, 6e91eaf2a .. 0c88c11ab^): None ->
     false, a yaml boolean otherwise (it needs ``rope: aligned``, the only RoPE mode this adapter serves). A checkpoint
@@ -424,8 +520,8 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
     """Refuse a checkpoint whose run record contradicts the contract it resolves to (``resolve_rope_clock`` completes
     the config's): a run that trained chunk observations (``refuse_recorded_chunk_observation``) and a recorded
     ``aligned_phase_window`` / ``memory_content`` / ``memory_gdn_output_normalizer`` / ``causal_observation`` /
-    ``causal_state`` / ``state_cross_attention`` / ``action_rope`` / ``physical_rope`` / ``sliding_window_chunks`` /
-    ``use_attn_res`` other than the contract's, at the record's top level or in its ``deploy`` block (the record of the
+    ``causal_state`` / ``state_cross_attention`` / ``action_rope`` / ``decoupled_rope`` / ``latent_action`` /
+    ``physical_rope`` / ``sliding_window_chunks`` / ``use_attn_res`` other than the contract's, at the record's top level or in its ``deploy`` block (the record of the
     physical-RoPE line). Keys the record does not carry are not checked."""
 
     refuse_recorded_chunk_observation(record, source)
@@ -438,6 +534,8 @@ def check_run_record(record: Mapping[str, Any], contract: CausalContract, source
         ("causal_state", contract.causal_state),
         ("state_cross_attention", contract.state_cross_attention),
         ("action_rope", contract.action_rope),
+        ("decoupled_rope", contract.decoupled_rope),
+        ("latent_action", contract.latent_action),
         ("physical_rope", contract.physical_rope),
         ("sliding_window_chunks", contract.sliding_window_chunks),
         ("use_attn_res", contract.use_attn_res),
@@ -541,6 +639,10 @@ def check_action_rope_form(
     naming only such trees is refused, and so, unless ``allow_unrecorded`` (a step-0 donor directory), is one naming no
     known tree."""
 
+    if contract.decoupled_rope:
+        return "none(decoupled_rope: the robot rows at 0 .. C on the whole-head ladder)"
+    if contract.latent_action:
+        return "none(latent_action: the action frame on the video's three axes)"
     if contract.action_rope != ACTION_ROPE_1D:
         return contract.action_rope
     trees = [tree for _, record in records for tree in record_trees(record)]
@@ -556,11 +658,45 @@ def check_action_rope_form(
     )
 
 
+def check_latent_action_form(
+    records: list[tuple[Path, Mapping[str, Any]]], contract: CausalContract, allow_unrecorded: bool = False
+) -> Optional[str]:
+    """The latent action frame a ``latent_action`` checkpoint trained, from its run records' training trees, as the
+    ready-report label: one copy per view (``LATENT_ACTION_TREES``, Sana cdf22c3d8 on), which this adapter serves. The
+    one copy of Sana 254d46478 (``LATENT_ACTION_ONE_COPY_TREES``) is the same on the one-view canvas and served there,
+    refused on the strip. A record naming neither (an older tree ignores the key) is refused, and so, unless
+    ``allow_unrecorded`` (a step-0 donor directory), is a checkpoint without a record. ``None`` without the switch."""
+
+    if not contract.latent_action:
+        return None
+    trees = [tree for _, record in records for tree in record_trees(record)]
+    known = [tree for tree in trees if _known(tree, LATENT_ACTION_TREES + LATENT_ACTION_ONE_COPY_TREES)]
+    rows = contract.view_count * LATENT_ACTION_TOKENS
+    if known and _known(known[-1], LATENT_ACTION_TREES):
+        return f"per_view(cdf22c3d8; trained on {known[-1]}; {contract.view_count} x {LATENT_ACTION_TOKENS} = {rows} tokens)"
+    if known:
+        if contract.view_count == 1:
+            return f"one_copy(254d46478; trained on {known[-1]}; = per view on the one-view canvas, {rows} tokens)"
+        raise ValueError(
+            f"the run record names training tree {known[-1]} (Sana 254d46478): its latent action frame is one copy on "
+            f"the plain 8 x 10 grid whatever the view count, which this adapter serves on the one-view canvas only; the "
+            f"{contract.view_count}-view strip takes one copy per view (Sana cdf22c3d8 on)"
+        )
+    if allow_unrecorded and not trees:
+        return f"per_view(unrecorded: donor directory; {rows} tokens)"
+    raise ValueError(
+        f"latent_action checkpoint whose run records ({[str(path.name) for path, _ in records] or 'none'}) name no "
+        f"training tree that reads the key ({trees or 'none'}): a tree before Sana 254d46478 ignores latent_action and "
+        "trains action rows. If the tree is cdf22c3d8 or a descendant, add it to LATENT_ACTION_TREES"
+    )
+
+
 def resolve_rope_clock(
     records: list[tuple[Path, Mapping[str, Any]]], contract: CausalContract, allow_unrecorded: bool = False
 ) -> tuple[CausalContract, str]:
     """The RoPE clock and softmax sink rule a checkpoint trained, from its run records' training trees, and the
-    ready-report label. A tree of ``SINK_HORIZON_TREES`` (Sana 0c88c11ab on) serves the physical clock whatever the
+    ready-report label. A ``decoupled_rope`` checkpoint (a tree of ``DECOUPLED_ROPE_TREES``) runs the decoupled clock
+    with the sink at the reader's window start and no horizon (any window). A tree of ``SINK_HORIZON_TREES`` (Sana 0c88c11ab on) serves the physical clock whatever the
     config says of physical_rope (no longer read there) with the sink at chunk max(0, c - ``SINK_HORIZON_CHUNKS``)
     (``sink_horizon``); a tree of ``WINDOW_START_SINK_TREES`` serves the sink at the reader's window start on the clock
     the config's physical_rope declares (the contract unchanged). Refuses a horizon checkpoint whose softmax window is
@@ -568,6 +704,21 @@ def resolve_rope_clock(
     ``allow_unrecorded`` (a step-0 donor directory, served on the window-start rule), a checkpoint without a record."""
 
     trees = [tree for _, record in records for tree in record_trees(record)]
+    if contract.decoupled_rope:
+        # Sana bb681f851: latent-frame video positions, the softmax sink at the reader's window start, no horizon
+        decoupled = [tree for tree in trees if _known(tree, DECOUPLED_ROPE_TREES)]
+        if decoupled:
+            label = f"decoupled+sink_window_start(bb681f851; trained on {decoupled[-1]})"
+        elif allow_unrecorded and not trees:
+            label = "decoupled+sink_window_start(unrecorded: donor directory)"
+        else:
+            raise ValueError(
+                f"decoupled_rope checkpoint whose run records ({[str(path.name) for path, _ in records] or 'none'}) name "
+                f"no training tree that reads the key ({trees or 'none'}): a tree before Sana bb681f851 ignores "
+                "decoupled_rope and trains the shared clock. If the tree is bb681f851 or a descendant, add it to "
+                "DECOUPLED_ROPE_TREES"
+            )
+        return replace(contract, physical_rope=True, sink_horizon=None), label
     horizon = [tree for tree in trees if _known(tree, SINK_HORIZON_TREES)]
     window_start = [tree for tree in trees if _known(tree, WINDOW_START_SINK_TREES)]
     if horizon:
@@ -715,6 +866,11 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
     causal_state = resolve_causal_state(options.get("causal_state"), causal_observation)
     state_cross_attention = resolve_state_cross_attention(options.get("state_cross_attention"), causal_state)
     action_rope = resolve_action_rope(options.get("action_rope"))
+    decoupled_rope = resolve_decoupled_rope(options.get("decoupled_rope"), options.get("action_rope"))
+    latent_action = resolve_latent_action(
+        options.get("latent_action"), state_cross_attention=state_cross_attention, memory_content=memory_content,
+        action_rope=options.get("action_rope"), decoupled_rope=decoupled_rope,
+    )
     physical_rope = resolve_physical_rope(options.get("physical_rope"))
     aligned_phase_window = resolve_aligned_phase_window(_extra(cfg.get("data")).get("aligned_phase_window"))
     window = options.get("sliding_window_chunks")
@@ -764,6 +920,8 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         use_attn_res=resolve_use_attn_res(model_cfg.get("use_attn_res")),
         state_cross_attention=state_cross_attention,
         action_rope=action_rope,
+        decoupled_rope=decoupled_rope,
+        latent_action=latent_action,
     )
 
 
@@ -779,6 +937,12 @@ __all__ = [
     "CAUSAL_DATASET_TYPES",
     "CAUSAL_POLICY_FACTORY",
     "CausalContract",
+    "DECOUPLED_ROPE_TREES",
+    "DECOUPLED_TARGET_OFFSET",
+    "LATENT_ACTION_GRID",
+    "LATENT_ACTION_ONE_COPY_TREES",
+    "LATENT_ACTION_TOKENS",
+    "LATENT_ACTION_TREES",
     "MEMORY_CONTENTS",
     "MEMORY_VIDEO_AND_ACTION",
     "MEMORY_VIDEO_ONLY",
@@ -792,6 +956,7 @@ __all__ = [
     "STATE_TOKEN_TREES",
     "WINDOW_START_SINK_TREES",
     "check_action_rope_form",
+    "check_latent_action_form",
     "check_observation_form",
     "check_run_record",
     "check_state_token_form",
@@ -807,7 +972,9 @@ __all__ = [
     "resolve_causal_contract",
     "resolve_causal_observation",
     "resolve_causal_state",
+    "resolve_decoupled_rope",
     "resolve_gdn_output_normalizer",
+    "resolve_latent_action",
     "resolve_physical_rope",
     "resolve_rope_clock",
     "resolve_memory_content",
