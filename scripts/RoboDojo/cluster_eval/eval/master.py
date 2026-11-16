@@ -1030,7 +1030,7 @@ def main() -> int:
     ap.add_argument("--worker", default="run_unit.sh", choices=("run_unit.sh", "run_unit_xpl.sh"),
                     help="node-side worker script under <--remote-install>/eval/: run_unit.sh = the SANA RPC server lane; "
                          "run_unit_xpl.sh = the official XPolicyLab websocket lane (an in-process adapter: policy/SANA_WAM by "
-                         "default, --worker-env SANA_EVAL_XPL_POLICY=SANA_MOT|OpenWAM for the others)")
+                         "default, --worker-env SANA_EVAL_XPL_POLICY=SANA_WAM_CAUSAL|OpenWAM for the others)")
     ap.add_argument("--xpl-root", default=None,
                     help="node-side path of the XPolicyLab checkout for run_unit_xpl.sh (default the worker's own: CE_REMOTE_XPL)")
     ap.add_argument("--worker-env", default=None,

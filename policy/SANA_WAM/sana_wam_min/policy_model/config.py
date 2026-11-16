@@ -272,8 +272,8 @@ class PolicyConfig:
             )
         )
 
-        # the condition-causal options are read from the config only for a condition-causal model: the memory policies'
-        # adapters (SANA_WAM_CAUSAL, SANA_WAM_SM) resolve their trunk through this config with yaml keys of the same names
+        # the condition-causal options are read from the config only for a condition-causal model: the memory policy's
+        # adapter (SANA_WAM_CAUSAL) resolves its trunk through this config with yaml keys of the same names
         condition_causal = bool(kwargs.get("condition_causal", False))
         state_cross_attention = kwargs.get(
             "state_cross_attention", _value(model_extra, "state_cross_attention", None) if condition_causal else None

@@ -1,10 +1,9 @@
 # RoboDojo cluster evaluation (SANA adapters)
 
-The orchestration behind every RoboDojo number of the SANA adapters in this fork (`policy/SANA_WAM`, `policy/SANA_MOT`,
+The orchestration behind every RoboDojo number of the SANA adapters in this fork (`policy/SANA_WAM`,
 `policy/SANA_WAM_CAUSAL`): the complete official protocol (42 tasks / 54 task configs / 2100 episodes per seed, seeds
 0-2) spread over a GPU cluster, one simulator + one policy server per GPU, scheduled from a control host over ssh, with
-the results written by RoboDojo's own `summarize_result.py`. The sparse-memory adapter `policy/SANA_WAM_SM` has a profile
-too (`ADAPTER=SANA_WAM_SM`, `lib/adapters.sh`); no campaign has run it yet.
+the results written by RoboDojo's own `summarize_result.py`.
 
 Everything site-specific lives in one file (`sites/<site>.env`). With a site configured, a campaign is one definition file
 plus a few commands:
@@ -47,7 +46,6 @@ bash eval/campaign.sh $D watch                                # blocks until the
 | `eval/decode_pred_videos.sh`, `eval/grow_single_gpu_slots.sh` | real-vs-predicted videos from `prediction_latent_dir` dumps; growing live masters onto freed GPUs |
 | `eval/pre_stretch_labels.txt` | checkpoints trained before the whole-frame stretch (served with the legacy crop) |
 | `eval/campaigns/` | the historical per-recipe drivers and chains that produced the published runs (hard-wired to the reference site; kept as the record, superseded by `run.sh` + `campaign.sh`) |
-| `eval/legacy/` | the static-plan launcher of the first runs (two-GPU jobs from a precomputed plan) |
 | `node/` | node setup and housekeeping: the RoboDojo / Isaac Sim installer, the sana-wam env installer, the RoboDojo pin, HF checkpoint downloads with sha256 / MANIFEST verification, GPU / CUDA / process probes, orphan cleanup |
 
 ## Reference site

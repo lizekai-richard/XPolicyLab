@@ -26,7 +26,7 @@ request_timeout_s: 600.0
 # record, checked against the config]. Refused before any weight: chunk_observation true, in the config or in the run
 # record (a run trained with chunk observations: serve it from XPolicyLab d57a617), a run record contradicting the
 # config, data.extra.window_repeats (the sink-less pantheon14k m48n24 runs), obs_in_first_chunk (vanilla52k), and the
-# sparse / hierarchical memory keys (SANA_WAM_SM). null -> XPolicyLab resolution of ckpt_name.
+# sparse / hierarchical memory keys (SANA_WAM_SM up to XPolicyLab 9270c044). null -> XPolicyLab resolution of ckpt_name.
 checkpoint_dir: null
 # An SFT (bidirectional) checkpoint has no GDN recurrence parameters; true serves it as the causal policy's step-0 model
 # (recurrence initialized as the causal trainer does on its first load). Pipeline checks only, never an evaluation.

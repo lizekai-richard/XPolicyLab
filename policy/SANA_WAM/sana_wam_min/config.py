@@ -511,7 +511,7 @@ def view_resize_from_train_config(cfg: dict[str, Any], requested: Optional[str] 
 def sana_pixel_pad_from_train_config(cfg: dict[str, Any]) -> str:
     """``model.extra.sana_pixel_pad`` (rwm/zekai-merge 319d3f666 / rwm/mot 2a0c69d1f): ``unmasked`` (default: the black
     quadrant's latent cells stay in the sequence) or ``masked`` (they are dropped from the policy's token sequence; the
-    SANA_WAM mirror serves it on the one-view 320x512 sana_pixel canvas, SANA_MOT refuses it). ``masked`` without
+    SANA_WAM mirror serves it on the one-view 320x512 sana_pixel canvas). ``masked`` without
     ``data.extra.multiview: sana_pixel`` is refused, as the live layout module does."""
 
     value = ((cfg.get("model") or {}).get("extra") or {}).get("sana_pixel_pad")

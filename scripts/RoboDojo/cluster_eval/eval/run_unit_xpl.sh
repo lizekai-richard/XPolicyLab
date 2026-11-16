@@ -6,15 +6,15 @@
 # client/<i>_<task>/{upstream_eval_result/_result.json, run_status.json, client.*.log}), so master.py and
 # summarize_eval.py drive it unchanged, but the policy is served by the OFFICIAL XPolicyLab websocket
 # PolicyServer running an XPolicyLab adapter IN-PROCESS -- policy/SANA_WAM by default (sana_wam_min: Sana-free
-# policy mirror, SDPA attention), policy/SANA_MOT (the MoT dual-expert policy, same sana-wam env) or policy/OpenWAM
+# policy mirror, SDPA attention), policy/SANA_WAM_CAUSAL (same sana-wam env) or policy/OpenWAM
 # -- and the simulator is driven by the official scripts/eval_policy.sh + XPolicyLab/policy/<POLICY>/deploy.py loop
 # (get_obs after EVERY action, no lazy render, no SANA RPC).
 # Purpose: rule the SANA RPC server/client integration in or out as the cause of the low success rates.
 #
 #   RPC_PORT   the slot port used for the websocket policy server (WS_PORT is unused but reclaimed)
 # Env (from master.py or the operator):
-#   SANA_EVAL_XPL_POLICY         the adapter under policy/: SANA_WAM (default) | SANA_MOT | SANA_WAM_CAUSAL | SANA_WAM_SM |
-#                                OpenWAM. The four SANA adapters share the sana-wam env and the Sana snapshot layout + text
+#   SANA_EVAL_XPL_POLICY         the adapter under policy/: SANA_WAM (default) | SANA_WAM_CAUSAL | OpenWAM. The two SANA
+#                                adapters share the sana-wam env and the Sana snapshot layout + text
 #                                encoder / VAE keys below
 #   SANA_EVAL_CHECKPOINT_ROOT    HF-style snapshot (config.yaml + model/pytorch_model_fsdp.bin [+ normalization/])
 #   SANA_EVAL_XPL_ROOT           the XPolicyLab checkout carrying policy/<POLICY> (default CE_REMOTE_XPL)
@@ -28,9 +28,7 @@
 #   SANA_EVAL_XPL_EXTRA_OVERRIDES  extra space-separated key=value deploy.yml overrides for the policy server
 #                                  (the token @ATTEMPT_DIR@ becomes this attempt's NFS dir, e.g.
 #                                  prediction_latent_dir=@ATTEMPT_DIR@/pred_latents)
-#                                (e.g. "diffusion_seed_base=20260803 sampling_steps=50", or for SANA_MOT
-#                                "video_layout=openwam_canvas" to assert the checkpoint's video layout); recorded in
-#                                resolved_inputs
+#                                (e.g. "diffusion_seed_base=20260803 sampling_steps=50"); recorded in resolved_inputs
 #   SANA_EVAL_LAYOUT_IDS / SANA_EVAL_LAYOUT_TOTAL   layout shard (master --shards): comma-separated layout ids this
 #                                unit evaluates (EPS of them) out of LAYOUT_TOTAL. The official client's resume
 #                                manifest is pre-seeded with every other layout marked 'abandoned', so it runs
@@ -75,13 +73,13 @@ case $XPL_ACTION_TYPE in joint|ee) ;; *) echo "SANA_EVAL_XPL_ACTION_TYPE must be
 LAYOUT_IDS=${SANA_EVAL_LAYOUT_IDS:-}
 LAYOUT_TOTAL=${SANA_EVAL_LAYOUT_TOTAL:-}
 read -r -a XPL_EXTRA_OVERRIDE_ARGS <<<"$XPL_EXTRA_OVERRIDES"
-POLICY_NAME=${SANA_EVAL_XPL_POLICY:-SANA_WAM}          # SANA_WAM (default) | SANA_MOT | SANA_WAM_CAUSAL | SANA_WAM_SM | OpenWAM
+POLICY_NAME=${SANA_EVAL_XPL_POLICY:-SANA_WAM}          # SANA_WAM (default) | SANA_WAM_CAUSAL | OpenWAM
 # pydeps only exist to patch the sana-wam env's missing websockets/msgpack/h5py, and it is PREPENDED to the
 # server's PYTHONPATH -- for a policy whose own env already ships them it would shadow the correct versions.
-# Hence: the policies served from the sana-wam env (SANA_WAM, SANA_MOT, SANA_WAM_CAUSAL, SANA_WAM_SM) get the historical
+# Hence: the policies served from the sana-wam env (SANA_WAM, SANA_WAM_CAUSAL) get the historical
 # default, any other none.
 case $POLICY_NAME in
-  SANA_WAM|SANA_MOT|SANA_WAM_CAUSAL|SANA_WAM_SM) XPL_PYDEPS=${SANA_EVAL_XPL_PYDEPS:-${CE_REMOTE_PYDEPS:-}} ;;
+  SANA_WAM|SANA_WAM_CAUSAL) XPL_PYDEPS=${SANA_EVAL_XPL_PYDEPS:-${CE_REMOTE_PYDEPS:-}} ;;
   *)                 XPL_PYDEPS=${SANA_EVAL_XPL_PYDEPS:-} ;;
 esac
 ENV_CFG_TYPE=arx_x5

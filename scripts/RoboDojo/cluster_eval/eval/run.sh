@@ -5,20 +5,17 @@
 # dispatched one capability category at a time, finished with the tail template and summarized with the official
 # summarize_result.py. Everything that defines a run comes from the environment -- eval/campaign.sh exports it from a
 # campaign definition (eval/defs/*.env); by hand, export the variables below:
-#   ADAPTER      SANA_WAM (default) | SANA_MOT | SANA_WAM_CAUSAL | SANA_WAM_SM   (ports, worker env, synced adapter dirs:
-#                lib/adapters.sh)
+#   ADAPTER      SANA_WAM (default) | SANA_WAM_CAUSAL   (ports, worker env, synced adapter dirs: lib/adapters.sh)
 #   CKPT_LABEL   the checkpoint snapshot <CE_CKPT_ROOT>/<label> (REQUIRED); CKPT overrides the directory
 #   NORM_SHA     sha256 of the normalization artifact the snapshot's training yaml pins (REQUIRED to launch: the adapter refuses
 #                a snapshot whose normalization differs; read it from <snapshot>/config.yaml normalization_sha256)
 #   SEED         eval seed (0)
 #   NFE (10) VIDEO_CFG (6) ACTION_CFG (1)           sampling steps and the per-stream guidance (VIDEO_CFG=1 ACTION_CFG=1 = guidance
 #                                                   off, no unconditional pass: checkpoints trained without condition dropout)
-#   VIDEO_FS ACTION_FS                              flow shifts (SANA_WAM / SANA_WAM_CAUSAL / SANA_WAM_SM 5 / 1; SANA_MOT 8 /
-#                                                   shared)
+#   VIDEO_FS ACTION_FS                              flow shifts (5 / 1)
 #   NAS          n_action_steps: execute the first NAS of the 32 predicted targets, then replan (unset = the whole chunk;
-#                refused for SANA_WAM_CAUSAL / SANA_WAM_SM, whose memory clock advances by whole 32-action chunks)
+#                refused for SANA_WAM_CAUSAL, whose memory clock advances by whole 32-action chunks)
 #   ACTION_TYPE  ee (default: end-effector poses through the evaluator's IK) | joint
-#   VIDEO_LAYOUT SANA_MOT only (default sana_pixel_canvas): asserts the checkpoint's video layout
 #   VIEW_RESIZE  crop | stretch: ONLY to force a view resize against the checkpoint's own (an A/B; run name _eval<mode>). By
 #                default the adapter stretches, and every label in eval/pre_stretch_labels.txt is served with the legacy crop
 #   ORGANIZE_TABLE_PROMPT  new (default: the instruction the simulator gives) | old: organize_table gets the OLD instruction -- the long
@@ -67,10 +64,9 @@ SEED=${SEED:-0}; [[ $SEED =~ ^[0-9]+$ ]] || { echo "SEED must be an integer, got
 NFE=${NFE:-10}; VIDEO_CFG=${VIDEO_CFG:-6}; ACTION_CFG=${ACTION_CFG:-1}
 VIDEO_FS=${VIDEO_FS:-$VIDEO_FS_DEFAULT}; ACTION_FS=${ACTION_FS-$ACTION_FS_DEFAULT}
 NAS=${NAS:-}; [[ -z $NAS || $NAS =~ ^[0-9]+$ ]] || { echo "NAS must be an integer, got '$NAS'"; exit 2; }
-[[ -n $NAS && ( $ADAPTER == SANA_WAM_CAUSAL || $ADAPTER == SANA_WAM_SM ) ]] && {
+[[ -n $NAS && $ADAPTER == SANA_WAM_CAUSAL ]] && {
   echo "NAS: $ADAPTER executes whole 32-action chunks (its memory clock; the adapter has no n_action_steps): unset NAS"; exit 2; }
 ACTION_TYPE=${ACTION_TYPE:-ee}; [[ $ACTION_TYPE == ee || $ACTION_TYPE == joint ]] || { echo "ACTION_TYPE must be ee or joint"; exit 2; }
-VIDEO_LAYOUT=${VIDEO_LAYOUT:-$VIDEO_LAYOUT_DEFAULT}
 # How each camera view reaches its bucket (adapter deploy key view_resize). The adapters stretch by default -- the only SFT resize
 # since the upstream change of 2026-09-27 -- and the worker serves every label in eval/pre_stretch_labels.txt (verified trained
 # before it) with the legacy crop, so nothing is set by default. VIEW_RESIZE forces a mode against the checkpoint's own (a
@@ -93,7 +89,6 @@ RUN=${RUN:-official_seed${SEED}_${CKPT_LABEL}_xpl_vcfg${VIDEO_CFG}_acfg${ACTION_
 OVERRIDES="sampling_steps=$NFE cfg_scale=$VIDEO_CFG action_cfg_scale=$ACTION_CFG flow_shift=$VIDEO_FS"
 [[ -n $ACTION_FS ]] && OVERRIDES+=" action_flow_shift=$ACTION_FS"
 OVERRIDES+=" normalization_sha256=$NORM_SHA"
-[[ $ADAPTER == SANA_MOT && -n $VIDEO_LAYOUT ]] && OVERRIDES+=" video_layout=$VIDEO_LAYOUT"
 [[ -n $NAS ]] && OVERRIDES+=" n_action_steps=$NAS"
 [[ -n $VIEW_RESIZE ]] && OVERRIDES+=" view_resize=$VIEW_RESIZE"
 [[ -n ${EXTRA_OVERRIDES:-} ]] && OVERRIDES+=" $EXTRA_OVERRIDES"
@@ -144,12 +139,11 @@ pyfloat(){ "$PY" -c 'import sys; print(float(sys.argv[1]))' "$1"; }   # the adap
 expect_ready(){ # the ready-line tokens these settings imply, one per line
   echo "ckpt=$CKPT"; echo "steps=$NFE"
   case $ADAPTER in
-    SANA_WAM|SANA_MOT)
+    SANA_WAM)
       echo "cfg_scale=$(pyfloat "$VIDEO_CFG")"; echo "video_cfg_scale=$(pyfloat "$VIDEO_CFG")"; echo "action_cfg_scale=$(pyfloat "$ACTION_CFG")"
       echo "flow_shift=$(pyfloat "$VIDEO_FS")"; if [[ -n $ACTION_FS ]]; then echo "action_flow_shift=$(pyfloat "$ACTION_FS")"; else echo "action_flow_shift=shared"; fi
-      echo "n_action_steps=${NAS:-all}"
-      [[ $ADAPTER == SANA_MOT && -n $VIDEO_LAYOUT ]] && echo "video_layout=$VIDEO_LAYOUT" ;;
-    SANA_WAM_CAUSAL|SANA_WAM_SM)
+      echo "n_action_steps=${NAS:-all}" ;;
+    SANA_WAM_CAUSAL)
       echo "video_cfg_scale=$(pyfloat "$VIDEO_CFG")"; echo "action_cfg_scale=$(pyfloat "$ACTION_CFG")"
       echo "flow_shift=$(pyfloat "$VIDEO_FS")"; echo "action_flow_shift=$(pyfloat "${ACTION_FS:-$VIDEO_FS}")"
       echo "normalization_sha256=$NORM_SHA" ;;
@@ -322,7 +316,7 @@ PYEOF
     while [[ $# -gt 0 ]]; do case $1 in --dry-run|--force) topts+=("$1"); shift ;; --*) topts+=("$1" "$2"); shift 2 ;; *) targs+=(--task "$1"); shift ;; esac; done
     [[ ${#targs[@]} -gt 0 ]] || targs=(--task play_tic_tac_toe --task imitate_sorting_sequence)
     # the shards are started through `bash run.sh smoke-gpu`, which inherits this environment (ADAPTER, CKPT_LABEL, ...)
-    export ADAPTER CKPT_LABEL CKPT NORM_SHA SEED NFE VIDEO_CFG ACTION_CFG VIDEO_FS ACTION_FS NAS ACTION_TYPE VIDEO_LAYOUT VIEW_RESIZE ORGANIZE_TABLE_PROMPT
+    export ADAPTER CKPT_LABEL CKPT NORM_SHA SEED NFE VIDEO_CFG ACTION_CFG VIDEO_FS ACTION_FS NAS ACTION_TYPE VIEW_RESIZE ORGANIZE_TABLE_PROMPT
     export EXTRA_OVERRIDES=${EXTRA_OVERRIDES:-}
     "$PY" "$EVAL/tail_shards.py" --run "$RUN" --driver "$EVAL/run.sh" --policy "$POLICY" "${targs[@]}" "${topts[@]}" "$sub" ;;
   status) sed -n 1,40p "$STATE/STATUS.md"; echo ...; tail -n 6 "$STATE/master.log" ;;

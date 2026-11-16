@@ -1,7 +1,7 @@
 # RoboDojo cluster evaluation: runbook
 
 How to run an evaluation campaign of a SANA checkpoint on the complete official RoboDojo protocol, exactly as every
-published number of `policy/SANA_WAM`, `policy/SANA_MOT` and `policy/SANA_WAM_CAUSAL` was produced, and how to read the
+published number of `policy/SANA_WAM` and `policy/SANA_WAM_CAUSAL` was produced, and how to read the
 results. Everything here runs on the **control host** from this directory (`scripts/RoboDojo/cluster_eval`); the GPU nodes
 only execute what `deploy.sh` put on their shared home. Paths below use the site variables (`CE_*`, see
 `site.env.example`).
@@ -84,7 +84,7 @@ Each node needs, under `CE_NODE_ROOT`:
 | file | exports | built by |
 |---|---|---|
 | `activate.sh` | `SANA_SIM_PY` (the Isaac Sim / RoboDojo python), `ROBODOJO_CHECKOUT` (RoboDojo at `09bd5f5`, with its `Assets`) | `node/install_node.sh` (Isaac Sim 5.1 + IsaacLab + curobo, python 3.11; resumable steps, `--only <step>`), then `node/node_pin_09bd5f5.sh` (a fresh node fast-forwards straight from the install pin) |
-| `activate_sana_wam.sh` | `SANA_PY` (the policy-server python) | `node/install_sana_wam.sh`, or by hand per `policy/SANA_WAM/INSTALLATION.md` section 1 (one env serves SANA_WAM, SANA_MOT, SANA_WAM_CAUSAL and SANA_WAM_SM) |
+| `activate_sana_wam.sh` | `SANA_PY` (the policy-server python) | `node/install_sana_wam.sh`, or by hand per `policy/SANA_WAM/INSTALLATION.md` section 1 (one env serves SANA_WAM and SANA_WAM_CAUSAL) |
 
 Never run two conda installers concurrently on one node. One single-GPU slot needs ~25 of 48 GB (policy server ~17 GB +
 Isaac client ~8 GB); the reference site uses RTX A6000 48 GB boards.
@@ -250,7 +250,7 @@ away (`mv hold.<run> hold.<run>.released`); the daemon resumes on its next tick.
   |---|---|---|
   | sampling steps | 10 | |
   | video CFG / action CFG | 6 / 1 | guidance off (`VIDEO_CFG=1 ACTION_CFG=1`) for checkpoints trained without condition dropout |
-  | flow shifts (video / action) | 5 / 1 (SANA_MOT: 8 / shared) | the checkpoint's own schedule |
+  | flow shifts (video / action) | 5 / 1 | the checkpoint's own schedule |
   | actions | `ee`: end-effector poses through the evaluator's IK | |
   | chunk execution | the whole predicted chunk (32 targets) | `NAS=24` executes the first 24, then replans; such runs end in `_nas24` |
 - **One checkpoint, one normalization.** `NORM_<k>` must equal the snapshot's own `normalization_sha256`.

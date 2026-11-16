@@ -24,5 +24,4 @@ below:
 | `pantheon_stretch_pair_seeds.sh` | `../defs/pantheon2k_latent_pair.env` |
 
 The per-run driver they all call, `vanilla34k_eefabs_f33fps8.sh` (SANA_WAM), corresponds to `../run.sh` with
-`ADAPTER=SANA_WAM`. `mot_eefabs_sana_pixel_f33fps8.sh` corresponds to `ADAPTER=SANA_MOT`, and
-`causal_p14k_eefabs_f33fps8.sh` to `ADAPTER=SANA_WAM_CAUSAL`.
+`ADAPTER=SANA_WAM`, and `causal_p14k_eefabs_f33fps8.sh` to `ADAPTER=SANA_WAM_CAUSAL`.

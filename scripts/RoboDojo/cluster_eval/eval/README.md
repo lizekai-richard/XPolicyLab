@@ -76,19 +76,14 @@ bash start_master.sh xpl_smoke_insert_key --worker run_unit_xpl.sh --tasks inser
 ```
 
 Other adapters on this lane: `--worker-env SANA_EVAL_XPL_POLICY=<POLICY>` selects `policy/<POLICY>` (default SANA_WAM).
-`SANA_MOT` (the MoT dual-expert policy) runs in the same sana-wam env and takes the same Sana snapshot layout and
-text-encoder / VAE keys, so it gets the same pydeps; `OpenWAM` gets its own bundle checks and no pydeps. For SANA_MOT add
-`video_layout=<multiview|openwam_canvas>` to `--xpl-overrides`: the adapter asserts it against the checkpoint before any
-weight is read (canvas yamls from before Sana rwm/mot 33b220373 carry no `video_layout` key). Driver for the NSC MoT
-canvas checkpoint: `campaigns/mot_canvas_nsc_s36k.sh` (`smoke-gpu NODE:GPU` runs one episode with the policy server and
-the Isaac client sharing ONE free GPU when no pair is free; it refuses a GPU a live master can use, a busy GPU, or a
-listening port; `autogrow start` appends every USABLE pair that no live master holds to the run every 5 minutes).
+`SANA_WAM_CAUSAL` runs in the same sana-wam env and takes the same Sana snapshot layout and text-encoder / VAE keys, so it
+gets the same pydeps; `OpenWAM` gets its own bundle checks and no pydeps.
 
 Single-GPU slots (2026-09-19): a `--node-pairs` / `control/add_slots` entry `s<g>` (e.g. `l3:s1;l26:s0`) makes CUDA
 device g run BOTH the policy server and the Isaac client (~17 + ~8 GB on a 48 GB A6000; slot id `<node>:g<g><g>`, ports
 base + 50 + g, clear of the pair ports base + 0..30). For a lone free GPU whose partner is busy or broken; plain pair
 indices behave exactly as before. Reading a unit's logs through the NFS view of another node can lag the writer by minutes (a live
-server.stdout.log showed 0 bytes from l5 while l3 had written it); `../probe_unit_server.sh` shows the node's own view.
+server.stdout.log showed 0 bytes from l5 while l3 had written it); `node/probe_unit_server.sh` shows the node's own view.
 
 Speed knobs. `--prediction-videos off` is the default and behaviour-neutral. `--lazy-render` DEFAULTS TO OFF since 2026-09-09: the official loop calls get_obs() after every action and that call advances the simulator's render/settle cadence, so skipping mid-chunk observations changed the dynamics (insert_key ep7: 25/50 first-stage hits with the official cadence vs 11-12/50 with lazy render; the XPolicyLab lane gave 27-30/50). Runs official_seed0_ep10s65690 and official_seed0_ep7s45000_lr5e5_clip1 were taken with lazy render ON and understate the policy. Details:
 `--prediction-videos off` drops the server's diagnostic prediction videos, whose VAE decode +
@@ -117,39 +112,10 @@ bash start_master.sh official_seed0_ep5s32845 --wait-for-checkpoint 21600 \
 tail -f ~/robodojo_master/official_seed0_dyn/master.log ; cat ~/robodojo_master/official_seed0_dyn/STATUS.md
 ```
 
-## Pieces (static plan mode; scripts in `legacy/`)
+## Static plan mode (retired)
 
-| file | runs on | role |
-|---|---|---|
-| `plan_eval.py` | x5 (needs the RoboDojo checkout + a python with yaml) | enumerate task configs, LPT-pack (task, seed) units into N jobs, assign node / GPU pair / ports, write `plan.json`, `tasks.json`, `PLAN.md`, `lists/` |
-| `run_eval_job.sh PLAN JOB` | each node (started by `launch_eval.sh`) | per session: server (task-list lane, `run_learned_server_only_local.sh`) -> wait for handoff -> benchmark client (`run_remote_benchmark_client.sh --keep-going`) -> stop server -> mark tasks with a complete `_result.json` DONE, re-queue the rest (up to `MAX_ROUNDS`=3); resumable |
-| `launch_eval.sh RUN_ROOT [job..]` | x5 | start jobs on their nodes (nohup setsid), staggered per node |
-| `stop_eval.sh RUN_ROOT [job..]` | x5 | TERM the runners (they stop client + server gracefully) |
-| `status_eval.sh RUN_ROOT` | x5 | rsync-pull status files, one line per job |
-| `summarize_eval.py RUN_ROOT` | x5 (on the rsync mirror) or a node | paper-style aggregation + coverage -> `RESULTS.md`, `results.json` |
-
-## Flow
-
-```bash
-# 1. plan on x5, then copy the run dir to the shared home (RUN_ROOT must contain "robodojo")
-python plan_eval.py --checkout ~/zekail/sana_wam_sim_benchmarks/RoboDojo-official-clone-20260823 \
-    --out /tmp/robodojo_eval_<run> --run-id <run> --seeds 0
-scp -r /tmp/robodojo_eval_<run> jiamingt@l5.mit.edu:robodojo_eval/<run>
-# 2. launch (jobs run detached on l5/l7/l8/l25, 4 per node, GPUs (0,1) (2,3) (4,5) (6,7))
-bash launch_eval.sh /homes/jiamingt/robodojo_eval/<run>
-# 3. watch / stop / summarize
-bash status_eval.sh /homes/jiamingt/robodojo_eval/<run>
-bash stop_eval.sh   /homes/jiamingt/robodojo_eval/<run>
-python summarize_eval.py ~/robodojo_eval_mirror/<run>
-```
-
-Per job on the node: `RUN_ROOT/jobs/<job>/{runner.log,status.txt,state/,sessions/<sid>_r<round>/{server,client}}`;
-`JOB_COMPLETE` or `JOB_INCOMPLETE` (with the missing units) at the end. Re-running
-`run_eval_job.sh` resumes. Smoke first: `--tasks stack_bowls,insert_key --episodes-per-task 1 --jobs 2 --nodes l5`.
-
-Knobs: server GPU / client GPU / rpc / ws ports come from the plan; the client
-watchdog is `900 + 480 * episodes_per_task` seconds per task; each job has its
-own Isaac kit home under `/dataset2/jiamingt/robodojo/kit_home/<job>`.
+The first runs used a static plan (two-GPU jobs from a precomputed `plan.json`, launched per node). That launcher is
+retired; `plan_eval.py` stays as the task enumeration `master.py` imports, `summarize_eval.py` as the per-run table.
 
 ### Policy-server overrides (`--xpl-overrides`)
 
@@ -266,9 +232,6 @@ of a master that still has a dispatchable queued unit; per-setting pauses are un
 
 ### Campaign drivers (`campaigns/`)
 
-One script per evaluation campaign pins every knob (checkpoint, overrides, settings, ports) so the run can be started,
-grown and re-checked by any session: `campaigns/s50k_cfg6_nfe10_fs3v8.sh {verify-norm|free-pairs|smoke PAIRS|dry|start PAIRS|grow PAIRS|status}`
-(sft_p120k_1e-4cos_clip1_s50k, CFG 6 @ 10 NFE, flow_shift 3 vs 8 as two settings of one run, category by category).
-`verify-norm` checks the checkpoint's normalization json against the sha256 in its config.yaml (the run also pins it
-through the adapter's `normalization_sha256` override), `dry` plans the whole run locally, `start` refuses pairs a live
-master holds and pauses the run whose pairs it takes over.
+The historical per-recipe drivers and chains of the published runs: `vanilla34k_eefabs_f33fps8.sh` (SANA_WAM) and
+`causal_p14k_eefabs_f33fps8.sh` (SANA_WAM_CAUSAL) are the per-run drivers, the `*_seeds.sh` chains call them (see
+`campaigns/README.md`). New campaigns use `run.sh` + `campaign.sh` instead.

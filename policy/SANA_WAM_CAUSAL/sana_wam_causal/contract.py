@@ -814,15 +814,15 @@ def resolve_causal_contract(cfg: Mapping[str, Any]) -> CausalContract:
         raise ValueError(
             f"model.extra.chunk_causal_policy.{sparse_keys[0]}: this is a sparse-memory checkpoint (Sana "
             "rwm/sparse-memory: one strided / fixed RGB memory every block reads), which this adapter would mis-serve as "
-            "the episode protocol; serve it with SANA_WAM_SM"
+            "the episode protocol; it is served by SANA_WAM_SM up to XPolicyLab 9270c044"
         )
     memory_keys = [key for key in ("hierarchical_memory", "memory_uniform", "memory_split") if key in options]
     if memory_keys:
         raise ValueError(
             f"model.extra.chunk_causal_policy.{memory_keys[0]}: this is a hierarchical-memory checkpoint (Sana "
             "rwm/sparse-memory before 3f6f8daa5, a dense / sparse memory read per block kind), which this adapter would "
-            "mis-serve as the episode protocol; it is served by SANA_WAM_HM up to XPolicyLab d57a617 (SANA_WAM_SM serves "
-            "the sparse memory that replaced it)"
+            "mis-serve as the episode protocol; it is served by SANA_WAM_HM up to XPolicyLab d57a617 (SANA_WAM_SM, up to "
+            "XPolicyLab 9270c044, served the sparse memory that replaced it)"
         )
     if "window_repeats" in _extra(cfg.get("data")):
         raise ValueError(
